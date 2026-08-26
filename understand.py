@@ -41,6 +41,15 @@ FAN_KEYS = [
     "FCPU", "FSYS", "FCPU2",
     "FOEM0", "FOEM1", "FOEM2", "FOEM3", "FOEM4", "FOEM5", "FOEM6",
 ]
+_FAN_OEM_KEY_RE = re.compile(r"^FOEM(\d+)$")
+
+
+def _is_valid_fan_key(key: str) -> bool:
+    if not isinstance(key, str):
+        return False
+    return key in FAN_KEYS or bool(_FAN_OEM_KEY_RE.match(key))
+
+
 CURRENT_KEYS = ["OEM0", "OEM1", "OEM2"]
 CASEOPEN_KEYS = ["CO0", "CO1", "CO2"]
 
@@ -69,7 +78,7 @@ FAN_HINTS = """
   CPU Fan / CPU_FAN                   → FCPU
   COM Module FAN                      → FCPU
   System Fan / SYS Fan / Carrier Board FAN → FSYS
-  OEM Fan                             → FOEM0 (only when explicitly OEM)
+  OEM Fan                             → FOEM<n> (n>=0, dynamic)
 """
 
 CURRENT_HINTS = """
@@ -174,7 +183,9 @@ repeat the same name in both fields.
 (e.g. "Total:8 Pins" -> 8; "Total: 4in/4out" -> 8).
 - gpio.pins: preserve GPIO rows from the form/analysis whenever available. \
 One entry per known pin index. direction is one of "input" | "output" | \
-"both" | "unknown".
+"both" | "unknown". Preserve the user-entered GPIO name as `name`; if the \
+form has no name or the user left it blank, use an empty string. Do not invent \
+GPIO names from signal labels, chip function labels, or locations.
 
 ## Screen control
 - Preserve the Screen control structure when present: record checked status \
@@ -262,7 +273,7 @@ CaseOpen: {CASEOPEN_KEYS}
   "smartfan":     ["<ini_key>", ...],
   "gpio": {{
     "count": 8,
-    "pins": [{{"index": 0, "direction": "input|output|both|unknown", "chip": "ITE8528", "location": "0"}}]
+        "pins": [{{"index": 0, "direction": "input|output|both|unknown", "chip": "ITE8528", "location": "0", "name": "<user-entered name or empty>"}}]
   }},
   "features": {{
     "smbus": true,
@@ -407,6 +418,18 @@ def validate_spec(spec: dict) -> list[str]:
         for k in ("PlatformVersion", "BIOSVersion", "ECVersion"):
             if k in info and not isinstance(info.get(k), str):
                 warnings.append(f"information.{k} should be string")
+    gpio = spec.get("gpio")
+    if gpio is not None and not isinstance(gpio, dict):
+        warnings.append("gpio should be an object")
+    elif isinstance(gpio, dict):
+        pins = gpio.get("pins", [])
+        if pins is not None and not isinstance(pins, list):
+            warnings.append("gpio.pins should be an array")
+        elif isinstance(pins, list):
+            for pin in pins:
+                if isinstance(pin, dict) and "name" in pin and not isinstance(pin.get("name"), str):
+                    warnings.append("gpio pin name should be string")
+
     valid_temp  = set(TEMP_KEYS)
     valid_fan   = set(FAN_KEYS)
     valid_curr  = set(CURRENT_KEYS)
@@ -419,8 +442,9 @@ def validate_spec(spec: dict) -> list[str]:
         if item.get("ini_key") not in valid_temp:
             warnings.append(f"Unknown temperature ini_key: {item.get('ini_key')!r}")
     for item in spec.get("fans", []):
-        if item.get("ini_key") not in valid_fan:
-            warnings.append(f"Unknown fan ini_key: {item.get('ini_key')!r}")
+        key = item.get("ini_key")
+        if not _is_valid_fan_key(key):
+            warnings.append(f"Unknown fan ini_key: {key!r}")
     for item in spec.get("currents", []):
         if item.get("ini_key") not in valid_curr:
             warnings.append(f"Unknown current ini_key: {item.get('ini_key')!r}")
@@ -428,7 +452,7 @@ def validate_spec(spec: dict) -> list[str]:
         if item.get("ini_key") not in valid_case:
             warnings.append(f"Unknown caseopen ini_key: {item.get('ini_key')!r}")
     for key in spec.get("smartfan", []):
-        if key not in valid_fan:
+        if not _is_valid_fan_key(key):
             warnings.append(f"Unknown smartfan ini_key: {key!r}")
 
     if not spec.get("chips", {}).get("hwm"):
@@ -479,6 +503,15 @@ def _extract_gpio_pins_from_pages(form_data: dict) -> list[dict]:
     pages = form_data.get("pages") or []
     out: dict[int, dict] = {}
 
+    def _gpio_index(value) -> int | None:
+        text = str(value or "").strip()
+        if re.fullmatch(r"\d+", text):
+            return int(text)
+        if not re.match(r"^\s*(?:GPI|GPO|GPIO|GP)", text, re.IGNORECASE):
+            return None
+        numbers = re.findall(r"\d+", text)
+        return int(numbers[-1]) if numbers else None
+
     for page in pages:
         tables = page.get("tables") or []
         for table in tables:
@@ -486,7 +519,7 @@ def _extract_gpio_pins_from_pages(form_data: dict) -> list[dict]:
                 continue
 
             # Try to discover header column indexes dynamically.
-            pin_col = chip_col = loc_col = sup_col = None
+            pin_col = chip_col = loc_col = sup_col = name_col = None
             for row in table:
                 if not isinstance(row, list):
                     continue
@@ -501,11 +534,16 @@ def _extract_gpio_pins_from_pages(form_data: dict) -> list[dict]:
                     loc_col = lowered.index("location")
                 if sup_col is None and any("support" == c for c in lowered):
                     sup_col = lowered.index("support")
+                if name_col is None:
+                    for candidate in ("name", "gpio name", "signal name"):
+                        if candidate in lowered:
+                            name_col = lowered.index(candidate)
+                            break
 
                 if pin_col is None:
                     # Heuristic for continuation tables where header is not repeated:
-                    # common GPIO row layout is ['', PIN, default, support, chip, location, ...]
-                    if len(cells) > 1 and re.fullmatch(r"\d+", cells[1]):
+                    # common GPIO row layout is ['', GPI0/GPO0, default, support, chip, location, ...]
+                    if len(cells) > 1 and _gpio_index(cells[1]) is not None:
                         pin_col = 1
                         if chip_col is None and len(cells) > 4:
                             chip_col = 4
@@ -513,15 +551,16 @@ def _extract_gpio_pins_from_pages(form_data: dict) -> list[dict]:
                             loc_col = 5
                         if sup_col is None and len(cells) > 3:
                             sup_col = 3
+                        if name_col is None and len(cells) > 6:
+                            name_col = 6
                     else:
                         continue
                 if pin_col >= len(cells):
                     continue
 
-                pin_txt = cells[pin_col]
-                if not re.fullmatch(r"\d+", pin_txt):
+                idx = _gpio_index(cells[pin_col])
+                if idx is None:
                     continue
-                idx = int(pin_txt)
 
                 direction = "unknown"
                 if sup_col is not None and sup_col < len(cells):
@@ -539,11 +578,14 @@ def _extract_gpio_pins_from_pages(form_data: dict) -> list[dict]:
                 row = {
                     "index": idx,
                     "direction": direction,
+                    "name": "",
                 }
                 if chip_col is not None and chip_col < len(cells) and cells[chip_col]:
                     row["chip"] = cells[chip_col]
                 if loc_col is not None and loc_col < len(cells) and cells[loc_col]:
                     row["location"] = cells[loc_col]
+                if name_col is not None and name_col < len(cells) and cells[name_col]:
+                    row["name"] = cells[name_col]
 
                 prev = out.get(idx)
                 if prev is None:
@@ -556,6 +598,8 @@ def _extract_gpio_pins_from_pages(form_data: dict) -> list[dict]:
                         prev["chip"] = row["chip"]
                     if not prev.get("location") and row.get("location"):
                         prev["location"] = row["location"]
+                    if not prev.get("name") and row.get("name"):
+                        prev["name"] = row["name"]
 
     return [out[i] for i in sorted(out.keys())]
 
@@ -597,7 +641,22 @@ def enrich_gpio_from_analysis(spec: dict, form_data: dict) -> None:
             cur["chip"] = row.get("chip")
         if not cur.get("location") and row.get("location") is not None:
             cur["location"] = str(row.get("location"))
+        if not cur.get("name") and row.get("name") is not None:
+            cur["name"] = str(row.get("name"))
         merged[idx] = cur
+
+    existing_pins = spec_gpio.get("pins")
+    if isinstance(existing_pins, list):
+        for p in existing_pins:
+            if not isinstance(p, dict):
+                continue
+            _merge_pin({
+                "index": p.get("index"),
+                "direction": p.get("direction"),
+                "chip": p.get("chip"),
+                "location": p.get("location"),
+                "name": p.get("name", ""),
+            })
 
     # Source 1: analysis.gpio.pins
     src_pins = analysis_gpio.get("pins") if isinstance(analysis_gpio, dict) else []
@@ -610,6 +669,7 @@ def enrich_gpio_from_analysis(spec: dict, form_data: dict) -> None:
                 "direction": p.get("direction"),
                 "chip": p.get("chip"),
                 "location": p.get("location"),
+                "name": p.get("name", ""),
             })
 
     # Source 2: parse page tables directly
@@ -618,10 +678,7 @@ def enrich_gpio_from_analysis(spec: dict, form_data: dict) -> None:
 
     if merged:
         out = [merged[i] for i in sorted(merged.keys())]
-        existing = spec_gpio.get("pins")
-        existing_len = len(existing) if isinstance(existing, list) else 0
-        if len(out) > existing_len:
-            spec_gpio["pins"] = out
+        spec_gpio["pins"] = out
 
         max_pin = max(merged.keys()) + 1
         count_candidates = [max_pin]

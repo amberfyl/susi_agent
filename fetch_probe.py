@@ -11,10 +11,10 @@ fetch_probe.py — A 端腳本
 
 常用範例：
   # SSH 流程：存到 CASES/SOM-9590/SOM-9590_susi_board_probe_report.txt
-  python3 fetch_probe.py --mode ssh --host 172.22.12.244 --ssh-user susiaa --project SOM-9590
+  python3 fetch_probe.py --mode ssh --host 172.22.12.77 --ssh-user susiaa --project SOM-9590
 
   # SSH 流程：自訂輸出檔名
-  python3 fetch_probe.py --mode ssh --host 172.22.12.244 --ssh-user susiaa \
+  python3 fetch_probe.py --mode ssh --host 172.22.12.77 --ssh-user susiaa \
     --project SOM-9590 --output-name susi_board_probe_report.txt
 
   # HTTP 舊流程（相容）
@@ -36,7 +36,7 @@ from pathlib import Path
 
 
 B_PORT = 8765
-DEFAULT_REMOTE_BAT = "C:/Users/susiaa/Desktop/suto/run_susi_board_probe.bat"
+DEFAULT_REMOTE_BAT = "C:/Users/susiaa/Desktop/suto/run_susi_full_probe.bat"
 DEFAULT_REMOTE_REPORT = "C:/Users/susiaa/Desktop/suto/susi_board_probe_report.txt"
 
 

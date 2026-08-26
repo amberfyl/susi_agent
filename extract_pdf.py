@@ -299,7 +299,10 @@ specific part number) — give a short role_hint for each.
 - GPIO has no "group" concept in these forms — emit a flat list of pins.
 - Each pin carries its own chip (a single GPIO table can span two different chips, \
 e.g. EC pins then PCH/SoC pins), its location string exactly as written (bank name, \
-pin index, or "CNxx PinY" — whatever granularity the form gives), and its direction.
+pin index, or "CNxx PinY" — whatever granularity the form gives), its direction, and \
+the user-entered name from the same row when present.
+- `name` is optional user data, not a chip function label or schematic signal; emit an \
+empty string when the request form does not provide a name. Never invent one.
 - direction is one of {GPIO_DIRECTIONS} — "follow_bios" and "both" are literal states \
 the form offers (Default value: Follow BIOS; Support: Both). Use "unknown" only when \
 no direction checkbox for that pin has "■" at all.
@@ -344,7 +347,7 @@ Required JSON schema:
   }},
   "gpio": {{
     "total_pins": <integer>,
-    "pins": [{{"pin": "0", "chip": "<name>", "location": "<as written>", "direction": "input|output|both|unknown"}}]
+        "pins": [{{"pin": "0", "chip": "<name>", "location": "<as written>", "direction": "input|output|both|unknown", "name": "<user-entered name or empty>"}}]
   }},
   "images_summary": ["<one sentence per embedded image>"],
   "unresolved": ["<field/reason>"],

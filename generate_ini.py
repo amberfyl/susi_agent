@@ -459,30 +459,58 @@ def _extract_gpio_chip(form_data: dict) -> str:
 
 def _extract_gpio_pins(form_data: dict) -> list[dict]:
     """Extract per-pin direction from GPIO table.
-    Returns list of {pin: int, support: 'input'|'output'} sorted by pin number."""
+    Returns list of {pin: int, support: str, name: str} sorted by pin number."""
+    def _gpio_index(value):
+        text = _cell(value)
+        if text.isdigit():
+            return int(text)
+        if not re.match(r"^\s*(?:GPI|GPO|GPIO|GP)", text, re.IGNORECASE):
+            return None
+        numbers = re.findall(r"\d+", text)
+        return int(numbers[-1]) if numbers else None
+
+    pins = {}
+    gpio_started = False
     for page in form_data.get("pages", []):
         for table in page.get("tables", []):
             if not table or not table[0]:
                 continue
-            if "gpio" not in _cell(table[0][0]).lower():
+            first_cells = [_cell(c) for c in (table[0] or [])]
+            has_gpio_header = any("gpio" in cell.lower() for cell in first_cells)
+            has_gpio_row = len(first_cells) > 1 and _gpio_index(first_cells[1]) is not None
+            if not has_gpio_header and not (gpio_started and has_gpio_row):
                 continue
-            pin_col = sup_col = None
-            pins = []
+            gpio_started = True
+            pin_col = sup_col = name_col = None
             for row in table:
                 cells = [_cell(c) for c in (row or [])]
                 if pin_col is None:
-                    if "PIN" in cells and "Support" in cells:
-                        pin_col = cells.index("PIN")
-                        sup_col = cells.index("Support")
+                    lowered = [cell.lower() for cell in cells]
+                    if "pin" in lowered and "support" in lowered:
+                        pin_col = lowered.index("pin")
+                        sup_col = lowered.index("support")
+                        for candidate in ("Name", "GPIO Name", "Signal Name"):
+                            candidate_lower = candidate.lower()
+                            if candidate_lower in lowered:
+                                name_col = lowered.index(candidate_lower)
+                                break
                         continue
-                else:
-                    if pin_col < len(cells) and cells[pin_col].isdigit():
-                        sup = cells[sup_col] if sup_col is not None and sup_col < len(cells) else ""
-                        direction = "input" if "input" in sup.lower() else "output"
-                        pins.append({"pin": int(cells[pin_col]), "support": direction})
-            if pins:
-                return sorted(pins, key=lambda p: p["pin"])
-    return []
+                    if has_gpio_row and len(cells) > 1 and _gpio_index(cells[1]) is not None:
+                        pin_col = 1
+                        sup_col = 3
+                        name_col = 6 if len(cells) > 6 else None
+                    else:
+                        continue
+
+                idx = _gpio_index(cells[pin_col]) if pin_col < len(cells) else None
+                if idx is None:
+                    continue
+                sup = cells[sup_col] if sup_col is not None and sup_col < len(cells) else ""
+                direction = "input" if "input" in sup.lower() else "output"
+                name = cells[name_col] if name_col is not None and name_col < len(cells) else ""
+                pins[idx] = {"pin": idx, "support": direction, "name": name}
+
+    return [pins[idx] for idx in sorted(pins)]
 
 
 def _extract_gpio_count(form_data: dict) -> int:
@@ -1120,14 +1148,6 @@ def generate_ini(root: Path, in_json: Path, out_ini: Path,
                 break
         return out
 
-    def _auto_gpio_name_prefix(chip_text: str) -> str:
-        t = re.sub(r"[\s\-_.]", "", (chip_text or "").upper())
-        if any(k in t for k in ("INTEL", "BOARDWELL", "SOC")):
-            return "SOC_GPIO"
-        if any(k in t for k in ("ADVANTECH", "ITE", "EC", "NCT")):
-            return "EC_GPIO"
-        return "GPIO"
-
     def _gpio_profile(chip_text: str) -> dict:
         cache_key = (chip_text or "").strip() or "<default>"
         if cache_key in _gpio_profile_cache:
@@ -1157,7 +1177,6 @@ def generate_ini(root: Path, in_json: Path, out_ini: Path,
             "base_opt": base_opt,
             "ioport": ioport,
             "chip_key": chip_key,
-            "name_prefix": _auto_gpio_name_prefix(chip_key or (chip_text or "")),
         }
         _gpio_profile_cache[cache_key] = prof
         return prof
@@ -1507,10 +1526,21 @@ def generate_ini(root: Path, in_json: Path, out_ini: Path,
     blank()
 
     # ── [HWM.Fan] ────────────────────────────────────────────────────────────
-    fan_order = [
-        "FCPU", "FSYS", "FCPU2",
-        "FOEM0", "FOEM1", "FOEM2", "FOEM3", "FOEM4", "FOEM5", "FOEM6",
-    ]
+    fan_base_order = ["FCPU", "FSYS", "FCPU2"]
+    fan_sources = set(fan_vals.keys()) | set(sf_vals.keys())
+    if probe_spec:
+        fan_sources |= set(((probe_spec.get("hwm") or {}).get("fans") or []))
+    fan_sources |= set(req.get("_spec_smartfan", []) or [])
+
+    dyn_foem = sorted(
+        [k for k in fan_sources if re.fullmatch(r"FOEM\d+", k or "")],
+        key=lambda k: int(k[4:]),
+    )
+    extra_fan_keys = sorted(
+        [k for k in fan_sources if k and k not in fan_base_order and not re.fullmatch(r"FOEM\d+", k)],
+    )
+    fan_order = fan_base_order + dyn_foem + extra_fan_keys
+
     section("HWM.Fan")
     comment("[Item]=[HW],[Channel],[IOPort],[option],[Pulses],[Name]")
     for k in fan_order:
@@ -1572,7 +1602,6 @@ def generate_ini(root: Path, in_json: Path, out_ini: Path,
     gpio_pin_meta = {p["pin"]: p for p in gpio_pin_rows if isinstance(p, dict) and "pin" in p}
 
     chip_local_rank: dict[str, int] = {}
-    name_seq: dict[str, int] = {}
     composite_gpio: dict[int, tuple[str, str, str, int, int, str]] = {}
 
     for i in range(gpio_count):
@@ -1603,11 +1632,6 @@ def generate_ini(root: Path, in_json: Path, out_ini: Path,
                 grp, bit = pins_db[i]
 
         pin_name = _cell(meta.get("name", ""))
-        if not pin_name and _has_per_pin_gpio_chip:
-            prefix = prof.get("name_prefix", "GPIO")
-            idx = name_seq.get(prefix, 0)
-            name_seq[prefix] = idx + 1
-            pin_name = f"{prefix}{idx}"
 
         composite_gpio[i] = (
             prof.get("hwid", ""),
