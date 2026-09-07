@@ -29,6 +29,16 @@
 1. 查 `ProductChip`：`UNIQUE(product_name, chip_name)`
 2. 命中 `prod_chip_id` 後，查各 section table
 
+### 5.1 I2C
+- 只有 `{project}-spec.json` 的 `features.i2c == true` 才進行 I2C query/generate；false 或缺值時維持 `SECTION_EMPTY`。
+- query 只查 `config.db` 中實際存在的 `I2C` row；沒有對應 row 的組合不做 fallback，維持 `SECTION_EMPTY`。
+- 目前 `I2C` table 由 `prod_chip_id` join `ProductChip` 後的四種組合就是候選全集：`MIO/EIO-201`、`MIO/IT-8528`、`ARK/IT-8528`、`MIO/NCT6694B`。
+- `I2C.id` 是 DB row primary key，不能當作 INI channel 或 full probe 的 I2C id。
+- `io_port`、`options` 一律取命中的 DB row。
+- DB row 的 `channel` 有值時直接使用 DB channel；DB row 的 `channel` 為空時，交由 generate 路徑讀 full probe 的有效 `I2C_OEMn`，以 OEM 的邏輯 `n` 計算 `channel = 0x80000000 + n`。
+- `I2C_OEM0`、`I2C_OEM1` 等邏輯 channel 分別落在 INI `Channel2`、`Channel3`；I2C INI 最大支援 `Channel5`，超出範圍不可硬塞。
+- candidate query 不解析 probe，也不在 query 層決定最終 channel；probe ID 組合由 orchestrator/generate 路徑執行。
+
 ## 6. Spec-assisted Cross-check (R-008 migrated)
 
 ### 6.1 Purpose
@@ -65,6 +75,7 @@
   - `WDT`
   - `StorageArea`
   - `ThermalProtect`
+  - `I2C`
   - `VGA.Backlight`
   - `HWM.Current`
   - `HWM.CaseOpen`

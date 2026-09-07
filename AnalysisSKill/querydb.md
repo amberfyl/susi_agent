@@ -233,6 +233,109 @@
 
 ---
 
+## 14) HWM.Fan.Channels
+
+> 注意：table 名稱含 `.`，SQL 需加雙引號：`"HWM.Fan.Channels"`
+
+用途：依 `hardware_id` 與 `report_name` 對應 Fan channel。
+
+欄位：
+- `id` (INTEGER, PK)
+- `hardware_id` (TEXT, NOT NULL)
+- `report_name` (TEXT, NOT NULL)
+- `channel_name` (TEXT, NOT NULL)
+- `channel_id` (TEXT, NOT NULL)
+
+約束：
+- `UNIQUE(hardware_id, report_name)`
+
+---
+
+## 15) HWM.Fan.Defaults
+
+> 注意：table 名稱含 `.`，SQL 需加雙引號：`"HWM.Fan.Defaults"`
+
+用途：`HWM.Fan` 相關預設鍵值。
+
+適用於 EC Fan template：`EIO-201`、`EIO-211`、`IT-8528`、`IT-5782`、`IT-5121`。
+`disp_name` 預設為空，未有圖片確認名稱時保持空白。
+
+欄位：
+- `id` (INTEGER, PK)
+- `name` (TEXT, NOT NULL)
+- `value` (TEXT, NOT NULL)
+
+約束：
+- `UNIQUE(name)`
+
+---
+
+## 16) GPIO.GroupPins
+
+> 注意：table 名稱含 `.`，SQL 需加雙引號：`"GPIO.GroupPins"`
+
+用途：GPIO report name 與 group/bit 的靜態對照。
+
+欄位：
+- `id` (INTEGER, PK)
+- `report_name` (TEXT, NOT NULL)
+- `group` (TEXT, NOT NULL)
+- `pin` (TEXT, NOT NULL)
+
+約束：
+- `UNIQUE(report_name)`
+
+---
+
+## 17) GPIO.Defaults
+
+> 注意：table 名稱含 `.`，SQL 需加雙引號：`"GPIO.Defaults"`
+
+用途：GPIO template 相關預設鍵值。
+
+欄位：
+- `id` (INTEGER, PK)
+- `name` (TEXT, NOT NULL)
+- `value` (TEXT, NOT NULL)
+
+約束：
+- `UNIQUE(name)`
+
+---
+
+## 18) I2C
+
+用途：提供 `[I2C]` 的硬體模板欄位。`I2C` table 沒有 `item_name`；`id` 只代表 DB row primary key，不代表 INI `Channel` 或 full probe 的 I2C id。
+
+欄位：
+- `id` (INTEGER, PK)
+- `prod_chip_id` (INTEGER, FK -> ProductChip.id)
+- `channel` (TEXT, NOT NULL, default "")
+- `io_port` (TEXT, NOT NULL, default "")
+- `options` (TEXT, NOT NULL, default "")
+- `disp_name` (TEXT, NOT NULL, default "")
+
+約束：
+- 目前無 UNIQUE index（依現況）
+
+目前資料（join `ProductChip`）：
+
+| I2C.id | prod_chip_id | product_name | chip_name | channel | io_port | options |
+|---:|---:|---|---|---|---|---|
+| 1 | 2 | MIO | EIO-201 | 空 | `0` | `0x20000000` |
+| 2 | 3 | MIO | IT-8528 | 空 | `0` | `0x20000000` |
+| 3 | 9 | ARK | IT-8528 | 空 | `0` | `0x20000000` |
+| 4 | 21 | MIO | NCT6694B | `0x00000000` | `0x2E` | `0x20000000` |
+
+生成規則：
+- request/spec 的 `features.i2c` 不是 `true`：不查詢、不產生 I2C。
+- 沒有命中以上 DB row：`SECTION_EMPTY`，不 fallback 到其他 chip。
+- `io_port`、`options` 從 DB row 取。
+- DB `channel` 有值：直接使用 DB channel。
+- DB `channel` 為空：由 full probe 的有效 `I2C_OEMn` 取得邏輯 `n`，使用 `0x80000000 + n`；`I2C_OEM0` 對應 INI `Channel2`，依序至 `Channel5`。
+
+---
+
 ## Query Key（資料面摘要）
 
 - 固定鍵：`product_name + chip_name`

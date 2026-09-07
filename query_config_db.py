@@ -25,6 +25,7 @@ from pathlib import Path
 
 
 VALID_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.]+$")
+FAN_DEFAULT_CHIPS = {"EIO201", "EIO211", "IT8528", "IT5782", "IT5121"}
 
 
 def quote_ident(name: str) -> str:
@@ -38,6 +39,43 @@ def get_existing_tables(con: sqlite3.Connection) -> set[str]:
         "SELECT name FROM sqlite_master WHERE type='table'"
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def norm_chip_name(chip_name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", (chip_name or "").upper())
+
+
+def chip_uses_hwm_fan_defaults(chip_name: str) -> bool:
+    normalized = norm_chip_name(chip_name)
+    return any(normalized.startswith(prefix) for prefix in FAN_DEFAULT_CHIPS)
+
+
+def load_hwm_fan_defaults(con: sqlite3.Connection) -> dict[str, str]:
+    defaults: dict[str, str] = {
+        "io_port": "0",
+        "options": "0x80000000",
+        "pulses": "0",
+    }
+
+    tables = get_existing_tables(con)
+    if "HWM.Fan.Defaults" not in tables:
+        return defaults
+
+    rows = con.execute(
+        """
+        SELECT name, value
+        FROM "HWM.Fan.Defaults"
+        ORDER BY id
+        """
+    ).fetchall()
+
+    for r in rows:
+        name = str(r[0] or "").strip()
+        value = str(r[1] or "").strip()
+        if not name:
+            continue
+        defaults[name] = value
+    return defaults
 
 
 def query_section(db_path: str | Path, product_name: str, chip_name: str, section: str) -> dict:
@@ -85,9 +123,44 @@ def query_section(db_path: str | Path, product_name: str, chip_name: str, sectio
         result["prod_chip"] = dict(prod)
 
         table_name = quote_ident(section)
+
+        # Section tables are not fully uniform (e.g., I2C has no item_name).
+        # Build a compatible projection from available columns.
+        tinfo = con.execute(f"PRAGMA table_info({table_name})").fetchall()
+        colset = {str(r[1]) for r in tinfo}
+
+        if "item_name" in colset:
+            item_name_expr = '"item_name" AS "item_name"'
+        elif section == "I2C":
+            # I2C.id is a database primary key, not an INI channel number.
+            item_name_expr = "'' AS \"item_name\""
+        else:
+            item_name_expr = "'' AS \"item_name\""
+
+        channel_expr = '"channel" AS "channel"' if "channel" in colset else "'' AS \"channel\""
+        io_port_expr = '"io_port" AS "io_port"' if "io_port" in colset else "'' AS \"io_port\""
+        if "options" in colset:
+            option_expr = '"options" AS "option"'
+        elif "option" in colset:
+            option_expr = '"option" AS "option"'
+        else:
+            option_expr = "'' AS \"option\""
+        disp_name_expr = '"disp_name" AS "disp_name"' if "disp_name" in colset else "'' AS \"disp_name\""
+        range_max_expr = '"range_max" AS "range_max"' if "range_max" in colset else "'' AS \"range_max\""
+        range_min_expr = '"range_min" AS "range_min"' if "range_min" in colset else "'' AS \"range_min\""
+        frequency_expr = '"frequency" AS "frequency"' if "frequency" in colset else "'' AS \"frequency\""
+
         rows = con.execute(
             f"""
-            SELECT id, item_name, channel, io_port, options AS option, disp_name
+            SELECT id,
+                   {item_name_expr},
+                   {channel_expr},
+                   {io_port_expr},
+                   {option_expr},
+                   {range_max_expr},
+                   {range_min_expr},
+                   {frequency_expr},
+                   {disp_name_expr}
             FROM {table_name}
             WHERE prod_chip_id = ?
             ORDER BY id

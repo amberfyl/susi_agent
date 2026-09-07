@@ -6,16 +6,26 @@
 ## Source of Truth
 1. 使用者提供的平台型號（product_name）
 2. target board 動態產生的 `susi_board_probe_report.txt`
-3. `{project}-spec.json`
-4. `config.db`
+3. AMD-only target board 動態產生的 `susi_spd_idx_probe_report.txt`
+4. `{project}-spec.json`
+5. `config.db`
 
 > `susi_board_probe_report.txt` 是執行時動態產物，不可假設預先存在。
+> `susi_spd_idx_probe_report.txt` 只在 AMD SPD idx 路線使用；遠端固定路徑為 `C:\Users\susiaa\Desktop\suto\V7\run_susi_spd_idx_probe.bat` / `C:\Users\susiaa\Desktop\suto\V7\susi_spd_idx_probe_report.txt`。
 
 ## 圖片判讀引擎策略（已拍板）
 - 圖片判讀 gate 一律使用 Hermes `vision_analyze`（線上模型直接看像素）。
 - 不使用 offline OCR engine（不依賴 tesseract/rapidocr/paddleocr 等本地 OCR 安裝）。
-- 圖片輸入範圍固定包含：`bios*.png` + `circus*.png`。
+- 圖片輸入範圍固定包含：`bios*.png` + `circuit*.png`。
+- 若 `circuit*.png` 判讀證據不足（解析度/裁切上下文不夠），可追加分析同案電路圖 PDF；檔名通常為 `circuit*.pdf`。
+- PDF 用途：補 pin 編號與網名對位，不用來硬推超出圖證據的結論。
 - 若判讀證據不足，維持既有 pending/ambiguous status 流程，不做硬推。
+
+## 推理強度策略（已拍板）
+- 僅「電路圖/BIOS 圖片判讀與歧義判斷」使用 **high reasoning**。
+- 其餘流程（probe、extract、understand、query、generate、verify）使用 Hermes 預設 reasoning。
+- 不在 `susi_gen.py` 內硬編碼 reasoning 等級；此策略屬 orchestrator/skill 執行層。
+- 當 Hermes 全域設定改回 default 後，依本策略即可達成「只有判圖 high，其它 default」。
 
 ## Master Flow (v1)
 1. 取得平台型號
@@ -29,6 +39,47 @@
 6. 呼叫 `config_builder_skill` 產生自動化測試 cfg
 7. 收集結果交給 `verdict_report_skill`
 8. 成功則回寫考古 DB；失敗則回歸校正（不直接覆蓋 DB）
+
+### SMBus decision precedence
+- **Spec gate（最高）**：以 `{project}-spec.json` 為準。
+  - `features.smbus=false` → `SECTION_EMPTY`，不進行 SMBus 產生流程。
+  - `features.smbus=true` 才進入下列 routing。
+- **EC 描述 gate**：讀 `feature_details.smbus.chip`；若文字含 `EC` 視為 EC-related SMBus，才允許 Channel2+ 擴展邏輯。
+- 在需要 SMBus 時，規則依下列優先序執行：
+  1. **SMBus source chip rule**：若實際 `smbus_function_source` 命中 chip-family 特例，依 SMBus chip rule 處理；不可用 GPIO/HWM 的其他 chip 名稱觸發。
+  2. **CPU-family channel route**：Intel 走 full board probe report；AMD 走 SPD idx probe。
+  3. **Probe evidence**：只在已選定 route 內提供 bus existence 或有效 SPD idx；不得反過來覆寫 chip rule。
+  4. **Template composition**：最後才將已確認的 channel/index 與指定 HWID/template 組合成 INI。
+
+### Intel SMBus Channel2+ mapping（使用 full board probe report）
+- Intel 固定先產生 `Channel1=0x00000001,0,0,0xA0000000,`。
+- 只有在 `features.smbus=true` 且 `feature_details.smbus.chip` 為 EC-related 時，才解析 full board probe 的 `SMBUS_OEMn ... EXISTS` 產生 `Channel2+`。
+- 映射規則：`OEM0 -> Channel2`、`OEM1 -> Channel3`、`OEM2 -> Channel4`、`OEM3 -> Channel5`。
+- 對應 channel 欄位為 `0x80000000 + n`（n 為 OEMn 的 n）。
+- `Channel2+` 的 HWID 取 DB `ProductChip.hardware_id`；`io_port=0`、`option=0xA0000000`。
+- 若無 OEM EXISTS 或非 EC-related，則只保留 Channel1（Channel2+ 留空）。
+
+### AMD SDRAM SPD idx 遠端探測流程（固定路徑）
+- CPU family 判定為 AMD 時，透過 SSH 連線到 target board 執行 `run_susi_spd_idx_probe.bat`。
+- 固定流程：先 SSH 觸發遠端 BAT，完成後以 SCP 將 report 拉回機器 A（不可改成手動搬檔）。
+- 固定遠端 BAT：`C:\Users\susiaa\Desktop\suto\V7\run_susi_spd_idx_probe.bat`
+- 固定遠端 report：`C:\Users\susiaa\Desktop\suto\V7\susi_spd_idx_probe_report.txt`
+- Channel1 仍採 SPD 動態 idx。
+- 當 `features.smbus=true` 且為 EC-related：
+  - 若 Channel1 idx 在 `0..3`，則 `Channel2` 固定填 `0x80000004`。
+  - 若 Channel1 idx 為 `4`，則不產生 Channel2（留空）。
+- 其餘欄位規則：Channel2 的 HWID 取 DB `ProductChip.hardware_id`，`io_port=0`、`option=0xA0000000`。
+- `SMBUS_SUPPORTED` 或 bus `EXISTS` 只能用來篩選 candidate；不能取代實際 SPD 讀取結果。
+- 若沒有有效 SPD、出現多個有效 `idx`，標記 `PENDING_AMD_SPD_PROBE_PATH_OR_RESULT`，不可猜測。
+
+### I2C decision precedence
+- **Spec gate（最高）**：只有 `{project}-spec.json` 的 `features.i2c=true` 才查詢與產生 `[I2C]`；false 或缺值標記 `SECTION_EMPTY`，不執行 DB query。
+- **DB candidate gate**：依 `(product_name, chip_name)` 查 `ProductChip`，再依 `prod_chip_id` 查 `I2C`；目前只有四筆實際 DB row 是候選，其他組合保持 `SECTION_EMPTY`，不可 fallback。
+- `I2C.id` 是資料庫 row primary key，不是 full probe 的 I2C id。
+- `io_port`、`options` 取命中的 `I2C` row；DB `channel` 有值時也直接取 DB channel。
+- DB `channel` 為空時，使用 full probe report 中有效的 `I2C_OEMn`。公式中的 `n` 是 `I2C_OEMn` 的邏輯編號；報告括號內的 raw API `Id` 只保留作追蹤，不直接代入公式。
+- channel 組合為 `0x80000000 + n`，並映射為 INI `Channel(n+2)`；因此 `I2C_OEM0 -> Channel2`、`I2C_OEM1 -> Channel3`，最多產生到 `Channel5`。
+- `I2C_EXTERNAL` 不作為上述 EC DB template 的 OEM channel；沒有可用 `I2C_OEMn` 時標記 `PENDING_I2C_PROBE`，不可產生空 channel 值。
 
 ## 14-Section 單一真相（Orchestrator 固定清單）
 - SMBus
@@ -136,6 +187,82 @@
 - BLOCKED/PENDING 決策
 - DB 回寫策略（何時可寫回）
 
+## Function Source Reconciliation Contract
+
+### Responsibility split
+- `diagram_filter_skill`：從 BIOS/電路圖取得功能來源證據與 physical pin/net mapping；不自行覆寫 spec、DB 或總控狀態。
+- `candidate_query_skill`：依 orchestrator 提供的 `(product_name, chip_name)` 做 deterministic DB query；不判定 GPIO/HWM/Fan 的最終 chip。
+- `orchestrator`：整合 form/`-spec.json`、block diagram、net-level schematic 與實測結果，產生每個功能的 `*_function_source` 與衝突/歧義 status。
+
+### Source precedence for function source
+1. net-level schematic pin/wire/bridge evidence
+2. measured/probe evidence that identifies the connected function path
+3. schematic block diagram evidence
+4. form/`-spec.json` chip field
+5. chip-family historical assumption
+
+> Block diagram、form/JSON 與歷史案例只能提供候選或架構方向；沒有 net-level pin/wire 證據時，不得宣稱 GPIO/HWM/Fan source 已確認。
+
+### GPIO mapping source
+- `EIO-201*`、`EIO-211*`、`IT-8528*`、`IT-5782*`：使用 target board auto report 的 group/pin。
+- `NCT6106D*`、`NCT6116D*`、`NCT6126D*`：**純 SIO 路線**，使用 schematic 的 signal -> function label 判定 group/pin。
+- `EIO-300 / NCT6694B` 複合規則：`GPIO / I2C / SMBus` 走 `NCT6694B`；其餘 section 走 `EIO-300`（EC side）。
+- source 不明時標記 pending，不混用來源，也不自行猜測。
+
+### GPIO mapping flow
+- EC 路線：auto report 決定實際 GPIO 數量；8 個只輸出 `GPIO00`~`GPIO07`，4 個只輸出 `GPIO00`~`GPIO03`。
+- EC 路線：`hwid` 由 DB 查詢；`[IOBase]`、`[IOPort/Device Address]`、`[Option]`、預設 `[Name]` 由 `GPIO.Defaults` 提供；`[Group],[Bit]` 由 `GPIO.GroupPins` 提供。
+- EC 路線：若 `spec.json.gpio.pins[].name` 有使用者名稱，填入 `[Name]`；未填時留空，不自動命名。
+- NCT/SIO 路線：`[Group],[Bit]` 只由 schematic 判定，依 diagram skill R-016/R-017；不套用 EC 的 auto report/template mapping。
+- 任一路線缺少必要證據時標記 pending，不以另一條路線補猜，也不混合兩條 mapping。
+
+### SMBus chip rule
+- `EIO-300 / NCT6694B`：`SMBus` 走 `NCT6694B` 規則（DB query/template）；DB template 尚未完成時標記 pending，不自行填值。
+- 此 chip rule 優先於一般 Intel/AMD channel route；其他 chip 維持對應 CPU-family 流程。
+
+### Required reconciliation output
+- `gpio_function_source`
+- `hwm_function_source`
+- `fan_function_source`
+- `physical_pin_map`（由 diagram skill 提供或標記缺證據）
+- `function_source_evidence[]`（選配除錯欄位；僅在衝突/歧義時建議填寫）
+
+### Conflict and pending rules
+- spec 與 schematic 不同：保留兩邊值，採 schematic 值作硬體判定，標記 `SPEC_SCHEMATIC_FUNCTION_SOURCE_CONFLICT`。
+- 只有 spec/form 值：標記 `FUNCTION_OWNERSHIP_NEEDS_SCHEMATIC_PROOF`，不可寫成 confirmed。
+- 同一 chip 的多個功能均有獨立 pin/net 證據：標記 `SAME_CHIP_MULTI_FUNCTION_CONFIRMED`，仍分開輸出各功能 mapping。
+- GPIO 經過 expander/bridge：以實際直接連接功能的 expander/bridge 作為 GPIO source，保留上游 EC/SIO 作為 upstream context。
+- 證據無法唯一收斂：保留候選並標記 `FUNCTION_SOURCE_AMBIGUOUS`，由 orchestrator 決定是否 BLOCKED/PENDING。
+
+## FAN 配對輸出契約（HWM.Fan / HWM.Fan.Control）
+
+### 決策時機
+- 先完成 diagram skill 的 PDF/電路圖分析，再判定是否為一對一配對。
+- 不做前置硬 gate（不是先假設 one-to-one 才分析）。
+- 訊號主依據：`[HWM.Fan]` 看 `*FAN_TACH*` / `*FAN_SPEED*`；`[HWM.Fan.Control]` 看 `*FAN_PWM*`。
+- `*FAN_SD#*`、`*FAN_MODE*` 僅作輔助證據，不可直接決定 pairing/idx。
+
+### 固定 template（必須遵守）
+- `[HWM.Fan]`
+  - `key = hwid, channel_id, 0x2E, 0x80000000, 0, "alias"`
+- `[HWM.Fan.Control]`
+  - `key = hwid, channel_id, 0x2E, 0x20000000, "alias"`
+- 有了固定 template 後，動態填值只剩：`hwid`、`channel_id`、`alias`。
+
+### 一對一成立時（`FAN_ONE_TO_ONE_CONFIRMED`）
+- `[HWM.Fan]` 與 `[HWM.Fan.Control]` 輸出相同 key 集合（`FCPU`、`FSYS`、`FOEMx`）。
+- 兩個 section 的 `channel_id` 同步使用 `base_channel_id + idx`。
+
+### 一對多成立時（`FAN_ONE_TO_MANY_CONFIRMED`）
+- `[HWM.Fan]` 與 `[HWM.Fan.Control]` 可維持相同 key 集合，但 `channel_id` 允許不同。
+- `[HWM.Fan]` 的 `channel_id` 依 FANIN idx（`base_channel_id + fanin_idx`）。
+- `[HWM.Fan.Control]` 的 `channel_id` 依 PWM 控制來源 idx（`base_channel_id + control_idx`）。
+- 允許多個 key 在 `[HWM.Fan.Control]` 共用同一 `channel_id`（例如一對多）。
+
+### 無法收斂時
+- 不可硬套 `idx -> FCPU/FSYS/FOEMx`。
+- 標記 `FAN_PAIRING_AMBIGUOUS` 或 `FAN_PAIRING_NEEDS_FANCONTROL_EVIDENCE`，保留候選待補圖證。
+
 ## What MUST NOT be pushed into child skills
 - 各 skill 不可自行重跑 probe
 - 各 skill 不可自行決定是否回寫 DB
@@ -144,6 +271,7 @@
 ## Common Status Codes
 - `READY_FOR_QUERY`
 - `PENDING_NO_EC_RULE`
+- `SMBUS_PLATFORM_EXCLUDED`
 - `NO_SUCH_PRODUCT_CHIP`
 - `SECTION_EMPTY`
 - `FOUND`

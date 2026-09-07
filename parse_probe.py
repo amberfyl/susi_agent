@@ -81,6 +81,11 @@ _LINE = re.compile(
     r"^\[(?P<st>OK|ERR)\]\s+(?P<name>\S+)\s+Id=(?P<id>0x[0-9A-Fa-f]+)"
     r"(?:\s+(?:Value=(?P<val>.+?)|Status=\S+))?\s*$"
 )
+_I2C_BUS_LINE = re.compile(
+    r"^(?P<name>I2C_(?:EXTERNAL|OEM\d+))\s+\(Id=(?P<id>0x[0-9A-Fa-f]+|\d+)\)"
+    r"(?P<rest>.*)$",
+    re.IGNORECASE,
+)
 
 
 def _strip_value(raw: str) -> str:
@@ -105,6 +110,7 @@ def parse_probe_report(path: Path) -> dict:
         "is_ec": bool,             # True iff BOARD_EC_FW_STR was [OK]
         "ec_fw": str,              # EC firmware version string ("" when absent)
         "features": {"smbus": bool, "i2c": bool},
+        "i2c_buses": [{"name": str, "id": int, "probe_id": int}],  # supported buses from full probe
         "hwm": {                       # per sub-class: ordered, de-duped ini_keys
             "voltages": [...], "temperatures": [...], "fans": [...],
             "current": [...], "caseopen": [...],
@@ -118,9 +124,28 @@ def parse_probe_report(path: Path) -> dict:
     board_name = platform_version = bios_version = ec_fw = ""
     ec_fw_ok = False
     smbus = i2c = False
+    i2c_buses = []
+    seen_i2c_bus_names = set()
 
     with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
+            bus_match = _I2C_BUS_LINE.match(line.strip())
+            if bus_match:
+                raw_id = bus_match.group("id")
+                probe_id = int(raw_id, 16) if raw_id.lower().startswith("0x") else int(raw_id)
+                rest = bus_match.group("rest")
+                unsupported = re.search(r"\bnot\s+supported\b|\bunsupported\b", rest, re.IGNORECASE)
+                bus_name = bus_match.group("name").upper()
+                oem_match = re.fullmatch(r"I2C_OEM(\d+)", bus_name)
+                bus_id = int(oem_match.group(1)) if oem_match else probe_id
+                if not unsupported and bus_name not in seen_i2c_bus_names:
+                    seen_i2c_bus_names.add(bus_name)
+                    i2c_buses.append({
+                        "name": bus_name,
+                        "id": bus_id,
+                        "probe_id": probe_id,
+                    })
+
             m = _LINE.match(line.rstrip("\n"))
             if not m:
                 continue
@@ -182,6 +207,7 @@ def parse_probe_report(path: Path) -> dict:
         "is_ec": is_ec,
         "ec_fw": ec_fw,
         "features": {"smbus": smbus, "i2c": i2c},
+        "i2c_buses": i2c_buses,
         "hwm": hwm,
         "unmapped": unmapped,
     }
