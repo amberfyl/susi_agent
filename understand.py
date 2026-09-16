@@ -285,6 +285,9 @@ CaseOpen: {CASEOPEN_KEYS}
     "storage": true,
     "thermalprotect": true
   }},
+  "feature_details": {{
+    "smbus": {{"status": true, "chip": "<EC/model/description text if present>"}}
+  }},
   "screen_control": {{
     "brightness": {{
       "enabled": true,
@@ -725,6 +728,58 @@ def ensure_information_block(spec: dict, form_data: dict) -> None:
     }
 
 
+def ensure_feature_details(spec: dict, form_data: dict) -> None:
+    """Preserve non-boolean feature details from extracted analysis.
+
+    Keep backward compatibility by leaving `features.<key>` as booleans, and
+    storing richer source metadata under `feature_details`.
+    """
+    analysis = (form_data.get("analysis") or {}) if isinstance(form_data, dict) else {}
+    susi_features = analysis.get("susi_features") if isinstance(analysis, dict) else None
+    if not isinstance(susi_features, dict):
+        return
+
+    details = spec.get("feature_details")
+    if not isinstance(details, dict):
+        details = {}
+
+    for key, node in susi_features.items():
+        if not isinstance(node, dict):
+            continue
+
+        status = node.get("status")
+        # Normalize status for JSON stability.
+        if isinstance(status, bool):
+            norm_status = status
+        elif isinstance(status, str):
+            s = status.strip().lower()
+            if s in {"true", "yes", "1", "enabled", "checked"}:
+                norm_status = True
+            elif s in {"false", "no", "0", "disabled", "unchecked"}:
+                norm_status = False
+            else:
+                norm_status = "unknown"
+        else:
+            norm_status = "unknown"
+
+        chip = node.get("chip")
+        chip_text = "" if chip is None else str(chip).strip()
+
+        out_node = {
+            "status": norm_status,
+            "chip": chip_text,
+        }
+
+        # Preserve any additional extractor-provided context if present.
+        for extra_key in ("remark", "desc", "description", "note"):
+            if extra_key in node and node.get(extra_key) is not None:
+                out_node[extra_key] = str(node.get(extra_key)).strip()
+
+        details[key] = out_node
+
+    spec["feature_details"] = details
+
+
 def resolve_paths(project: str | None, in_json: str | None, spec_out: str | None,
                   root: Path) -> tuple[Path, Path]:
     if in_json:
@@ -795,6 +850,10 @@ def understand(project: str | None, in_json: str | None, spec_out: str | None,
 
     # Ensure spec.json always carries a stable [Information] JSON block.
     ensure_information_block(spec, form_data)
+
+    # Preserve richer non-boolean feature metadata (e.g., smbus chip/description)
+    # from extract analysis while keeping features booleans backward-compatible.
+    ensure_feature_details(spec, form_data)
 
     warnings = validate_spec(spec)
     for w in warnings:

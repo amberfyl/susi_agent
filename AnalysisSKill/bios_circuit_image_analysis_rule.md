@@ -4,22 +4,25 @@
 角色：此檔即 diagram_filter_skill 的規則主檔（沿用既有檔名 `bios_circuit_image_analysis_rule.md`）。
 適用範圍：AIagent_susi 專案中，針對 BIOS 圖片與電路圖做候選過濾與 ini 內容裁切。
 
-## 規則 R-001：AMD EPYC 平台不保留 SMBus ini
+補充（PNG 判讀 fallback）：
+- 預設先分析 `bios*.png` / `circuit*.png`。
+- 若 `circuit*.png` 因解析度或裁切造成 pin/網名對位不穩，允許追加分析同案電路圖 PDF（常見檔名：`circuit*.pdf`）。
+- PDF 主要用於補強「pin 編號 + 網名 + 功能名」對位證據；不可脫離圖證據做硬推。
 
-### 觸發條件
-- 在 BIOS 圖片可讀文字中，CPU 型號包含字串：`AMD EPYC`
+## 規則 R-001：AMD 平台不做 EPYC hard exception
 
-### 判定
-- 將平台判定為：**無南橋（No South Bridge）**
+### 原則
+- 在 SMBus 路由中，不再使用 `AMD EPYC` 作為先行排除條件。
+- 只要 CPU family 為 AMD，統一進入 AMD 正規流程（SPD idx probe + 下游規則）判定。
 
 ### 後續動作
-- 若後續流程有找出 SMBus 設定（例如候選資料、DB query 結果、或暫存 ini 區段中存在 `[SMBus]` 內容），
-  必須執行刪除動作：
-  - 刪除整個 `[SMBus]` section，或
-  - 至少清空其所有 key/value（以「不輸出 SMBus 實際設定」為最終結果）
+- 不產生 `SMBUS_PLATFORM_EXCLUDED` / `AMD_EPYC_NO_SMBUS` 這類先行阻斷狀態。
+- 不因為 BIOS 文字含 `AMD EPYC` 就提前刪除或清空 `[SMBus]`。
+- 是否輸出 SMBus、輸出哪些 channel，交由 AMD 正規流程與 probe 證據決定。
 
-### 不影響範圍
-- 其他 CPU 類型目前**不套用**本規則，維持原流程與原判定。
+### 影響範圍
+- 本調整僅移除 AMD EPYC hard exception。
+- 其他 SMBus gate（例如 spec gate、EC-related channel 規則）維持原流程。
 
 ## 規則 R-002：BIOS 項目白名單過濾（Query 後裁切）
 
@@ -99,7 +102,7 @@
 ## 規則 R-006：CPU Configuration BIOS 頁面的用途邊界
 
 ### 可用用途
-- 可用於平台分流與例外規則判斷（例如：是否為 AMD EPYC 類型）。
+- 可用於平台分流與一般規則判斷（例如：Intel / AMD family 路由）。
 - 可用於案內一致性核對（避免拿錯專案圖資）。
 
 ### 不可用用途
@@ -138,13 +141,13 @@
 
 ### 回填規則
 1. 單一值且高可讀性：
-   - 直接回填到輸出 ini 的 `[Information]`。
+  - 直接回填到輸出 ini 的 `[Information]`。
 2. 多張 BIOS 圖讀到同值：
-   - 視為一致，回填該值。
+  - 視為一致，回填該值。
 3. 多張 BIOS 圖讀到不一致值：
-   - 不回填，標記 `AMBIGUOUS_INFO_HEADER`（含衝突欄位名）。
+  - 不回填，標記 `AMBIGUOUS_INFO_HEADER`（含衝突欄位名）。
 4. 字串不完整或 `vision_analyze` 信心不足：
-   - 不回填，標記 `AMBIGUOUS_INFO_HEADER`。
+  - 不回填，標記 `AMBIGUOUS_INFO_HEADER`。
 
 ### 不可由 BIOS 圖推導的欄位
 - `SusiAi=`
@@ -163,11 +166,11 @@
 
 ### 裁決原則
 1. **BIOS 優先（最高優先）**
-   - 若 BIOS 可清楚讀到項目存在性或名稱（含 `+5V` / `+5VSB` 這類可明確區分字串），以 BIOS 為準。
+  - 若 BIOS 可清楚讀到項目存在性或名稱（含 `+5V` / `+5VSB` 這類可明確區分字串），以 BIOS 為準。
 2. **spec.json 次優先**
-   - 僅在 BIOS 無法清楚判讀、或該項在 BIOS 圖未出現時，才採用 spec.json。
+  - 僅在 BIOS 無法清楚判讀、或該項在 BIOS 圖未出現時，才採用 spec.json。
 3. **DB 候選為基底**
-   - DB query 結果僅提供候選集合，需經 BIOS/spec 後處理裁切，不可直接視為最終輸出。
+  - DB query 結果僅提供候選集合，需經 BIOS/spec 後處理裁切，不可直接視為最終輸出。
 
 ### 衝突處理
 - `spec.json` 與 BIOS 互斥時：
@@ -416,126 +419,191 @@
   - 實際執行結果（是否刪除 SMBus section、各 section 刪除哪些非 BIOS 項目）
   - 使用了哪些 soft mapping（以及是否被實測覆寫）
 
+## 規則 R-016：電路圖 net 追線優先於文字位置對齊
+
+### 目的
+- 避免因 signal label 與鄰近 pin/function label 在垂直方向接近，誤把訊號配到相鄰 GPIO。
+- 只適用於本次任務指定的目標 GPIO signal；包括 `EC_P*_GPIO*`、`SIO_GPIO*`、`EC_GP*` 的命名提示，不代表要把所有接到 `GP*` pin 的 signal 都納入。
+- `EC_P1_GPIO4` 僅是本規則的錯判示例，不是唯一或特殊的分析對象；`EC_P2_GPIO*`、`EC_P3_GPIO*` 等其他 port 也必須套用相同流程。
+
+### 常見適用 chip（經驗提示，非硬限制）
+- R-016 常見於 `NUVOTON_NCT6694B` / `EIO-300` 類案例（外部 signal 常見 `EC_P*_GPIO*` 命名）。
+- 但本規則不綁定型號；只要任務是 `signal -> pin -> function label` 的 net-level 追線，都必須套用。
+
+### 判定優先序
+1. 實際 electrical wire 的連續路徑（水平線、垂直線、摺線、轉折）。
+2. junction、T-connection、pin endpoint 與 connector/net label 的連接關係。
+3. chip pin number 與該 pin 旁的 GPIO function label。
+4. signal label 的文字位置、字串相似度與上下排列順序，僅作候選定位，不得單獨裁決。
+
+### 分析範圍 Gate（先篩選，再追線）
+- 先依使用者指定的 signal pattern 建立 `target_signal_set`；只有在此集合中的 signal 才能進入後續 wire trace 與 mapping 輸出。
+- 使用者只說「分析 GPIO」而未指定 pattern 時，才依 chip-aware naming hint 選定預設 pattern；不可把多個 pattern 或所有含 `GPIO`/`GP*` 的 signal 聯集納入。
+- AIMB 的 `NCT6126D*`、`NCT6116D*`、`NCT6106D*`、`NCT6776D*` 預設目標為 `SIO_GPIO*`；本次分析只輸出 `SIO_GPIO* -> GP* function label`。這是預設搜尋入口，不是唯一合法命名。
+- `SIO_GPIO*`、`EC_GPIO*`、`EC_P*_GPIO*`、`EC_GP*` 都是合法的 GPIO external-signal pattern；實際採用哪一個，依使用者指定、chip hint 或圖面中與目標 chip 相連的命名證據決定。
+- 預設 pattern 找不到時，才搜尋上述替代 pattern；若只有一個替代 pattern 能與目標 chip 的 GPIO wire 形成一致集合，將它選為 `target_signal_set` 並記錄實際採用的 pattern。若有多個可能 pattern，標記 `GPIO_SIGNAL_SCOPE_AMBIGUOUS`，不可把它們聯集納入。
+- 其他 signal 即使實際接到 `GP*` pin，也屬 `OUT_OF_SCOPE`，不可納入本次 GPIO mapping；例如 `FAN_SPEED2`、`FAN2_PWM`、`SIO_ERR_BEEP`、`SIO_LED*`、`SIO_PORT80_SEL`。
+- 若使用者明確指定其他 signal pattern，使用者指定值優先於 chip-aware naming hint；若 scope 仍無法唯一決定，標記 `GPIO_SIGNAL_SCOPE_AMBIGUOUS`，不得擴大成全部 GPIO signal。
+
+### Chip-aware signal naming hint（搜尋入口，非 mapping 規則）
+- 依候選 chip identity 優先使用下列字串縮小 GPIO 搜尋範圍：
+  - `NCT6694B*` / `EIO-300*` -> `EC_P*_GPIO*`
+  - `NCT6126D*` / `NCT6116D*` / `NCT6106D*` / `NCT6776D*` -> `SIO_GPIO*`
+  - `EIO-211*` -> `EC_GP*`
+- 上述只是外部 signal 的命名提示；命中後仍必須依 R-016 追蹤實際 wire、pin endpoint 與 chip function label。
+- `SIO_GPIO*`、`EC_P*_GPIO*`、`EC_GP*` 都是外部 net label 候選，不可由 suffix/index 直接推導 `GPxx` function、package pin 或 mapping 順序。
+- 同一張圖可能有多顆 NCT/SIO/EC，命名提示不能單獨決定 GPIO owner；仍須依 R-018 判定實際功能來源。
+- 若候選 chip 使用其他 net 命名，或命名提示未命中，仍可搜尋 `GPIO`、`EC_GPIO`、`SIO_GPIO`、`EC_GP`、`GP*`、connector net 與 chip function label 作為候選定位；搜尋結果不能未經 scope 確認就加入 `target_signal_set`。
+
+### 必做追線流程
+1. 先完成分析範圍 Gate，再掃描 `target_signal_set`；通用 GPIO/GP 搜尋只作候選定位或確認替代命名，不得把未符合目標 pattern 的 signal 加入清單。
+2. 對清單中的每一條 signal，從 signal label 或 BI/BO/IN/OUT 箭頭的實際 wire endpoint 開始。
+3. 沿 wire 逐段追蹤；遇到轉折時依 wire 的新方向繼續，不以文字所在的水平列代替連線。
+4. 遇到 junction 才視為分支；單純交叉但沒有 junction 的線不可視為相連。
+5. 追到 chip pin 後，記錄 pin number，再讀取該 pin 對應的完整 function label。
+6. 只對 `target_signal_set` 輸出一對一 mapping 表：`signal -> chip pin -> GPIO function label`；每一條目標 signal 都必須有結果或 ambiguity 標記，`OUT_OF_SCOPE` signal 不得出現在表內。
+7. 若 signal label 與 pin label 不在同一水平線，必須優先採用摺線後的實際 endpoint，並標記 `MAPPED_BY_WIRE_TRACE`。
+
+### 證據與錯誤防護
+- 只依連續 electrical wire、junction、net label 與 pin endpoint 判定；顏色、文字距離、上下排列與 OCR 座標不能單獨作為連線證據。
+- review/annotation 只有在依結構確認未連到 pin、junction 或 net endpoint 時才排除；不可依固定顏色判定。
+- X/NC 只有在附著於同一個 pin 或 wire endpoint，且 wire 在該處終止時，才能判定未連接；附近其他 pin 或 branch 的 X/NC 不影響 trace。
+- revision/review 文字只作背景資訊，不得改寫目前 wire trace；若它本身是直接接在線上的 net label，才可納入追線。
+- wire 被裁切、endpoint 不清，或無法區分 wire 與 annotation 時，標記 `GPIO_NET_TRACE_AMBIGUOUS`；若涉及 X/NC 衝突，加註 `reason=X_NC_MARKER_CONFLICT`，不得硬猜。
+
+### 完整性要求
+- 先列出 `target_signal_set` 的數量與完整清單。
+- 每條目標 signal 都必須有 mapping；若 pin 無法確認，列出並標記 `GPIO_NET_TRACE_AMBIGUOUS`。
+- `OUT_OF_SCOPE` signal 不得加入 mapping 表。
+
+### 驗證案例：ARK-1251
+- `EC_P1_GPIO4` 的文字位置接近 `ESPI_ALERT#/GPIOB3`，但實際 wire 先水平延伸、再向下摺線，最後接到 `F1`。
+- 因此正確 mapping 為：
+  - `EC_P1_GPIO4 -> F1 -> SHD_CS#/CLKRUN#/ESPI_CS2#/GPIOB1`
+- 錯誤 mapping `EC_P1_GPIO4 -> GPIOB3` 是由文字 Y 座標對齊造成，違反本規則的追線優先序。
+
+## 規則 R-017：清楚 GPIO 圖面的 physical pin map 與 SUSI logical GPIO 分層
+
+### 目的
+- 當電路圖直接顯示 GPIO group/port/pin function 與外部 net 的清楚接線時，建立可追溯的 physical pin mapping。
+- 避免把 request form/JSON 的 SUSI logical location（例如 `GPIO1`）誤當成晶片 function label（例如 `GPIO0_P0_0`）。
+
+### 觸發條件
+- 電路圖可清楚辨識 chip name、chip pin endpoint、pin number 或座標，以及 chip 內部的 GPIO function label。
+- 外部 signal/net 以連續 wire 直接接到該 pin，或可透過明確的 0R/Co-lay 路徑追到該 pin。
+
+### 常見適用 chip（經驗提示，非硬限制）
+- R-017 常見於一般 EC / SuperIO / SoC GPIO 圖面（例如 `ITE`、`ENE`、`EIO-211` 等）。
+- 只要圖面能建立清楚 physical pin map 與 function label 分層，就應套用；不因 chip 家族不同而豁免。
+
+### 必做輸出
+1. 主要輸出先建立 signal 到 GPIO function label 的 mapping：
+  - `external signal/net -> chip GPIO function label`
+  - 只處理 R-016 `分析範圍 Gate` 通過的 `target_signal_set`；`OUT_OF_SCOPE` signal 不得進入 mapping 表。
+2. 若 function label 可拆成 group/port/pin，必須正規化並作為主要結果：
+  - `GPIO34` 或 `GP34` -> `group 3, pin 4`
+  - `GPIO71` 或 `GP71` -> `group 7, pin 1`
+  - 這只是 label 正規化；signal 是否真的接到該 function，仍依 R-016 追線判定。
+3. chip package pin number（例如 `L6`、`M6`、`A12`）只作追線證據/除錯欄位，不是主要 GPIO mapping 結果；若圖面可讀，才附加記錄。
+4. 再輸出 SUSI logical mapping（若 form/JSON 有 GPI/GPO 項目）：
+  - `logical GPI0/GPO0 -> normalized group/pin`（只有在 wire/order/文件證據支持時才能建立）
+5. `function_label`、`normalized_group_pin`、`chip_package_pin`、`logical_location` 必須分欄保存，不得只用單一 `location` 欄位混合表示。
+
+### 清楚圖面的判定規則
+- 同一 GPIO group 中連續排列、且每條 wire 明確接至連續 chip pin 的情況，可依 pin endpoint 建立完整 group map。
+- 若圖面直接顯示 `GPIO0_P0_0` 到 `GPIO0_P0_7`，應完整列出 8 條，不得只回報 `count=8`。
+- `count` 只能代表數量，不代表 group、port、pin 或 direction 已完成 mapping。
+- `GPI/GPO` 的 input/output 是 logical interface 方向；除非電路圖或晶片資料表提供方向證據，不得僅由 wire 左右方向推導晶片 pin direction。
+- 使用者若要求 GPIO 對應，預設主要回答 `signal -> GPIO function label -> normalized group/pin`；除非特別要求，不以 chip package pin 作為主要答案。
+
+### Form/JSON 衝突處理
+- `location: GPIO1` 只記錄為 SUSI logical location；不可直接改寫成 physical `GPIO0_P0_*`。
+- 若 form/JSON 只有 `index`、`direction`、`location`，但沒有 physical pin，標記 `LOGICAL_GPIO_WITHOUT_PHYSICAL_PIN_MAP`。
+- 若電路圖提供 physical map，應保留原始 logical 欄位，並新增 physical 欄位；不可因圖面結果覆寫原始需求資料。
+- 若 logical index 與 physical pin 的一對一順序無明確證據，標記 `LOGICAL_PHYSICAL_GPIO_MAPPING_AMBIGUOUS`，不得默認 index 順序相同。
+
+## 規則 R-018：功能來源 chip 必須由 net-level 證據確認
+
+### 目的
+- 區分「同一顆 EC/SIO 同時承擔 HWM 與 GPIO」與「HWM、GPIO 分屬不同 chip 或 GPIO expander」的架構。
+- 避免把某一個 chip family 的案例經驗硬套到其他平台。
+- 明確規定 `-spec.json` 的 chip 欄位是候選/需求資料，不能取代電路圖的實際連線證據。
+
+### 通用原則
+- R-016/R-017 的 GPIO 追線與 physical mapping 規則不綁定特定 chip name。
+- `EIO-211`、`NCT6694B`、`NCT6126D` 等名稱只能作為候選 chip identity，不能單獨證明 GPIO 或 HWM 的功能來源。
+- 同一顆 chip 可以同時提供 HWM、GPIO、Fan、WDT 等功能；也可能只有其中一部分功能，必須逐功能判定。
+- 本規則中的「功能來源 chip」是硬體連線判定，不是 Skill 的所有權或軟體權限。
+- GPIO mapping source 由 orchestrator 決定；指定 `schematic` 時，依 R-016/R-017 追線與正規化，不混用 auto report 結果。
+- EC route 的 GPIO 數量、DB template default 與 `spec.json` 名稱由 orchestrator 的 GPIO mapping flow 處理；本規則只處理 schematic route 的追線與正規化。
+
+### 必做判定流程
+1. 分別建立功能來源：`HWM -> chip`、`GPIO -> chip`、`Fan -> chip`、`WDT -> chip`。
+2. 先讀 `-spec.json`/form 作為候選；再從電路圖追線確認，不能反過來用候選 chip 名稱推導連線。
+3. 對 GPIO：從 GPIO external signal 沿 wire 追到實際 GPIO pin/function；若先進入 `TCA9555`、IO expander、level shifter 或其他 bridge，GPIO 的直接功能來源應記為該元件，而不是上游 EC/SIO。
+4. 對 HWM：從 `VIN/TEMP/FANIN/PWM` 或等價 net 追到實際監控 chip pin；不能因 GPIO 已判定為某 chip，就自動把 HWM 也歸給該 chip。
+5. 若同一顆 chip 的不同 pin group 分別承擔 HWM 與 GPIO，可標記 `SAME_CHIP_MULTI_FUNCTION_CONFIRMED`，但仍要分別列出 pin/function mapping。
+6. 若只有 chip 名稱或 form 的 `Chip` 欄位，沒有 net-level pin 證據，標記 `FUNCTION_OWNERSHIP_NEEDS_SCHEMATIC_PROOF`。
+
+### 證據優先序
+1. chip pin endpoint 與連續 wire 的 net-level 連線。
+2. 明確的 bridge/expander 與其 GPIO pin 連線。
+3. schematic block label 或 chip function label。
+4. block diagram 的功能方塊連線，只作架構方向證據。
+5. form/JSON 的 chip 欄位與 chip family 經驗，只能作候選或交叉驗證。
+
+### 輸出契約
+- 建議使用不易誤解的欄位名稱：
+  - `gpio_function_source`
+  - `hwm_function_source`
+  - `fan_function_source`
+  - `physical_pin_map`
+- 若保留舊欄位，`gpio_owner`/`hwm_owner` 等只能作為相容 alias，語意等同 `*_function_source`。
+- 若功能來源不同，不能以單一 `chip` 欄位合併表示。
+- 若功能來源尚未由圖面證明，保留多候選並標記 ambiguity，不得因歷史案例自動套用。
+- 若 `-spec.json` 與電路圖衝突，保留兩邊值並標記 `SPEC_SCHEMATIC_FUNCTION_SOURCE_CONFLICT`；net-level 電路圖值為最終硬體判定值。
+
+### 已知案例邊界
+- SOM-6833 的 `EIO-211` 可由圖面確認其 GPIO 與 Smart Fan 等功能路由到同一顆 EC，但此結論只適用於該案的圖面證據。
+- `NCT6694B/EIO-300` 案例不可僅依 chip 名稱推定 GPIO 一定由 NCT6694B 直接承擔；若圖面出現 `TCA9555` 或其他 expander，應以實際 expander pin route 為準。
+
+## 規則 R-019：FAN IN/OUT 配對判讀（先分析再判定）
+
+### 目的
+- 為 `[HWM.Fan]` / `[HWM.Fan.Control]` 提供可機器化的配對結果。
+- 僅處理「可由圖證確認」的配對，不做 naming 猜測。
+
+### 分析範圍
+- 優先：`circuit*.png`。
+- 證據不足時：追加 `circuit*.pdf`（尤其 fan control 頁）做交叉確認。
+- 命名提示可包含：`FAN_SPEED*`、`FAN_TACH*`（IN）與 `*_PWM`（OUT），但最終必須回到 net-level 連線判定。
+
+### 判定流程
+1. 先找 IN 路徑：`FAN_SPEED*` / `FAN_TACH*` -> `*FANIN*` function label（如 `CPUFANIN`/`SYSFANIN`/`AUXFANINx`）。
+2. 再找 OUT 路徑：`*_PWM` -> `*FANOUT*` 或等價 fan control 輸出鏈。
+3. 以同一路徑/同一控制群組建立 IN/OUT pairing。
+4. 全部配對完成後才判定是否 one-to-one；不可前置假設 one-to-one。
+
+### 訊號採信範圍（FAN）
+- `[HWM.Fan]` 主訊號僅採 `*FAN_TACH*` / `*FAN_SPEED*`（IN 端證據）。
+- `[HWM.Fan.Control]` 主訊號僅採 `*FAN_PWM*`（OUT/控制來源證據）。
+- `*FAN_SD#*`、`*FAN_MODE*` 僅作輔助交叉驗證，不可單獨作為配對或 idx 主依據。
+
+### 輸出契約
+- 必輸出：`fanin_label`、`fanin_signal`、`fanout_signal`、`fanin_idx_candidate`、`control_idx_candidate`。
+- `fanin_idx_candidate` 的語意順序可用：`CPU -> 0`、`SYS -> 1`、`AUX0 -> 2`、`AUX1 -> 3`（僅在圖證支持時）。
+- `control_idx_candidate` 依實際 PWM 控制來源網分組，不得由 connector 數量直接推定。
+- 檔名/頁碼/截圖座標屬於選配除錯欄位；平常流程非必填。
+
+### 狀態碼
+- 一對一成立：`FAN_ONE_TO_ONE_CONFIRMED`
+- 一對多成立：`FAN_ONE_TO_MANY_CONFIRMED`
+- 證據不足：`FAN_PAIRING_NEEDS_FANCONTROL_EVIDENCE`
+- 無法唯一收斂：`FAN_PAIRING_AMBIGUOUS`
+
 ---
 
-## 人工找圖提醒（非 Skill 流程，只是搜尋字串規則）
+## 人工搜圖建議
 
-> 目的：人工從電路圖快速定位關鍵 net，補強 Backlight 與 SMBus 的判讀證據。
-
-### A. Backlight（沿用）
-
-#### A-1. 本案（SOM-6833 / EIO-211）優先關鍵字
-- `EC_LVDS_BKLT_CTL`
-- `EC_LVDS_BKLT_EN#`
-
-#### A-2. 常見同義關鍵字（跨平台可能改名）
-- EN 類：
-  - `BL_EN`
-  - `BKLT_EN`
-  - `BKL_EN`
-  - `LCD_BL_EN`
-  - `LVDS_ENABKL`
-- CTRL/PWM 類：
-  - `BL_PWM`
-  - `BKLT_PWM`
-  - `BKL_PWM`
-  - `BKLT_CTL`
-  - `LVDS0_CTRL`
-- eDP/LVDS 前綴變體：
-  - `eDP_BKLT*`
-  - `LVDS_BKLT*`
-  - `EDP_LVDS_BKLT*`
-
-#### A-3. 建議搜尋順序（人工）
-1. 先搜廣義：`BKLT`、`BKL`、`BL_`
-2. 再搜本案詞：`EC_LVDS_BKLT_CTL`、`EC_LVDS_BKLT_EN#`
-3. 追線確認是否同一組路徑：來源（EC/SoC/CH7513） -> option 電阻/切換點 -> connector 輸出（`LVDS_BKLT_EN`/`LVDS_BKLT_CTRL`）
-
-#### A-4. 判讀提醒
-- 命名不是全平台統一，不能只用單一字串下結論。
-- 若是 option 電阻切換（例如 0R / NL），多半是「來源可切換」，不代表有兩組獨立背光裝置。
-
-### B. SMBus（新增）
-
-#### B-1. 先判「有沒有 SMBus」
-- `SMBUS`
-- `SMB`
-- `SMB_CLK`
-- `SMB_DAT`
-- `SMB_SCL`
-- `SMB_SDA`
-- `SMBCLK`
-- `SMBDAT`
-
-#### B-2. 再判「來源是誰（PCH/EC）」
-- PCH/SB/FCH 側：
-  - `PCH_SMB*`
-  - `SML0CLK`
-  - `SML0DATA`
-  - `SML1CLK`
-  - `SML1DATA`
-  - `South Bridge`
-  - `FCH`
-- EC 側：
-  - `EC_SMB*`
-  - `EC_SMB_CLK*`
-  - `EC_SMB_DAT*`
-  - `EC_I2C*`
-
-#### B-3. 尋找「路由切換證據」（高價值）
-- `CO-LAY` / `COLAY`
-- `OPTION` / `BOM OPTION`
-- `DNP` / `DNI` / `NL` / `NC`
-- `0R` / `0Ω`
-- `MUX` / `SWITCH` / `SEL`
-- `R###`（選配電阻跳線點）
-
-#### B-4. 端點與用途輔助關鍵字
-- `B2B`
-- `CONN` / `CN` / `J`
-- `SPD` / `DRAM_SMB*`
-- `EDID` / `DDC`
-- `EEPROM` / `24Cxx`
-
-#### B-5. 建議搜尋順序（人工）
-1. 存在性：`SMBUS`、`SMB_CLK`、`SMB_DAT`
-2. 來源線索：`SML0*`、`PCH_SMB*`、`EC_SMB*`
-3. 找切換點：`CO-LAY`、`OPTION`、`NL`、`0R`
-4. 追線：來源晶片腳位 -> 選配電阻/切換點 -> 連接器/端點
-
-#### B-6. 判讀提醒
-- block diagram 只算中證據：可支持「有功能」，不足以單獨決定 ownership。
-- net-level 連線 + 切換件（0R/NL/OPTION）才是強證據，可用於候選保留/降權。
-- 若 request 文字是 `PCH or EC ...` 且缺少上游 pin/net 追線，應維持 `SMBUS_CHIP_AMBIGUOUS`，不要硬收斂單一 chipname。
-
-### C. [HWM.Voltage] 人工抓圖關鍵字提醒（新增）
-
-> 用途：僅供人工在大量電路圖中快速定位 [HWM.Voltage] 相關區塊。
-
-#### C-1. 搜尋關鍵字
-- `H/W Monitor`
-- `HW Monitor`
-- `AVCC3`
-- `AUXTIN`
-
-#### C-2. 人工操作提醒
-1. 先以 `H/W Monitor` 或 `HW Monitor` 搜尋，快速定位到電壓監控相關頁面/區塊。
-2. 再以 `AVCC3` 或 `AUXTIN` 細化定位到 SIO 電壓監控區。
-3. 確認同區塊可看到 `VIN2/AUXTIN`、`VIN1`、`VIN0`（或其左側對應網名）。
-4. 確認後即可人工截圖，作為 [HWM.Voltage] 判讀證據。
-
-### D. [HWM.Fan] / [HWM.Fan.Control] 人工抓圖關鍵字提醒（新增）
-
-> 用途：僅供人工在大量電路圖中快速定位 FAN 監測與 FAN 控制相關區塊。
-
-#### D-1. 搜尋關鍵字
-- `EC_FANPWM0`
-- `EC_FANPWM1`
-- `EC_FANTACH0`
-- `EC_FANTACH1`
-- `SMART FAN`
-
-#### D-2. 人工操作提醒
-1. 先以 `EC_FANPWM0/1`、`EC_FANTACH0/1` 搜尋 EC/SIO 端 pin 區塊。
-2. 以 `SMART FAN` 搜尋中間驅動/調理電路區塊（若有）。
-3. 人工截圖時，優先保留同框證據：`PWM/TACH net 名稱 + 對應 pin/function + 連接去向頁碼/端點`。
+- 人工搜圖關鍵字僅供快速定位電路圖 net，不是判定規則，也不能取代實際 wire trace、pin endpoint 或其他圖證。
+- 詳細內容請見 [人工搜圖建議](人工搜圖建議.md)。

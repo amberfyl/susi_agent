@@ -1,6 +1,6 @@
-# SUSI DLL 呼叫速查（僅保留 SusiBoardGetValue 範圍）
+# SUSI DLL 呼叫速查（HWM Read + SmartFan control）
 
-你這次關心的是 `SusiBoardGetValue(Id, ref value)` 的 Id。
+你這次關心的是 `SusiBoardGetValue(Id, ref value)` 的 Id，以及 SmartFan 的專用控制 API。
 以下已排除你不在意的範圍：
 - 不展開 `SusiDevice` / `Device*.dll`
 - 不展開 `susiAI / susiIOT`
@@ -48,6 +48,14 @@ C# 對應（SusiDemo4 實際會用）：
 - `SUSI_ID_HWM_FAN_CPU`
 - `SUSI_ID_HWM_FAN_SYSTEM`
 - `SUSI_ID_HWM_FAN_CPU2`
+
+### 2.4 SmartFan control
+- `SusiFanControlGetCaps(Id, ItemId, out value)`
+- `SusiFanControlGetConfig(Id, out config)`
+- `SusiFanControlSetConfig(Id, ref config)`
+- `Id` 使用同一個 HWM fan ID，不存在另一組 SmartFan control API ID。
+- AIMB-289：FCPU=`0x00022000`、FSYS=`0x00022001`。
+- Manual PWM capability flag：`SUSI_FC_FLAG_SUPPORT_MANUAL_MODE = (1 << 2)`。
 
 電流（mA）：
 - `SUSI_ID_HWM_CURRENT_OEM0~OEM2`

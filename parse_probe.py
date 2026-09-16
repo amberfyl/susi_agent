@@ -86,6 +86,14 @@ _I2C_BUS_LINE = re.compile(
     r"(?P<rest>.*)$",
     re.IGNORECASE,
 )
+_GPIO_SUPPORT_LINE = re.compile(
+    r"^GPIO_Bank(?P<bank>\d+)_(?:InputSupport|OutputSupport)$",
+    re.IGNORECASE,
+)
+_GPIO_PIN_LINE = re.compile(
+    r"^GPIO_B(?P<bank>\d+)P(?P<pin>\d+)_GPIO(?P<gpio>\d+)_(?:Direction|Level)$",
+    re.IGNORECASE,
+)
 
 
 def _strip_value(raw: str) -> str:
@@ -97,6 +105,24 @@ def _strip_value(raw: str) -> str:
         return raw[1:-1]
     # e.g. '1136 mV', '3296 (=56.5 C)' -> keep the leading numeric token
     return raw
+
+
+def _parse_bitmask_value(raw: str) -> int | None:
+    s = str(raw or "").strip().lower()
+    if not s:
+        return None
+    try:
+        if s.startswith("0b"):
+            return int(s[2:], 2)
+        if s.startswith("0x"):
+            return int(s, 16)
+        if re.fullmatch(r"[01]{8,}", s):
+            return int(s, 2)
+        if re.fullmatch(r"\d+", s):
+            return int(s, 10)
+    except Exception:
+        return None
+    return None
 
 
 def parse_probe_report(path: Path) -> dict:
@@ -126,6 +152,9 @@ def parse_probe_report(path: Path) -> dict:
     smbus = i2c = False
     i2c_buses = []
     seen_i2c_bus_names = set()
+    gpio_supported_by_bank: dict[int, int] = {}
+    gpio_keys: list[str] = []
+    gpio_key_seen: set[str] = set()
 
     with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
@@ -153,6 +182,21 @@ def parse_probe_report(path: Path) -> dict:
             name = m.group("name")
             cid = int(m.group("id"), 16)
             val = _strip_value(m.group("val"))
+
+            gpio_sup = _GPIO_SUPPORT_LINE.match(name)
+            if ok and gpio_sup:
+                bank = int(gpio_sup.group("bank"))
+                mask = _parse_bitmask_value(val)
+                if mask is not None:
+                    gpio_supported_by_bank[bank] = gpio_supported_by_bank.get(bank, 0) | mask
+
+            gpio_pin = _GPIO_PIN_LINE.match(name)
+            if ok and gpio_pin:
+                gpio_num = int(gpio_pin.group("gpio"))
+                key = f"GPIO{gpio_num:02d}"
+                if key not in gpio_key_seen:
+                    gpio_key_seen.add(key)
+                    gpio_keys.append(key)
 
             # board info (string IDs live in the 0x0000 class)
             if name == "BOARD_NAME_STR" and ok:
@@ -200,6 +244,11 @@ def parse_probe_report(path: Path) -> dict:
     # SuperIO-only boards (AIMB-286: 12 HWM [OK] but BOARD_EC_FW_STR [ERR]).
     is_ec = ec_fw_ok
 
+    gpio_count_from_mask = 0
+    for _bank, mask in gpio_supported_by_bank.items():
+        gpio_count_from_mask += int(mask).bit_count()
+    gpio_count = len(gpio_keys) if gpio_keys else (gpio_count_from_mask if gpio_count_from_mask > 0 else 0)
+
     return {
         "board_name": board_name,
         "platform_version": platform_version,
@@ -208,6 +257,12 @@ def parse_probe_report(path: Path) -> dict:
         "ec_fw": ec_fw,
         "features": {"smbus": smbus, "i2c": i2c},
         "i2c_buses": i2c_buses,
+        "gpio": {
+            "count": gpio_count,
+            "keys": gpio_keys,
+            "banks": {str(k): f"0x{v:08X}" for k, v in sorted(gpio_supported_by_bank.items())},
+            "source": "GPIO_PIN_LINES" if gpio_keys else ("GPIO_SUPPORT_MASK" if gpio_count_from_mask > 0 else "NONE"),
+        },
         "hwm": hwm,
         "unmapped": unmapped,
     }

@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Deterministic query tool for config.db
+"""Deterministic query tool for the active ``config_new.db`` schema.
 
-Input key:
-  - product_name
-  - chip_name
-  - section (target table)
+The lookup key is always ``(product_name, chip_name)``.  ``ProductChip``
+provides the corresponding ``hardware_id``; section rows are then selected by
+that hardware id because the active schema no longer has ``prod_chip_id``
+foreign keys in section tables.
 
-Output statuses:
-  - NO_SUCH_PRODUCT_CHIP
-  - SECTION_EMPTY
-  - FOUND
-  - INVALID_SECTION
+This module intentionally does not read or fall back to the retired
+``config.db`` schema.
 """
 
 from __future__ import annotations
@@ -22,23 +18,26 @@ import json
 import re
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 
+DEFAULT_DB_PATH = Path(__file__).with_name("config_new.db")
 VALID_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.]+$")
 FAN_DEFAULT_CHIPS = {"EIO201", "EIO211", "IT8528", "IT5782", "IT5121"}
 
 
 def quote_ident(name: str) -> str:
-    if not VALID_IDENTIFIER.match(name):
+    """Quote a SQLite identifier after validating a table/column name."""
+    if not VALID_IDENTIFIER.fullmatch(name):
         raise ValueError(f"Invalid identifier: {name}")
     return '"' + name.replace('"', '""') + '"'
 
 
 def get_existing_tables(con: sqlite3.Connection) -> set[str]:
     rows = con.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    return {r[0] for r in rows}
+    return {str(row[0]) for row in rows}
 
 
 def norm_chip_name(chip_name: str) -> str:
@@ -46,41 +45,52 @@ def norm_chip_name(chip_name: str) -> str:
 
 
 def chip_uses_hwm_fan_defaults(chip_name: str) -> bool:
+    """Compatibility helper used by the generator's fan-template path."""
     normalized = norm_chip_name(chip_name)
     return any(normalized.startswith(prefix) for prefix in FAN_DEFAULT_CHIPS)
 
 
 def load_hwm_fan_defaults(con: sqlite3.Connection) -> dict[str, str]:
-    defaults: dict[str, str] = {
-        "io_port": "0",
-        "options": "0x80000000",
-        "pulses": "0",
-    }
+    """Return the common HWM.Fan template defaults in the new schema.
 
-    tables = get_existing_tables(con)
-    if "HWM.Fan.Defaults" not in tables:
+    ``config_new.db`` stores these values directly on ``HWM.Fan`` rows and no
+    longer has ``HWM.Fan.Defaults``.  The current EC template values are
+    stable across those rows, so this helper keeps the old Python import/API
+    usable without querying any retired table.
+    """
+    defaults = {"io_port": "0", "options": "0x80000000", "pulses": "0"}
+    if "HWM.Fan" not in get_existing_tables(con):
         return defaults
 
-    rows = con.execute(
-        """
-        SELECT name, value
-        FROM "HWM.Fan.Defaults"
-        ORDER BY id
-        """
-    ).fetchall()
-
-    for r in rows:
-        name = str(r[0] or "").strip()
-        value = str(r[1] or "").strip()
-        if not name:
-            continue
-        defaults[name] = value
+    row = con.execute(
+        'SELECT io_port, options, pulses FROM "HWM.Fan" ORDER BY id LIMIT 1'
+    ).fetchone()
+    if row is not None:
+        for key in defaults:
+            value = str(row[key] or "").strip()
+            if value:
+                defaults[key] = value
     return defaults
 
 
-def query_section(db_path: str | Path, product_name: str, chip_name: str, section: str) -> dict:
-    db_path = Path(db_path)
-    result: dict = {
+def _normalize_row(row: sqlite3.Row) -> dict[str, Any]:
+    """Return new-schema columns plus read-only compatibility aliases.
+
+    The database source of truth remains ``report_name``, ``channel_id``,
+    ``channel_name`` and ``options``.  The aliases let existing config-builder
+    code consume the query result while it is being migrated from the retired
+    schema; they are not database columns.
+    """
+    item = dict(row)
+    item.setdefault("item_name", item.get("report_name", ""))
+    item.setdefault("channel", item.get("channel_id", ""))
+    item.setdefault("option", item.get("options", ""))
+    item.setdefault("disp_name", item.get("channel_name", ""))
+    return item
+
+
+def _empty_result(product_name: str, chip_name: str, section: str) -> dict[str, Any]:
+    return {
         "query_key": {
             "product_name": product_name,
             "chip_name": chip_name,
@@ -89,86 +99,70 @@ def query_section(db_path: str | Path, product_name: str, chip_name: str, sectio
         "status": None,
         "prod_chip": None,
         "rows": [],
+        "row_count": 0,
     }
 
-    if not db_path.exists():
+
+def query_section(
+    db_path: str | Path,
+    product_name: str,
+    chip_name: str,
+    section: str,
+) -> dict[str, Any]:
+    """Query one section from ``config_new.db``.
+
+    Status values:
+      - ``DB_NOT_FOUND``
+      - ``NO_SUCH_PRODUCT_CHIP``
+      - ``SECTION_EMPTY``
+      - ``FOUND``
+      - ``INVALID_SECTION``
+    """
+    path = Path(db_path)
+    result = _empty_result(product_name, chip_name, section)
+
+    if not path.exists():
         result["status"] = "DB_NOT_FOUND"
-        result["error"] = str(db_path)
+        result["error"] = str(path)
         return result
 
-    con = sqlite3.connect(str(db_path))
+    con = sqlite3.connect(str(path))
     con.row_factory = sqlite3.Row
     try:
         tables = get_existing_tables(con)
-        if section not in tables:
+        if "ProductChip" not in tables:
+            result["status"] = "INVALID_DATABASE"
+            result["error"] = 'Missing required table "ProductChip"'
+            return result
+        if section not in tables or section == "ProductChip":
             result["status"] = "INVALID_SECTION"
             result["available_sections"] = sorted(t for t in tables if t != "ProductChip")
             return result
 
         prod = con.execute(
             """
-            SELECT id, product_name, chip_name, hardware_id, config_chip
-            FROM ProductChip
+            SELECT *
+            FROM "ProductChip"
             WHERE product_name = ? AND chip_name = ?
             LIMIT 1
             """,
             (product_name, chip_name),
         ).fetchone()
-
         if prod is None:
             result["status"] = "NO_SUCH_PRODUCT_CHIP"
             return result
 
-        prod_chip_id = prod["id"]
         result["prod_chip"] = dict(prod)
+        hardware_id = str(prod["hardware_id"] or "").strip()
+        result["lookup"] = {"hardware_id": hardware_id}
 
         table_name = quote_ident(section)
-
-        # Section tables are not fully uniform (e.g., I2C has no item_name).
-        # Build a compatible projection from available columns.
-        tinfo = con.execute(f"PRAGMA table_info({table_name})").fetchall()
-        colset = {str(r[1]) for r in tinfo}
-
-        if "item_name" in colset:
-            item_name_expr = '"item_name" AS "item_name"'
-        elif section == "I2C":
-            # I2C.id is a database primary key, not an INI channel number.
-            item_name_expr = "'' AS \"item_name\""
-        else:
-            item_name_expr = "'' AS \"item_name\""
-
-        channel_expr = '"channel" AS "channel"' if "channel" in colset else "'' AS \"channel\""
-        io_port_expr = '"io_port" AS "io_port"' if "io_port" in colset else "'' AS \"io_port\""
-        if "options" in colset:
-            option_expr = '"options" AS "option"'
-        elif "option" in colset:
-            option_expr = '"option" AS "option"'
-        else:
-            option_expr = "'' AS \"option\""
-        disp_name_expr = '"disp_name" AS "disp_name"' if "disp_name" in colset else "'' AS \"disp_name\""
-        range_max_expr = '"range_max" AS "range_max"' if "range_max" in colset else "'' AS \"range_max\""
-        range_min_expr = '"range_min" AS "range_min"' if "range_min" in colset else "'' AS \"range_min\""
-        frequency_expr = '"frequency" AS "frequency"' if "frequency" in colset else "'' AS \"frequency\""
-
         rows = con.execute(
-            f"""
-            SELECT id,
-                   {item_name_expr},
-                   {channel_expr},
-                   {io_port_expr},
-                   {option_expr},
-                   {range_max_expr},
-                   {range_min_expr},
-                   {frequency_expr},
-                   {disp_name_expr}
-            FROM {table_name}
-            WHERE prod_chip_id = ?
-            ORDER BY id
-            """,
-            (prod_chip_id,),
+            f"SELECT * FROM {table_name} WHERE hardware_id = ? ORDER BY id",
+            (hardware_id,),
         ).fetchall()
 
-        result["rows"] = [dict(r) for r in rows]
+        result["rows"] = [_normalize_row(row) for row in rows]
         result["row_count"] = len(rows)
         result["status"] = "FOUND" if rows else "SECTION_EMPTY"
         return result
@@ -178,17 +172,16 @@ def query_section(db_path: str | Path, product_name: str, chip_name: str, sectio
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Query /home/company2/AIagent_susi/config.db by (product_name, chip_name, section)"
+        description="Query config_new.db by (product_name, chip_name, section)"
     )
-    parser.add_argument("product_name", help="Product name key, e.g. SOM")
-    parser.add_argument("chip_name", help="Chip name key, e.g. EIO-211")
-    parser.add_argument("section", help="Section table name, e.g. WDT / VGA.Backlight")
+    parser.add_argument("product_name", help="Product name key, e.g. AIMB")
+    parser.add_argument("chip_name", help="Chip name key, e.g. EIO-201")
+    parser.add_argument("section", help="Section table name, e.g. WDT / HWM.Fan")
     parser.add_argument(
         "--db",
-        default="/home/company2/AIagent_susi/config.db",
-        help="Path to config.db",
+        default=str(DEFAULT_DB_PATH),
+        help="Path to config_new.db (default: %(default)s)",
     )
-
     args = parser.parse_args()
 
     result = query_section(
@@ -197,12 +190,11 @@ def main() -> int:
         chip_name=args.chip_name,
         section=args.section,
     )
-
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     if result["status"] == "DB_NOT_FOUND":
         return 2
-    if result["status"] == "INVALID_SECTION":
+    if result["status"] in {"INVALID_DATABASE", "INVALID_SECTION"}:
         return 3
     return 0
 

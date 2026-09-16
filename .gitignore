@@ -1,1 +1,6 @@
 *:Zone.Identifier
+
+# Legacy chip_db flow; config_new.db is the active database.
+chip_db.py
+build_chip_db.py
+chip_db.db

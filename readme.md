@@ -15,10 +15,10 @@
     - form json -> spec json（LLM 判讀）
 
     6) /home/company2/AIagent_susi/query_config_db.py
-    - generate 階段的 config.db deterministic query（目前核心）
+    - generate 階段的 config_new.db deterministic query（目前核心）
 
-    7) /home/company2/AIagent_susi/config.db
-    - 現行唯一查詢來源（你要求的 config.db-only）
+    7) /home/company2/AIagent_susi/config_new.db
+    - 現行唯一查詢來源（你要求的 config_new.db-only）
 
     8) Analysis skill文件
     - /home/company2/AIagent_susi/AnalysisSKill/orchestrator_skill.md

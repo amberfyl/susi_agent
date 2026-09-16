@@ -16,7 +16,7 @@ import difflib
 from pathlib import Path
 
 # from chip_db import ChipDB
-# Disabled by policy: generation must not use chip_db/chip_db.db; use config.db query flow instead.
+# Disabled by policy: generation must not use chip_db/chip_db.db; use config_new.db query flow instead.
 
 
 # ---------- option bit constants (from PageTemplate.cs / Page*.cs) ----------
@@ -874,7 +874,7 @@ def generate_ini(root: Path, in_json: Path, out_ini: Path,
     # Load chip DB
     # db = ChipDB.load()
     raise RuntimeError(
-        "chip_db flow is disabled by policy. Use config.db query flow (query_config_db.py / candidate_query_skill)."
+        "chip_db flow is disabled by policy. Use config_new.db query flow (query_config_db.py / candidate_query_skill)."
     )
 
     # ── HWM chip lookup ──────────────────────────────────────────────────────

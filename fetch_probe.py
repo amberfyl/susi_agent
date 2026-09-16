@@ -36,8 +36,14 @@ from pathlib import Path
 
 
 B_PORT = 8765
-DEFAULT_REMOTE_BAT = "C:/Users/susiaa/Desktop/suto/run_susi_full_probe.bat"
-DEFAULT_REMOTE_REPORT = "C:/Users/susiaa/Desktop/suto/susi_board_probe_report.txt"
+DEFAULT_REMOTE_BAT_FULL = "C:/Users/susiaa/Desktop/suto/V7/run_susi_full_probe.bat"
+DEFAULT_REMOTE_REPORT_FULL = "C:/Users/susiaa/Desktop/suto/V7/susi_full_probe_report.txt"
+DEFAULT_REMOTE_BAT_SPD_IDX = "C:/Users/susiaa/Desktop/suto/V7/run_susi_spd_idx_probe.bat"
+DEFAULT_REMOTE_REPORT_SPD_IDX = "C:/Users/susiaa/Desktop/suto/V7/susi_spd_idx_probe_report.txt"
+
+# Backward-compatible aliases (full probe defaults)
+DEFAULT_REMOTE_BAT = DEFAULT_REMOTE_BAT_FULL
+DEFAULT_REMOTE_REPORT = DEFAULT_REMOTE_REPORT_FULL
 
 
 def _default_out_dir(project: str | None, out_dir: str | None) -> Path:
@@ -48,10 +54,12 @@ def _default_out_dir(project: str | None, out_dir: str | None) -> Path:
     return Path("probe_reports")
 
 
-def _default_filename(project: str | None, output_name: str | None) -> str:
+def _default_filename(project: str | None, output_name: str | None, probe_kind: str) -> str:
     if output_name:
         return output_name
     if project:
+        if probe_kind == "spd_idx":
+            return f"{project}_susi_spd_idx_probe_report.txt"
         return f"{project}_susi_board_probe_report.txt"
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"probe_{ts}.txt"
@@ -113,35 +121,48 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Fetch SUSI probe report from target board")
     ap.add_argument("--mode", choices=["ssh", "http"], default="ssh", help="Fetch mode (default: ssh)")
     ap.add_argument("--host", required=True, help="Target host IP or hostname")
+    ap.add_argument(
+        "--probe-kind",
+        choices=["full", "spd_idx"],
+        default="full",
+        help="Probe script profile for default remote paths (default: full)",
+    )
 
     # 路徑與命名
     ap.add_argument("--project", default=None, help="Project name (e.g., SOM-9590), used for default output path/name")
     ap.add_argument("--dir", default=None, help="Output directory (default: CASES/<project>/ or probe_reports/)")
-    ap.add_argument("--output-name", default=None, help="Output filename (default: <project>_susi_board_probe_report.txt)")
+    ap.add_argument("--output-name", default=None, help="Output filename (default: <project>_susi_board_probe_report.txt or <project>_susi_spd_idx_probe_report.txt by --probe-kind)")
 
     # SSH 參數
     ap.add_argument("--ssh-user", default=None, help="SSH username (required in ssh mode)")
-    ap.add_argument("--remote-bat", default=DEFAULT_REMOTE_BAT, help=f"Remote BAT path (default: {DEFAULT_REMOTE_BAT})")
-    ap.add_argument("--remote-report", default=DEFAULT_REMOTE_REPORT, help=f"Remote report path (default: {DEFAULT_REMOTE_REPORT})")
+    ap.add_argument("--remote-bat", default=None, help="Remote BAT path (default depends on --probe-kind)")
+    ap.add_argument("--remote-report", default=None, help="Remote report path (default depends on --probe-kind)")
 
     args = ap.parse_args()
 
     out_dir = _default_out_dir(args.project, args.dir)
-    filename = _default_filename(args.project, args.output_name)
+    filename = _default_filename(args.project, args.output_name, args.probe_kind)
     out_path = out_dir / filename
+
+    if args.probe_kind == "spd_idx":
+        remote_bat = args.remote_bat or DEFAULT_REMOTE_BAT_SPD_IDX
+        remote_report = args.remote_report or DEFAULT_REMOTE_REPORT_SPD_IDX
+    else:
+        remote_bat = args.remote_bat or DEFAULT_REMOTE_BAT_FULL
+        remote_report = args.remote_report or DEFAULT_REMOTE_REPORT_FULL
 
     if args.mode == "ssh":
         if not args.ssh_user:
             sys.exit("[ERROR] --ssh-user is required in ssh mode")
 
         print(f"[*] SSH mode: triggering probe on {args.ssh_user}@{args.host}")
-        print(f"[*] Remote BAT: {args.remote_bat}")
-        print(f"[*] Remote report: {args.remote_report}")
+        print(f"[*] Remote BAT: {remote_bat}")
+        print(f"[*] Remote report: {remote_report}")
         fetch_probe_ssh(
             host=args.host,
             ssh_user=args.ssh_user,
-            remote_bat=args.remote_bat,
-            remote_report=args.remote_report,
+            remote_bat=remote_bat,
+            remote_report=remote_report,
             out_path=out_path,
         )
         print(f"[OK] Report saved: {out_path}")

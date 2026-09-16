@@ -8,7 +8,7 @@
 2. target board 動態產生的 `susi_board_probe_report.txt`
 3. AMD-only target board 動態產生的 `susi_spd_idx_probe_report.txt`
 4. `{project}-spec.json`
-5. `config.db`
+5. `config_new.db`
 
 > `susi_board_probe_report.txt` 是執行時動態產物，不可假設預先存在。
 > `susi_spd_idx_probe_report.txt` 只在 AMD SPD idx 路線使用；遠端固定路徑為 `C:\Users\susiaa\Desktop\suto\V7\run_susi_spd_idx_probe.bat` / `C:\Users\susiaa\Desktop\suto\V7\susi_spd_idx_probe_report.txt`。
@@ -176,9 +176,54 @@
 - 若 BIOS 名稱、probe 狀態、mapping 三者無法收斂：
   - 標記 `AMBIGUOUS_HWM_VOLTAGE_ALIAS`
   - 保留模板列，不做硬判。
-- 若出現同一 `channel_id` 對應多個 item（`CHANNEL_DUPLICATE`）：
-  - 命中 SuperIO 圖證規則適用條件時，交由 `diagram_filter_skill`（R-014/R-015）做判圖修正。
-  - 非 R-014/R-015 適用情境時，不自動修正，標記 `PENDING_CHANNEL_DUPLICATE_NEED_EVIDENCE`。
+- SuperIO 首版種子策略（NCT6694B / NCT61xxD / NCT6776D）：
+  - 不以 `report_name` 成功匹配作為前置條件。
+  - 直接把 DB 查到的 `channel_id` 列全部輸出到 `HWM.Voltage`（v1 種子 INI），先上機驗證。
+  - v1 階段不強制完成 item 精準對位；以 target 回報成功通道為主，之後再用 BIOS 名稱/電壓值回推 item，產生 v2。
+  - v2 必須做兩件事：
+    1. 只保留 BIOS 畫面有顯示的電壓 item。
+    2. 將 BIOS 顯示名稱回填到 INI `Name(alias)` 欄位（例如 `+12V/+5V/+3.3V/+5VSB`）。
+  - 第二輪硬性規則（/susiagent 自動收斂）：
+    - 對 `NCT6106D/NCT6116D/NCT6126D`（61**D）平台，`HWM.Voltage` 必須走兩輪：
+      1) 第一輪先產 v1 種子並部署上機
+      2) 重抓 probe 後第二輪再產生 v2
+    - 未跑第二輪不得宣稱完成（除非有明確 blocker：SSH/driver/probe/BIOS 證據不足）。
+- 若後續仍有同一 `channel_id` 多 item 衝突（`CHANNEL_DUPLICATE`），再交由圖證流程（R-014/R-015）做收斂；無證據時標記 pending。
+
+### 驗證層級定義（Non-EC Voltage）
+- `PASS_MAPPING`：通道可讀 + item 對位 + Name(alias) 回填完成（對應 A+B）。
+- `CONDITIONAL_CALIBRATION_PENDING`：mapping 成功但數值比例仍需校正（如 R1/R2/scale 未收斂）。
+- `FORMAL_PASS`：完成正式條件（重複性/容差/交付標準）驗證。
+
+## HWM.Temperature（Non-EC SuperIO）v1 / v2 規則
+
+### 適用條件
+- 非 EC（`is_ec=False` 或未知）且 chip 屬 NCT6694B / NCT61xxD / NCT6776D。
+
+### v1 種子輸出
+- 不以 probe report name 對位作前置條件。
+- 先將 DB 查到的 `HWM.Temperature` rows 依序全部輸出成 v1 INI（保留 channel_id）。
+- v1 階段允許 item/key 為暫定，不要求一次到位。
+
+### v2 收斂輸出
+- 上機驗證後，使用 target probe 成功通道 + BIOS 可見溫度名稱/數值做交集收斂。
+- 只保留「BIOS 可見」且「probe [OK]」的溫度 item。
+- 將 BIOS 顯示名稱回填到 INI `Name(alias)` 欄位。
+- 無法收斂者標記 pending/ambiguous，不做硬判。
+- 第二輪硬性規則（/susiagent 自動收斂）：
+  - 對 `NCT6106D/NCT6116D/NCT6126D`（61**D）平台，`HWM.Temperature` 必須走兩輪：
+    1) 第一輪先產 v1 種子並部署上機
+    2) 重抓 probe 後第二輪再產生 v2
+  - 未跑第二輪不得宣稱完成（除非有明確 blocker：SSH/driver/probe/BIOS 證據不足）。
+
+### option fallback（溫度全 ERR 時）
+- 觸發條件：`[HWM.Temperature]` 初版上機後，probe 的 `HWM_TEMP_*` 在同一輪結果全為 `[ERR]`（0 個 `[OK]`）。
+- 動作：改為候選組合迭代，針對 `[HWM.Temperature]` 同步調整 `io_port + option` 後重測。
+  - 每輪：套用一組 `(io_port, option)` → 部署/重載 → 重抓 probe。
+  - 任一輪出現 `HWM_TEMP_*` 非全 ERR（有 OK）即視為命中，停止迭代並保留該組。
+- 邊界：
+  - 不改 `channel_id/item_key`。
+  - 若候選組合全部測完仍全 ERR，標記 `PENDING_TEMP_IO_OPTION_CANDIDATES_EXHAUSTED` 並回報各輪 probe 證據。
 
 ## What MUST stay in Orchestrator
 - probe 觸發與回收
@@ -248,6 +293,11 @@
 - `[HWM.Fan.Control]`
   - `key = hwid, channel_id, 0x2E, 0x20000000, "alias"`
 - 有了固定 template 後，動態填值只剩：`hwid`、`channel_id`、`alias`。
+
+### NCT61xxD（含 NCT6106D/NCT6116D/NCT6126D/NCT6776D）probe 全 FAIL 特例
+- 若 fan probe 全 FAIL（無可用 fan key），先以 BIOS fan 名稱確認 fan key 集合（`FCPU`/`FSYS`/`FOEMx`）。
+- 再以該 key 集合反查 `config_new.db` 的 `HWM.Fan` rows，取 DB 對應的 `channel_id/io_port/options/pulses`。
+- 不用「連續 idx 預設值」覆蓋 DB row；只有 DB 無對應 key 時才回退到一般 fallback。
 
 ### 一對一成立時（`FAN_ONE_TO_ONE_CONFIRMED`）
 - `[HWM.Fan]` 與 `[HWM.Fan.Control]` 輸出相同 key 集合（`FCPU`、`FSYS`、`FOEMx`）。

@@ -49,6 +49,7 @@
   3. 與 BIOS 截圖值做時間接近對照（容差）
   4. CPU load 前後趨勢檢查（方向性）
 - 主要證據：time series、BIOS 對照表、容差結果
+- Non-EC/SIO fallback：若同一輪 `HWM_TEMP_*` 全為 `[ERR]`（0 OK），進入 `(io_port, option)` 候選組合迭代重測：每輪改參數→部署/重載→重抓 probe；任一輪出現非全 ERR 即命中並保留該組。若候選全數失敗，標記 `PENDING_TEMP_IO_OPTION_CANDIDATES_EXHAUSTED`。
 
 ## 5) [HWM.Voltage]
 ### Skill 說明（可直接自動化）

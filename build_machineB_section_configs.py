@@ -16,6 +16,7 @@ SECTION_OUTPUTS = {
     "SMBus": "{model}_smbus.json",
     "HWM.Fan": "{model}_fan.json",
     "HWM.Fan.Control": "{model}_fancontrol.json",
+    "WDT": "{model}_wdt.json",
 }
 
 DEFAULTS = {
@@ -57,6 +58,26 @@ DEFAULTS = {
             "min_success_rate": 1.0,
             "require_stable_mask": True,
             "enforce_mask_match": True,
+        },
+    },
+    "wdt": {
+        "capability_check": {
+            "sample_count": 3,
+            "sample_interval_ms": 200,
+            "min_success_rate": 1.0,
+        },
+        "nondestructive_check": {
+            "enabled": True,
+            "test_timeout_sec": 30,
+            "refresh_interval_sec": 5,
+            "refresh_cycles": 3,
+            "stop_wait_margin_sec": 5,
+        },
+        "destructive_check": {
+            "enabled": False,
+            "allow_destructive_reset": False,
+            "pending_result_when_disabled": "PENDING",
+            "pending_reason_when_disabled": "Destructive reboot-required WDT checks are pending by policy",
         },
     },
 }
@@ -422,12 +443,17 @@ def build_smbus_config(
         fields = [item.strip() for item in raw.split(",")]
         if len(fields) < 4:
             raise BuildError(f"[SMBus]{key} in {path} has fewer than 4 tuple fields")
-        bus_index = parse_int_auto(fields[1])
+        # SUSI SMBus tuples encode the channel as 0x80000000 + idx;
+        # Machine-B capability checks need the zero-based idx rather than
+        # the encoded channel value. Keep the original tuple unchanged.
+        encoded_channel = parse_int_auto(fields[1])
+        bus_index = encoded_channel - 0x80000000 if encoded_channel >= 0x80000000 else encoded_channel
         if bus_index < 0 or bus_index > 31:
             raise BuildError(f"[SMBus]{key} bus index must be in [0,31], got {bus_index}")
         channel_map[key] = {
             "raw_tuple": raw,
             "tuple_fields": fields,
+            "encoded_channel": encoded_channel,
             "bus_index": bus_index,
             "capability_bit": bus_index,
         }
@@ -494,6 +520,127 @@ def build_smbus_config(
         "require_stable_mask": require_stable_mask,
         "enforce_mask_match": enforce_mask_match,
         "supported_id": supported_id,
+    }
+
+
+def build_wdt_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    cap_policy = policy_section(policy, "wdt_capability")
+    nondestructive_policy = policy_section(policy, "wdt_nondestructive")
+    destructive_policy = policy_section(policy, "wdt_destructive")
+
+    defaults_cap = DEFAULTS["wdt"]["capability_check"]
+    defaults_non = DEFAULTS["wdt"]["nondestructive_check"]
+    defaults_des = DEFAULTS["wdt"]["destructive_check"]
+
+    sample_count = int(policy_value(cap_policy, "sample_count", defaults_cap["sample_count"]))
+    sample_interval_ms = int(
+        policy_value(cap_policy, "sample_interval_ms", defaults_cap["sample_interval_ms"])
+    )
+    min_success_rate = float(
+        policy_value(cap_policy, "min_success_rate", defaults_cap["min_success_rate"])
+    )
+
+    nondestructive_enabled = bool(
+        policy_value(nondestructive_policy, "enabled", defaults_non["enabled"])
+    )
+    test_timeout_sec = int(
+        policy_value(
+            nondestructive_policy,
+            "test_timeout_sec",
+            defaults_non["test_timeout_sec"],
+        )
+    )
+    refresh_interval_sec = int(
+        policy_value(
+            nondestructive_policy,
+            "refresh_interval_sec",
+            defaults_non["refresh_interval_sec"],
+        )
+    )
+    refresh_cycles = int(
+        policy_value(nondestructive_policy, "refresh_cycles", defaults_non["refresh_cycles"])
+    )
+    stop_wait_margin_sec = int(
+        policy_value(
+            nondestructive_policy,
+            "stop_wait_margin_sec",
+            defaults_non["stop_wait_margin_sec"],
+        )
+    )
+
+    destructive_enabled = bool(
+        policy_value(destructive_policy, "enabled", defaults_des["enabled"])
+    )
+    allow_destructive_reset = bool(
+        policy_value(
+            destructive_policy,
+            "allow_destructive_reset",
+            defaults_des["allow_destructive_reset"],
+        )
+    )
+    pending_result_when_disabled = str(
+        policy_value(
+            destructive_policy,
+            "pending_result_when_disabled",
+            defaults_des["pending_result_when_disabled"],
+        )
+    )
+    pending_reason_when_disabled = str(
+        policy_value(
+            destructive_policy,
+            "pending_reason_when_disabled",
+            defaults_des["pending_reason_when_disabled"],
+        )
+    )
+
+    return {
+        "schema_version": "1.0",
+        "category": "WDT",
+        "model": model,
+        "source_ini": source_metadata(path, "WDT"),
+        "required_channels": keys,
+        "capability_check": {
+            "sample_count": sample_count,
+            "sample_interval_ms": sample_interval_ms,
+            "min_success_rate": min_success_rate,
+        },
+        "nondestructive_check": {
+            "enabled": nondestructive_enabled,
+            "test_timeout_sec": test_timeout_sec,
+            "refresh_interval_sec": refresh_interval_sec,
+            "refresh_cycles": refresh_cycles,
+            "stop_wait_margin_sec": stop_wait_margin_sec,
+        },
+        "destructive_check": {
+            "enabled": destructive_enabled,
+            "allow_destructive_reset": allow_destructive_reset,
+            "pending_result_when_disabled": pending_result_when_disabled,
+            "pending_reason_when_disabled": pending_reason_when_disabled,
+        },
+        "result_semantics": {
+            "nonreboot_cases_pass_but_destructive_skipped": "CONDITIONAL",
+            "destructive_skipped_breakdown_bucket": "pending",
+            "api_or_capability_failure": "FAIL_API",
+            "functional_failure": "FAIL_FUNCTIONAL",
+        },
+        "safety": {
+            "allow_destructive_reset": allow_destructive_reset,
+            "max_reset_attempts": 1,
+            "abort_on_checkpoint_mismatch": True,
+        },
+        # legacy compatibility for simple runner implementation
+        "sample_count": sample_count,
+        "sample_interval_ms": sample_interval_ms,
+        "minimum_success_rate": min_success_rate,
+        "test_timeout_sec": test_timeout_sec,
+        "refresh_interval_sec": refresh_interval_sec,
+        "refresh_cycles": refresh_cycles,
+        "allow_destructive_reset": allow_destructive_reset,
     }
 
 
@@ -584,6 +731,8 @@ def main() -> int:
                         fan_entry,
                         f"{model}_fan.json",
                     )
+                elif section_name == "WDT":
+                    config = build_wdt_config(model, source_path, keys, policy)
                 else:
                     config = build_smbus_config(model, source_path, keys, policy)
                 write_config(output_path, config)

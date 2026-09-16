@@ -1,9 +1,11 @@
 import argparse
+import ast
 import hashlib
 import json
 import re
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +26,20 @@ SPLIT_SECTIONS = [
     "HWM.Fan.Control", "HWM.CaseOpen", "WDT", "GPIO",
     "StorageArea", "ThermalProtect",
 ]
+
+
+_CIRCUIT_EVIDENCE_CHIP_PREFIXES = (
+    "NCT6694B",
+    "NCT6106D",
+    "NCT6116D",
+    "NCT6126D",
+    "NCT6776D",
+)
+
+
+def _chip_requires_circuit_evidence(chip_name: str | None) -> bool:
+    c = _norm_chip_name(chip_name or "")
+    return c.startswith(_CIRCUIT_EVIDENCE_CHIP_PREFIXES)
 
 
 def _parse_sections_arg(raw: str | None) -> list[str] | None:
@@ -127,13 +143,81 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _run_temperature_option_fallback_helper(
+    ini_paths: list[Path],
+    probe_path: Path,
+    section: str = "HWM.Temperature",
+    candidates: list[str] | None = None,
+    runner_cmd: str | None = None,
+) -> dict:
+    helper_path = Path(__file__).resolve().parent / "tools" / "hwm_temperature_option_fallback.py"
+    payload: dict = {
+        "helper": str(helper_path),
+        "ini_paths": [str(p) for p in ini_paths],
+        "probe_path": str(probe_path),
+        "decision": "SKIPPED",
+    }
+    if not helper_path.exists():
+        payload["decision"] = "HELPER_MISSING"
+        return payload
+    if not probe_path.exists():
+        payload["decision"] = "PROBE_MISSING"
+        return payload
+
+    missing = [str(p) for p in ini_paths if not p.exists()]
+    if missing:
+        payload["decision"] = "INI_MISSING"
+        payload["missing_ini_paths"] = missing
+        return payload
+
+    cmd = [
+        sys.executable,
+        str(helper_path),
+        "--probe",
+        str(probe_path),
+        "--section",
+        section,
+    ]
+    for p in ini_paths:
+        cmd.extend(["--ini", str(p)])
+    for c in (candidates or []):
+        if str(c).strip():
+            cmd.extend(["--candidate", str(c).strip()])
+    if runner_cmd and runner_cmd.strip():
+        cmd.extend(["--runner-cmd", runner_cmd.strip()])
+
+    cp = subprocess.run(cmd, capture_output=True, text=True)
+    if cp.returncode != 0:
+        payload.update({
+            "decision": "HELPER_ERROR",
+            "exit_code": cp.returncode,
+            "stderr": (cp.stderr or "").strip(),
+        })
+        return payload
+
+    try:
+        data = json.loads((cp.stdout or "").strip() or "{}")
+        if isinstance(data, dict):
+            payload.update(data)
+            payload["decision"] = str(data.get("decision") or "NO_CHANGE")
+            return payload
+    except Exception:
+        pass
+
+    payload.update({
+        "decision": "HELPER_OUTPUT_PARSE_ERROR",
+        "stdout": (cp.stdout or "").strip(),
+    })
+    return payload
+
+
 def _extract_voltage_label_hints(text: str) -> list[str]:
     u = (text or "").upper()
     patterns = [
         r"HWM_VOLTAGE_[A-Z0-9_]+",
         r"\+12VSB|\+5VSB|\+3\.3VSB",
-        r"\+12V|\+5V|\+3\.3V",
-        r"VBAT|VCORE2?|VTT|5VSB|3VSB|12V|5V|3V3",
+        r"\+12V|\+9V|\+5V|\+3\.3V",
+        r"VBAT|VCORE2?|VTT|5VSB|3VSB|12V|9V|5V|3V3",
     ]
     hits: list[str] = []
     for p in patterns:
@@ -147,18 +231,133 @@ def _extract_voltage_label_hints(text: str) -> list[str]:
     return dedup
 
 
-def _collect_scoped_vision_images(project_dir: Path) -> list[Path]:
-    """Collect scoped bios*/circuit* images with common raster extensions.
+def _normalize_monitor_label(label: str) -> str:
+    s = str(label or "").strip().upper()
+    s = re.sub(r"\s+", " ", s)
+    return s
 
-    Scope lock is kept (bios*/circuit* only), but extension matching is
-    normalized to support .png/.jpg/.jpeg with any case.
+
+def _parse_float_safe(x: str) -> float | None:
+    try:
+        return float(str(x).strip())
+    except Exception:
+        return None
+
+
+def _merge_value_hints(existing: object, parsed: list[dict]) -> list[dict]:
+    merged: list[dict] = []
+    idx_by_key: dict[str, int] = {}
+
+    def _add_one(raw: object) -> None:
+        if not isinstance(raw, dict):
+            return
+        label = str(raw.get("label") or "").strip()
+        val = raw.get("value")
+        unit = str(raw.get("unit") or "").strip().upper()
+        if not label:
+            return
+        if not isinstance(val, (int, float)):
+            vv = _parse_float_safe(str(val))
+            if vv is None:
+                return
+            val = vv
+        key = _normalize_monitor_label(label)
+        rec = {
+            "label": label,
+            "value": float(val),
+            "unit": unit,
+        }
+        i = idx_by_key.get(key)
+        if i is None:
+            idx_by_key[key] = len(merged)
+            merged.append(rec)
+        else:
+            merged[i] = rec
+
+    if isinstance(existing, list):
+        for it in existing:
+            _add_one(it)
+    for it in parsed:
+        _add_one(it)
+    return merged
+
+
+def _extract_voltage_value_hints(text: str) -> list[dict]:
+    u = (text or "").upper()
+    patt = re.compile(
+        r"(?P<label>\+?12VSB|\+?5VSB|\+?3\.3VSB|\+?12V|\+?9V|\+?5V|\+?3\.3V|VBAT|VCORE2?|VTT|3VSB|5VSB|12V|9V|5V|3V3)"
+        r"\s*[:=]?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>MV|V)\b"
+    )
+    out: list[dict] = []
+    for m in patt.finditer(u):
+        v = _parse_float_safe(m.group("value"))
+        if v is None:
+            continue
+        out.append({
+            "label": m.group("label"),
+            "value": v,
+            "unit": m.group("unit").upper(),
+        })
+    return _merge_value_hints([], out)
+
+
+def _extract_temperature_value_hints(text: str) -> list[dict]:
+    u = (text or "").upper()
+    patt = re.compile(
+        r"(?P<label>CPU\s*TEMPERATURE|SYSTEM\s*TEMPERATURE|SYS\s*TEMPERATURE|CPU\s*TEMP|SYSTEM\s*TEMP|SYS\s*TEMP|TCPU|TSYS)"
+        r"\s*[:=]?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?:°?\s*C)\b"
+    )
+    out: list[dict] = []
+    for m in patt.finditer(u):
+        v = _parse_float_safe(m.group("value"))
+        if v is None:
+            continue
+        out.append({
+            "label": m.group("label"),
+            "value": v,
+            "unit": "C",
+        })
+    return _merge_value_hints([], out)
+
+
+def _extract_fan_value_hints(text: str) -> list[dict]:
+    u = (text or "").upper()
+    patt = re.compile(
+        r"(?P<label>CPU\s*FAN\d*\s*SPEED|SYS(?:TEM)?\s*FAN\d*\s*SPEED|COM\s*MODULE\s*FAN|CARRIER\s*BOARD\s*FAN|FCPU\d*|FSYS\d*|FOEM\d+)"
+        r"\s*[:=]?\s*(?P<value>-?\d+(?:\.\d+)?)\s*RPM\b"
+    )
+    out: list[dict] = []
+    for m in patt.finditer(u):
+        v = _parse_float_safe(m.group("value"))
+        if v is None:
+            continue
+        out.append({
+            "label": m.group("label"),
+            "value": v,
+            "unit": "RPM",
+        })
+    return _merge_value_hints([], out)
+
+
+def _collect_scoped_vision_images(project_dir: Path, chip_name: str | None = None) -> list[Path]:
+    """Collect scoped bios/circuit rasters with chip-aware scope.
+
+    - Always include bios*.png/jpg/jpeg.
+    - Include circuit*.png/jpg/jpeg only for chip families that require
+      circuit evidence (NCT6694B / NCT61xxD / NCT6776D*).
     """
+    include_circuit = _chip_requires_circuit_evidence(chip_name)
+
     images: list[Path] = []
     for p in sorted(project_dir.iterdir()):
         if not p.is_file():
             continue
         name = p.name.lower()
-        if not (name.startswith("bios") or name.startswith("circuit")):
+        if name.startswith("bios"):
+            pass
+        elif include_circuit and name.startswith("circuit"):
+            pass
+        else:
             continue
         if p.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
             continue
@@ -166,8 +365,8 @@ def _collect_scoped_vision_images(project_dir: Path) -> list[Path]:
     return images
 
 
-def _build_bios_image_cache(project_dir: Path, project_name: str) -> Path:
-    pngs = _collect_scoped_vision_images(project_dir)
+def _build_bios_image_cache(project_dir: Path, project_name: str, chip_name: str | None = None) -> Path:
+    pngs = _collect_scoped_vision_images(project_dir, chip_name=chip_name)
 
     out = project_dir / f"{project_name}-bios-image-cache.json"
 
@@ -195,6 +394,18 @@ def _build_bios_image_cache(project_dir: Path, project_name: str) -> Path:
         if not isinstance(hints, list):
             hints = _extract_voltage_label_hints(p.name)
 
+        voltage_value_hints = prev.get("voltage_value_hints") if isinstance(prev, dict) else None
+        if not isinstance(voltage_value_hints, list):
+            voltage_value_hints = _extract_voltage_value_hints(str(analysis_text or ""))
+
+        temperature_value_hints = prev.get("temperature_value_hints") if isinstance(prev, dict) else None
+        if not isinstance(temperature_value_hints, list):
+            temperature_value_hints = _extract_temperature_value_hints(str(analysis_text or ""))
+
+        fan_value_hints = prev.get("fan_value_hints") if isinstance(prev, dict) else None
+        if not isinstance(fan_value_hints, list):
+            fan_value_hints = _extract_fan_value_hints(str(analysis_text or ""))
+
         analysis_status = (prev.get("analysis_status") if isinstance(prev, dict) else None) or "PENDING_VISION_ANALYZE"
         label_hint_source = (prev.get("label_hint_source") if isinstance(prev, dict) else None) or (
             "vision_analyze" if analysis_status == "DONE_VISION_ANALYZE" else "filename_regex"
@@ -210,14 +421,21 @@ def _build_bios_image_cache(project_dir: Path, project_name: str) -> Path:
             "analysis_status": analysis_status,
             "analysis_text": analysis_text or "",
             "voltage_label_hints": hints,
+            "voltage_value_hints": voltage_value_hints,
+            "temperature_value_hints": temperature_value_hints,
+            "fan_value_hints": fan_value_hints,
             "label_hint_source": label_hint_source,
         })
 
     overall_status = "DONE" if items and all(i.get("analysis_status") == "DONE_VISION_ANALYZE" for i in items) else "PENDING"
+    image_glob = ["bios*.png|jpg|jpeg"]
+    if _chip_requires_circuit_evidence(chip_name):
+        image_glob.append("circuit*.png|jpg|jpeg")
+
     payload = {
         "project": project_name,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "image_glob": ["bios*.png|jpg|jpeg", "circuit*.png|jpg|jpeg"],
+        "image_glob": image_glob,
         "image_count": len(items),
         "analysis_engine": "hermes_vision_analyze",
         "analysis_status": overall_status,
@@ -274,7 +492,19 @@ def _vision_populate_bios_cache(cache_path: Path) -> Path:
 
         status = str(it.get("analysis_status") or "").strip().upper()
         analysis_text = str(it.get("analysis_text") or "").strip()
-        needs_ai = (status != "DONE_VISION_ANALYZE") or (not analysis_text)
+        has_value_fields = all(k in it for k in [
+            "voltage_value_hints",
+            "temperature_value_hints",
+            "fan_value_hints",
+        ])
+        is_bios = str(it.get("filename") or "").strip().lower().startswith("bios")
+        any_value_present = False
+        for k in ["voltage_value_hints", "temperature_value_hints", "fan_value_hints"]:
+            v = it.get(k)
+            if isinstance(v, list) and len(v) > 0:
+                any_value_present = True
+                break
+        needs_ai = (status != "DONE_VISION_ANALYZE") or (not analysis_text) or (not has_value_fields) or (is_bios and not any_value_present)
         if not needs_ai:
             continue
 
@@ -284,6 +514,8 @@ def _vision_populate_bios_cache(cache_path: Path) -> Path:
             "1) 電壓標籤(如 +12V,+5V,+5VSB,+3.3V,VBAT)；"
             "2) 即時溫度感測名稱(如 CPU Temperature/System Temperature，排除 Shutdown threshold 類)；"
             "3) 風扇名稱(如 COM Module FAN/Carrier Board FAN/CPU Fan/System Fan)。"
+            "若畫面有即時數值，請同時附上值與單位，格式盡量像："
+            "VOLTAGE_VALUE: <label>=<number><V|mV>; TEMP_VALUE: <label>=<number>C; FAN_VALUE: <label>=<number>RPM。"
             f" 圖片路徑：{img_path}"
         )
 
@@ -306,10 +538,26 @@ def _vision_populate_bios_cache(cache_path: Path) -> Path:
                 seen.add(s)
                 merged_hints.append(s)
 
+        voltage_value_hints = _merge_value_hints(
+            it.get("voltage_value_hints"),
+            _extract_voltage_value_hints(out),
+        )
+        temperature_value_hints = _merge_value_hints(
+            it.get("temperature_value_hints"),
+            _extract_temperature_value_hints(out),
+        )
+        fan_value_hints = _merge_value_hints(
+            it.get("fan_value_hints"),
+            _extract_fan_value_hints(out),
+        )
+
         it["analysis_text"] = out
         it["analysis_status"] = "DONE_VISION_ANALYZE"
         it["label_hint_source"] = "vision_analyze"
         it["voltage_label_hints"] = merged_hints
+        it["voltage_value_hints"] = voltage_value_hints
+        it["temperature_value_hints"] = temperature_value_hints
+        it["fan_value_hints"] = fan_value_hints
         changed = True
 
     data["analysis_status"] = "DONE" if items and all(
@@ -395,6 +643,7 @@ def _pick_alias_from_bios_labels(report_name: str, labels: set[str]) -> tuple[st
     has_5vsb = any(x in canon_labels for x in {"+5VSB", "5VSB", "5VSTANDBY", "+5VSTANDBY"})
     has_5v_plain = any(x in canon_labels for x in {"+5V", "5V"})
     has_12v = any(x in canon_labels for x in {"+12V", "12V"})
+    has_9v = any(x in canon_labels for x in {"+9V", "9V"})
     has_33v = any(x in canon_labels for x in {"+3.3V", "3V3"})
     has_vbat = "VBAT" in canon_labels
 
@@ -403,16 +652,126 @@ def _pick_alias_from_bios_labels(report_name: str, labels: set[str]) -> tuple[st
         return "VBAT", "BIOS_LABEL_MATCH_VBAT"
     if "12V" in rn and has_12v:
         return "+12V", "BIOS_LABEL_MATCH_12V"
+    if "9V" in rn and has_9v:
+        return "+9V", "BIOS_LABEL_MATCH_9V"
     if "3V" in rn and has_33v:
         return "+3.3V", "BIOS_LABEL_MATCH_3V3"
+
+    # 5V rail: must disambiguate 5V vs 5VSB by report_name first.
+    if "5VSB" in rn or "STBY" in rn:
+        if has_5vsb:
+            return "+5VSB", "BIOS_LABEL_MATCH_5VSB"
+        return None, "NO_CONFIDENT_ALIAS_5VSB"
+
     if "5V" in rn:
-        # 若 BIOS 同時出現 +5V 與 +5VSB，優先用 BIOS plain +5V 顯示名稱
         if has_5v_plain:
             return "+5V", "BIOS_LABEL_MATCH_5V_PLAIN"
         if has_5vsb:
-            return "+5VSB", "BIOS_LABEL_MATCH_5VSB"
+            return "+5VSB", "BIOS_LABEL_MATCH_5VSB_FALLBACK"
 
     return None, "NO_CONFIDENT_ALIAS"
+
+
+def _ai_resolve_unmatched_voltage_aliases(
+    unresolved: list[dict],
+    bios_items: list[dict],
+    candidate_labels: list[str],
+    used_aliases: set[str],
+) -> list[dict]:
+    """Use vision-AI reasoning to map unresolved DB voltage rows to BIOS labels.
+
+    Fallback for obvious name mismatch (e.g., report_name DC vs BIOS +9V),
+    to reduce dependence on Python-side string enumeration.
+    """
+    if not unresolved or not bios_items or not candidate_labels:
+        return []
+
+    bios_candidates: list[dict] = []
+    for it in bios_items:
+        if not isinstance(it, dict):
+            continue
+        fn = str(it.get("filename") or "")
+        if not fn.lower().startswith("bios"):
+            continue
+        p = Path(str(it.get("path") or "").strip())
+        if not p.exists():
+            continue
+        vv = it.get("voltage_value_hints")
+        score = len(vv) if isinstance(vv, list) else 0
+        bios_candidates.append({"item": it, "path": p, "score": score})
+    if not bios_candidates:
+        return []
+
+    bios_candidates.sort(key=lambda x: int(x.get("score") or 0), reverse=True)
+    target_item = bios_candidates[0]["item"]
+    target_path: Path = bios_candidates[0]["path"]
+
+    values_lines: list[str] = []
+    vv = target_item.get("voltage_value_hints")
+    if isinstance(vv, list):
+        for rec in vv:
+            if not isinstance(rec, dict):
+                continue
+            lb = str(rec.get("label") or "").strip()
+            val = rec.get("value")
+            unit = str(rec.get("unit") or "").strip()
+            if lb:
+                values_lines.append(f"- {lb}={val}{unit}")
+
+    added: list[dict] = []
+    used_norm = {str(x).upper().strip() for x in used_aliases if str(x).strip()}
+    candidate_norm = {str(x).upper().strip() for x in candidate_labels if str(x).strip()}
+
+    for row in unresolved:
+        if not isinstance(row, dict):
+            continue
+        report_name = str(row.get("report_name") or "").strip()
+        channel_id = str(row.get("channel_id") or "").strip()
+        if not report_name:
+            continue
+
+        prompt = (
+            "請分析這張 BIOS 圖，替一個未匹配 DB 電壓項目選最可能 BIOS 標籤。"
+            "可用語意/數值推理（名字可不一致），但不可虛構標籤。\n"
+            f"目標DB項目: report_name={report_name}, channel_id={channel_id}\n"
+            f"候選BIOS標籤(只能選其一): {', '.join(candidate_labels)}\n"
+            f"已使用標籤(盡量避免重複): {', '.join(sorted(used_norm)) if used_norm else '(none)'}\n"
+            "BIOS可見電壓值:\n"
+            f"{chr(10).join(values_lines) if values_lines else '- (no parsed values)'}\n"
+            "只輸出一行：PICK|<alias-or-UNKNOWN>|<high|medium|low>|<reason>"
+        )
+        out = _run_vision_analyze(target_path, prompt)
+        if not out:
+            continue
+        first = str(out).strip().splitlines()[0].strip()
+        m = re.match(r"^PICK\|([^|]+)\|(high|medium|low)\|(.+)$", first, re.IGNORECASE)
+        if not m:
+            continue
+
+        alias = m.group(1).strip()
+        confidence = m.group(2).strip().lower()
+        reason = m.group(3).strip()
+        if not alias or alias.upper() == "UNKNOWN":
+            continue
+        alias_norm = alias.upper().strip()
+        if alias_norm in used_norm:
+            continue
+        if alias_norm not in candidate_norm:
+            continue
+        if confidence != "high":
+            continue
+
+        used_norm.add(alias_norm)
+        added.append({
+            "report_name": report_name,
+            "channel_id": channel_id,
+            "alias": alias,
+            "confidence": "high",
+            "reason": f"AI_INFERRED_MISMATCH:{reason}",
+            "evidence_image": str(target_item.get("filename") or target_path.name),
+        })
+
+    return added
 
 
 def _build_voltage_alias_bridge(ec_base: dict, bios_cache: dict) -> dict:
@@ -423,12 +782,32 @@ def _build_voltage_alias_bridge(ec_base: dict, bios_cache: dict) -> dict:
 
     image_label_map: dict[str, list[str]] = {}
     merged_labels: set[str] = set()
+    measured_labels: set[str] = set()
     for item in bios_items:
         if not isinstance(item, dict):
             continue
         image = item.get("filename") or item.get("path") or ""
+        analysis_text = item.get("analysis_text") or ""
         labels = []
-        labels.extend(_extract_voltage_label_hints(item.get("analysis_text") or ""))
+        labels.extend(_extract_voltage_label_hints(analysis_text))
+
+        # Strong signal: parsed/measured voltage-value pairs from analysis text.
+        for rec in _extract_voltage_value_hints(str(analysis_text)):
+            if isinstance(rec, dict):
+                lb = str(rec.get("label") or "").strip().upper()
+                if lb:
+                    labels.append(lb)
+                    measured_labels.add(lb)
+
+        # Backward compatibility: keep explicit hints if present in cache.
+        vv = item.get("voltage_value_hints")
+        if isinstance(vv, list):
+            for rec in vv:
+                if isinstance(rec, dict):
+                    lb = str(rec.get("label") or "").strip().upper()
+                    if lb:
+                        labels.append(lb)
+                        measured_labels.add(lb)
         hints = item.get("voltage_label_hints")
         if isinstance(hints, list):
             labels.extend([str(x).upper() for x in hints])
@@ -447,6 +826,7 @@ def _build_voltage_alias_bridge(ec_base: dict, bios_cache: dict) -> dict:
             "+5VSB": {"+5VSB", "5VSB", "5V STANDBY", "+5V STANDBY", "+V5SB"},
             "+5V": {"+5V", "5V", "+V5"},
             "+12V": {"+12V", "12V", "+V12"},
+            "+9V": {"+9V", "9V", "+V9"},
             "+3.3V": {"+3.3V", "3V3", "+V3.3"},
             "VBAT": {"VBAT", "+VBAT"},
         }.get(alias, set())
@@ -478,6 +858,54 @@ def _build_voltage_alias_bridge(ec_base: dict, bios_cache: dict) -> dict:
                 "report_name": report_name,
                 "channel_id": channel_id,
                 "reason": reason,
+            })
+
+    def _canon_label(x: str) -> str:
+        y = (x or "").upper().strip().replace(" ", "")
+        y = y.replace("+V5SB", "+5VSB").replace("+V12", "+12V").replace("+V9", "+9V").replace("+V5", "+5V")
+        y = y.replace("+V3.3", "+3.3V").replace("+VBAT", "VBAT")
+        return y
+
+    # AI fallback for mismatched naming: let model reason from image + values.
+    if unresolved:
+        cand = sorted({_canon_label(x) for x in measured_labels if str(x).strip()} or
+                      {_canon_label(x) for x in merged_labels if str(x).strip()})
+        used = {_canon_label(str(x.get("alias") or "")) for x in alias_map if isinstance(x, dict)}
+        ai_added = _ai_resolve_unmatched_voltage_aliases(unresolved, bios_items, cand, used)
+        if ai_added:
+            resolved_keys = {
+                (str(x.get("report_name") or ""), str(x.get("channel_id") or ""))
+                for x in ai_added if isinstance(x, dict)
+            }
+            unresolved = [
+                x for x in unresolved
+                if (str(x.get("report_name") or ""), str(x.get("channel_id") or "")) not in resolved_keys
+            ]
+            alias_map.extend(ai_added)
+
+    if len(unresolved) == 1:
+        known_aliases = {"+12V", "+9V", "+5V", "+5VSB", "+3.3V", "VBAT"}
+        used_aliases = {_canon_label(str(x.get("alias") or "")) for x in alias_map if isinstance(x, dict)}
+
+        measured_known = {_canon_label(x) for x in measured_labels}
+        measured_known = {x for x in measured_known if x in known_aliases}
+        remain_measured = measured_known - used_aliases
+
+        merged_known = {_canon_label(x) for x in merged_labels}
+        merged_known = {x for x in merged_known if x in known_aliases}
+        remain_merged = merged_known - used_aliases
+
+        inferred_aliases = remain_measured if len(remain_measured) == 1 else remain_merged
+        if len(inferred_aliases) == 1:
+            inferred = next(iter(inferred_aliases))
+            tail = unresolved.pop()
+            alias_map.append({
+                "report_name": tail.get("report_name", ""),
+                "channel_id": tail.get("channel_id", ""),
+                "alias": inferred,
+                "confidence": "high",
+                "reason": "BIOS_SINGLETON_REMAINDER_MATCH",
+                "evidence_image": first_evidence_image(inferred),
             })
 
     payload = {
@@ -512,8 +940,10 @@ def _write_voltage_alias_bridge_file(project_dir: Path, project_name: str,
 def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path | None) -> dict:
     """Item-4: merge alias_map back into HWM.Voltage row disp_name(Name field).
 
-    Also keep item key (left side) semantically aligned with display alias.
-    Example: alias '+5V' should output item key 'V50' (not 'V5SB').
+    Default behavior keeps item_name from report/channel semantics and only fills
+    disp_name(Name). One exception: when BIOS clearly shows VBAT, report_name is
+    HWM_VOLTAGE_VBATLI, and no true VBAT key exists in this section, promote that
+    row key from VBATLI -> VBAT.
     """
     if not alias_bridge_path:
         return query_result
@@ -527,8 +957,11 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
         return query_result
 
     alias_map = bridge.get("alias_map") if isinstance(bridge, dict) else []
-    if not isinstance(alias_map, list) or not alias_map:
-        return query_result
+    if not isinstance(alias_map, list):
+        alias_map = []
+    unresolved = bridge.get("unresolved") if isinstance(bridge, dict) else []
+    if not isinstance(unresolved, list):
+        unresolved = []
 
     by_key: dict[tuple[str, str], str] = {}
     by_report: dict[str, str] = {}
@@ -550,18 +983,25 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
         if report_name:
             by_report[report_name] = alias
 
-    if not by_key and not by_report:
-        return query_result
+    unresolved_keys: set[tuple[str, str]] = set()
+    for u in unresolved:
+        if not isinstance(u, dict):
+            continue
+        unresolved_keys.add((
+            str(u.get("report_name") or "").strip(),
+            str(u.get("channel_id") or "").strip(),
+        ))
 
-    alias_to_item_key = {
-        "+12V": "V120",
-        "+5V": "V50",
-        "+5VSB": "V5SB",
-        "+3.3V": "V33",
-        "VBAT": "VBAT",
-    }
+    has_true_vbat = any(
+        _canonical_voltage_item_name(
+            str(r.get("report_name") or ""),
+            str(r.get("item_name") or r.get("channel_name") or "")
+        ) == "VBAT"
+        for r in rows if isinstance(r, dict)
+    )
 
     merged = 0
+    oem_fallback_count = 0
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -573,12 +1013,56 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
             alias = by_report.get(report_name)
         if alias:
             row["disp_name"] = alias
-            mapped_key = alias_to_item_key.get(alias)
-            if mapped_key:
-                row["item_name"] = mapped_key
+            current_item = _canonical_voltage_item_name(
+                report_name,
+                str(row.get("item_name") or row.get("channel_name") or "")
+            )
+            if (alias == "VBAT"
+                    and current_item == "VBATLI"
+                    and not has_true_vbat):
+                row["item_name"] = "VBAT"
+                has_true_vbat = True
             merged += 1
 
+    # If still unmatched after alias merge, keep count visibility by parking them
+    # into VOEM<n> slots (name mismatch fallback).
+    if unresolved_keys:
+        used_items: set[str] = set()
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            item = _canonical_voltage_item_name(
+                str(r.get("report_name") or ""),
+                str(r.get("item_name") or r.get("channel_name") or "")
+            )
+            if item:
+                used_items.add(item)
+
+        oem_slots = [f"VOEM{i}" for i in range(4) if f"VOEM{i}" not in used_items]
+        if oem_slots:
+            for r in rows:
+                if not isinstance(r, dict) or not oem_slots:
+                    continue
+                rk = (
+                    str(r.get("report_name") or "").strip(),
+                    str(r.get("channel_id") or r.get("channel") or "").strip(),
+                )
+                if rk not in unresolved_keys:
+                    continue
+                cur = _canonical_voltage_item_name(
+                    str(r.get("report_name") or ""),
+                    str(r.get("item_name") or r.get("channel_name") or "")
+                )
+                if cur.startswith("VOEM"):
+                    continue
+                r["item_name"] = oem_slots.pop(0)
+                if not str(r.get("disp_name") or "").strip():
+                    r["disp_name"] = "OEM Voltage"
+                oem_fallback_count += 1
+
     query_result["alias_merged_count"] = merged
+    query_result["alias_unresolved_count"] = len(unresolved_keys)
+    query_result["alias_oem_fallback_count"] = oem_fallback_count
     query_result["alias_bridge_path"] = str(alias_bridge_path)
     return query_result
 
@@ -613,6 +1097,10 @@ def _canonical_voltage_item_name(report_name: str, fallback: str = "") -> str:
         "HWM_VOLTAGE_VOEM1": "VOEM1",
         "HWM_VOLTAGE_VOEM2": "VOEM2",
         "HWM_VOLTAGE_VOEM3": "VOEM3",
+        "HWM_VOLTAGE_OEM0": "VOEM0",
+        "HWM_VOLTAGE_OEM1": "VOEM1",
+        "HWM_VOLTAGE_OEM2": "VOEM2",
+        "HWM_VOLTAGE_OEM3": "VOEM3",
         "HWM_VOLTAGE_N5V": "VN50",
         "HWM_VOLTAGE_N12V": "VN120",
     }
@@ -657,6 +1145,220 @@ def _probe_ok_voltage_report_names(probe_path: Path | None) -> list[str]:
     return names
 
 
+def _map_bios_voltage_label_to_item_alias(label: str) -> tuple[str, str] | None:
+    """Map BIOS-visible voltage label text to INI item key + Name(alias)."""
+    s = str(label or "").strip().upper()
+    if not s:
+        return None
+
+    s = s.replace(" ", "")
+    s = s.replace("＋", "+")
+
+    # standby rails first (avoid 5VSB being matched by plain 5V rule)
+    if any(t in s for t in ["5VSB", "5VSTANDBY", "+5VSB", "+5VSTANDBY"]):
+        return "V5SB", "+5VSB"
+    if any(t in s for t in ["3.3VSB", "3VSB", "+3.3VSB", "+3VSB"]):
+        return "V3SB", "+3VSB"
+
+    if "VCORE2" in s:
+        return "VCORE2", "VCORE2"
+    if "VCORE" in s:
+        return "VCORE", "VCORE"
+    if "VBAT" in s:
+        return "VBAT", "VBAT"
+    if "VTT" in s:
+        return "VTT", "VTT"
+    if "12V" in s:
+        return "V120", "+12V"
+    if "9V" in s:
+        return "DC", "+9V"
+    if "3.3V" in s or "3V3" in s:
+        return "V33", "+3.3V"
+    # keep plain 5V after 5VSB rule
+    if s in {"+5V", "5V", "+V5"} or ("5V" in s and "SB" not in s and "S5" not in s):
+        return "V50", "+5V"
+
+    return None
+
+
+def _extract_bios_voltage_name_hints(cache_path: Path) -> dict:
+    """Extract BIOS-visible voltage item set + alias names for SuperIO v2 refine."""
+    out: dict = {
+        "visible_items": [],
+        "alias_by_item": {},
+        "evidence_images": {},
+    }
+    if not cache_path.exists():
+        return out
+    try:
+        data = _load_json(cache_path)
+    except Exception:
+        return out
+
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return out
+
+    visible: set[str] = set()
+    alias_by_item: dict[str, str] = {}
+    evidence_images: dict[str, list[str]] = {}
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        fn = str(it.get("filename") or "")
+        if not fn.lower().startswith("bios"):
+            continue
+
+        labels_with_priority: list[tuple[str, int]] = []
+
+        # higher confidence: explicit value hints in BIOS text
+        vv = it.get("voltage_value_hints")
+        if isinstance(vv, list):
+            for rec in vv:
+                if isinstance(rec, dict):
+                    lb = str(rec.get("label") or "").strip()
+                    if lb:
+                        labels_with_priority.append((lb, 0))
+
+        # medium confidence: parsed label hints
+        for lb in _extract_voltage_label_hints(str(it.get("analysis_text") or "")):
+            labels_with_priority.append((lb, 1))
+        vh = it.get("voltage_label_hints")
+        if isinstance(vh, list):
+            for lb in vh:
+                s = str(lb or "").strip()
+                if s:
+                    labels_with_priority.append((s, 1))
+
+        for lb, _prio in labels_with_priority:
+            mapped = _map_bios_voltage_label_to_item_alias(lb)
+            if not mapped:
+                continue
+            item_key, alias = mapped
+            visible.add(item_key)
+
+            # first-wins is stable because priority-0 entries are inserted first.
+            if item_key not in alias_by_item:
+                alias_by_item[item_key] = alias
+
+            imgs = evidence_images.setdefault(item_key, [])
+            if fn and fn not in imgs:
+                imgs.append(fn)
+
+    out["visible_items"] = sorted(visible)
+    out["alias_by_item"] = alias_by_item
+    out["evidence_images"] = evidence_images
+    return out
+
+
+def _probe_ok_voltage_measurements(probe_path: Path | None) -> dict[str, dict]:
+    """Parse probe HWM Voltage block and return item-key indexed OK measurements."""
+    if not probe_path or not probe_path.exists():
+        return {}
+
+    out: dict[str, dict] = {}
+    in_voltage_block = False
+
+    with open(probe_path, "r", encoding="utf-8-sig") as f:
+        for raw in f:
+            line = raw.strip()
+            if line.startswith("==="):
+                in_voltage_block = ("HWM Voltage" in line)
+                continue
+            if not in_voltage_block:
+                continue
+
+            m = re.match(r"^\[OK\]\s+HWM_VOLTAGE_([A-Z0-9_]+)\b.*\bValue=([0-9]+)\s*mV\b", line)
+            if not m:
+                continue
+            suffix = m.group(1)
+            mv = _parse_int_value(m.group(2))
+            if mv is None:
+                continue
+
+            rn = f"HWM_VOLTAGE_{suffix}"
+            item_key = _canonical_voltage_item_name(rn, suffix)
+            if not item_key or item_key in out:
+                continue
+            out[item_key] = {
+                "report_name": suffix,
+                "mv": mv,
+            }
+
+    return out
+
+
+def _apply_superio_voltage_v2_refine(result: dict,
+                                     bios_cache_path: Path | None,
+                                     probe_path: Path | None) -> dict:
+    """Non-EC SuperIO v2 refine.
+
+    Keep only BIOS-visible voltage items that are also probe-OK, and backfill
+    Name(alias) with BIOS display labels.
+    """
+    if result.get("status") != "FOUND":
+        return result
+    rows = result.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return result
+    if not bios_cache_path or not probe_path:
+        return result
+
+    bios_hints = _extract_bios_voltage_name_hints(bios_cache_path)
+    probe_ok = _probe_ok_voltage_measurements(probe_path)
+
+    visible_items = set(str(x) for x in bios_hints.get("visible_items") or [])
+    alias_by_item = bios_hints.get("alias_by_item") or {}
+    if not visible_items or not probe_ok:
+        return result
+
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        report_name = str(row.get("report_name") or row.get("item_name") or "")
+        fallback = str(row.get("item_name") or row.get("channel_name") or "")
+        item_key = _canonical_voltage_item_name(report_name, fallback)
+
+        out_row = dict(row)
+        if item_key:
+            out_row["item_name"] = item_key
+
+        in_bios = item_key in visible_items if item_key else False
+        in_probe = item_key in probe_ok if item_key else False
+        if in_bios and in_probe:
+            alias = alias_by_item.get(item_key)
+            if alias:
+                out_row["disp_name"] = alias
+            kept.append(out_row)
+        else:
+            dropped.append({
+                "item_name": item_key,
+                "report_name": str(row.get("report_name") or ""),
+                "channel_id": str(row.get("channel_id") or row.get("channel") or ""),
+                "reason": "NOT_IN_BIOS" if not in_bios else "NOT_OK_IN_PROBE",
+            })
+
+    out = dict(result)
+    out["rows"] = kept
+    out["row_count"] = len(kept)
+    out["status"] = "FOUND" if kept else "SECTION_EMPTY"
+    out["superio_v2"] = {
+        "enabled": True,
+        "route": "SUPERIO_V2_BIOS_PROBE_ALIAS",
+        "bios_visible_count": len(visible_items),
+        "probe_ok_count": len(probe_ok),
+        "kept_count": len(kept),
+        "dropped_count": len(dropped),
+        "dropped": dropped,
+        "evidence_images": bios_hints.get("evidence_images") or {},
+    }
+    return out
+
+
 def _probe_ok_temperature_report_names(probe_path: Path | None) -> list[str]:
     if not probe_path or not probe_path.exists():
         return []
@@ -686,28 +1388,6 @@ def _probe_ok_temperature_report_names(probe_path: Path | None) -> list[str]:
     return names
 
 
-def _load_temperature_defaults(db_path: Path) -> dict[str, str]:
-    defaults: dict[str, str] = {
-        "io_port": "0",
-        "options": "0x80000000",
-        "offset": "0",
-        "disp_name": "",
-    }
-
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute('SELECT name, value FROM "HWM.Temperature.Defaults"').fetchall()
-        for r in rows:
-            k = (r["name"] or "").strip()
-            if k in defaults:
-                defaults[k] = (r["value"] or "").strip()
-    finally:
-        con.close()
-
-    return defaults
-
-
 def _temp_item_name_from_report(report_name: str) -> str:
     rn = (report_name or "").upper().strip()
     direct_map = {
@@ -730,6 +1410,243 @@ def _temp_item_name_from_report(report_name: str) -> str:
     return suffix
 
 
+def _is_superio_temperature_seed_chip(chip_name: str) -> bool:
+    """Return True for non-EC SIO families that should emit temperature seed rows."""
+    c = _norm_chip_name(chip_name)
+    return c.startswith(("NCT6694B", "NCT6106D", "NCT6116D", "NCT6126D", "NCT6776D"))
+
+
+def _apply_superio_temperature_seed_rows(rows: list[dict]) -> list[dict]:
+    """Normalize non-EC SIO HWM.Temperature rows for v1 seed INI output."""
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        r = dict(row)
+        report_name = str(r.get("report_name") or r.get("item_name") or "")
+        fallback = str(r.get("item_name") or r.get("channel_name") or "")
+        item = _temp_item_name_from_report(report_name) or fallback
+        if item:
+            r["item_name"] = item
+        r["channel"] = r.get("channel") or r.get("channel_id") or ""
+        r["option"] = r.get("option") or r.get("options") or ""
+        out.append(r)
+    return out
+
+
+def _map_bios_temp_label_to_item_alias(label: str) -> tuple[str, str] | None:
+    s = (label or "").upper().strip()
+    if not s:
+        return None
+    s = re.sub(r"\s+", " ", s)
+
+    if "CPU" in s and "TEMPERATURE" in s:
+        return "TCPU", "CPU Temperature"
+    if ("SYSTEM" in s or re.search(r"\bSYS\b", s)) and "TEMPERATURE" in s:
+        return "TSYS", "System Temperature"
+    if "CHIPSET" in s and "TEMPERATURE" in s:
+        return "TCHIPSET", "Chipset Temperature"
+    if ("GRAPHIC" in s or "GPU" in s) and "TEMPERATURE" in s:
+        return "GRAPHIC", "Graphic Temperature"
+
+    m_oem = re.search(r"\bOEM\s*([0-6])\b", s)
+    if m_oem and "TEMPERATURE" in s:
+        idx = m_oem.group(1)
+        return f"TOEM{idx}", f"OEM{idx} Temperature"
+    return None
+
+
+def _extract_bios_temperature_name_hints(cache_path: Path) -> dict:
+    """Extract BIOS-visible temperature item set + alias names for SuperIO v2 refine."""
+    out: dict = {
+        "visible_items": [],
+        "alias_by_item": {},
+        "value_c_by_item": {},
+        "evidence_images": {},
+    }
+    if not cache_path.exists():
+        return out
+    try:
+        data = _load_json(cache_path)
+    except Exception:
+        return out
+
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return out
+
+    visible: set[str] = set()
+    alias_by_item: dict[str, str] = {}
+    value_c_by_item: dict[str, float] = {}
+    evidence_images: dict[str, list[str]] = {}
+
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        fn = str(it.get("filename") or "")
+        if not fn.lower().startswith("bios"):
+            continue
+
+        labels_with_priority: list[tuple[str, int, float | None]] = []
+
+        tv = it.get("temperature_value_hints")
+        if isinstance(tv, list):
+            for rec in tv:
+                if isinstance(rec, dict):
+                    lb = str(rec.get("label") or "").strip()
+                    vv = rec.get("value")
+                    vnum = float(vv) if isinstance(vv, (int, float)) else None
+                    if lb:
+                        labels_with_priority.append((lb, 0, vnum))
+
+        txt = str(it.get("analysis_text") or "")
+        for m in re.finditer(r"TEMP_VALUE:\s*([^=\n]+?)\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*C\b", txt, re.IGNORECASE):
+            lb = str(m.group(1) or "").strip()
+            try:
+                vnum = float(m.group(2))
+            except Exception:
+                vnum = None
+            labels_with_priority.append((lb, 1, vnum))
+
+        for lb, _prio, vc in labels_with_priority:
+            mapped = _map_bios_temp_label_to_item_alias(lb)
+            if not mapped:
+                continue
+            item_key, alias = mapped
+            visible.add(item_key)
+
+            if item_key not in alias_by_item:
+                alias_by_item[item_key] = alias
+            if vc is not None and item_key not in value_c_by_item:
+                value_c_by_item[item_key] = vc
+
+            imgs = evidence_images.setdefault(item_key, [])
+            if fn and fn not in imgs:
+                imgs.append(fn)
+
+    out["visible_items"] = sorted(visible)
+    out["alias_by_item"] = alias_by_item
+    out["value_c_by_item"] = value_c_by_item
+    out["evidence_images"] = evidence_images
+    return out
+
+
+def _probe_ok_temperature_measurements(probe_path: Path | None) -> dict[str, dict]:
+    """Parse probe HWM Temperature block and return item-key indexed OK measurements."""
+    if not probe_path or not probe_path.exists():
+        return {}
+
+    out: dict[str, dict] = {}
+    in_temp_block = False
+
+    with open(probe_path, "r", encoding="utf-8-sig") as f:
+        for raw in f:
+            line = raw.strip()
+            if line.startswith("==="):
+                in_temp_block = ("HWM Temperature" in line)
+                continue
+            if not in_temp_block:
+                continue
+
+            m = re.match(r"^\[OK\]\s+HWM_TEMP_([A-Z0-9_]+)\b.*\bValue=([0-9]+)(?:\s*\(=\s*([0-9]+(?:\.[0-9]+)?)\s*C\))?", line)
+            if not m:
+                continue
+
+            suffix = m.group(1)
+            rn = f"HWM_TEMP_{suffix}"
+            item_key = _temp_item_name_from_report(rn)
+            if not item_key or item_key in out:
+                continue
+
+            raw_v = _parse_int_value(m.group(2))
+            c_v = None
+            if m.group(3):
+                try:
+                    c_v = float(m.group(3))
+                except Exception:
+                    c_v = None
+
+            out[item_key] = {
+                "report_name": rn,
+                "raw": raw_v,
+                "celsius": c_v,
+            }
+
+    return out
+
+
+def _apply_superio_temperature_v2_refine(result: dict,
+                                         bios_cache_path: Path | None,
+                                         probe_path: Path | None) -> dict:
+    """Non-EC SuperIO HWM.Temperature v2 refine.
+
+    Keep only BIOS-visible temperature items that are also probe-OK, and backfill
+    Name(alias) with BIOS display labels.
+    """
+    if result.get("status") != "FOUND":
+        return result
+    rows = result.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return result
+    if not bios_cache_path or not probe_path:
+        return result
+
+    bios_hints = _extract_bios_temperature_name_hints(bios_cache_path)
+    probe_ok = _probe_ok_temperature_measurements(probe_path)
+
+    visible_items = set(str(x) for x in bios_hints.get("visible_items") or [])
+    alias_by_item = bios_hints.get("alias_by_item") or {}
+    if not visible_items or not probe_ok:
+        return result
+
+    kept: list[dict] = []
+    dropped: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        report_name = str(row.get("report_name") or row.get("item_name") or "")
+        item_key = _temp_item_name_from_report(report_name)
+        if not item_key:
+            item_key = str(row.get("item_name") or "").strip().upper()
+
+        out_row = dict(row)
+        if item_key:
+            out_row["item_name"] = item_key
+
+        in_bios = item_key in visible_items if item_key else False
+        in_probe = item_key in probe_ok if item_key else False
+        if in_bios and in_probe:
+            alias = alias_by_item.get(item_key)
+            if alias:
+                out_row["disp_name"] = alias
+            kept.append(out_row)
+        else:
+            dropped.append({
+                "item_name": item_key,
+                "report_name": str(row.get("report_name") or ""),
+                "channel_id": str(row.get("channel_id") or row.get("channel") or ""),
+                "reason": "NOT_IN_BIOS" if not in_bios else "NOT_OK_IN_PROBE",
+            })
+
+    out = dict(result)
+    out["rows"] = kept
+    out["row_count"] = len(kept)
+    out["status"] = "FOUND" if kept else "SECTION_EMPTY"
+    out["superio_temp_v2"] = {
+        "enabled": True,
+        "route": "SUPERIO_TEMP_V2_BIOS_PROBE_ALIAS",
+        "bios_visible_count": len(visible_items),
+        "probe_ok_count": len(probe_ok),
+        "kept_count": len(kept),
+        "dropped_count": len(dropped),
+        "dropped": dropped,
+        "evidence_images": bios_hints.get("evidence_images") or {},
+        "bios_value_c_by_item": bios_hints.get("value_c_by_item") or {},
+    }
+    return out
+
+
 def _spec_temperature_alias_map(spec: dict | None) -> dict[str, str]:
     out: dict[str, str] = {}
     if not isinstance(spec, dict):
@@ -747,6 +1664,24 @@ def _spec_temperature_alias_map(spec: dict | None) -> dict[str, str]:
     return out
 
 
+def _coerce_display_hint(value: object) -> str:
+    """Return only the display label from a hint payload.
+
+    Hint files may carry structured evidence, but INI Name fields must contain
+    a plain label string rather than a Python dict representation.
+    """
+    if isinstance(value, dict):
+        value = value.get("label") or value.get("name") or value.get("alias") or ""
+    elif isinstance(value, str) and value.lstrip().startswith("{"):
+        try:
+            parsed = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed.get("label") or parsed.get("name") or parsed.get("alias") or ""
+    return str(value or "").strip()
+
+
 def _load_project_temperature_name_hints(project_dir: Path, project_name: str) -> dict[str, str]:
     """Load explicit BIOS-derived temperature display names for this project."""
     path = project_dir / f"{project_name}-temperature-name-hints.json"
@@ -759,7 +1694,13 @@ def _load_project_temperature_name_hints(project_dir: Path, project_name: str) -
     by_key = data.get("by_key") if isinstance(data, dict) else None
     if not isinstance(by_key, dict):
         return {}
-    return {str(k).strip().upper(): str(v).strip() for k, v in by_key.items() if str(k).strip() and str(v).strip()}
+    out: dict[str, str] = {}
+    for k, v in by_key.items():
+        kk = str(k or "").strip().upper()
+        vv = _coerce_display_hint(v)
+        if kk and vv:
+            out[kk] = vv
+    return out
 
 
 def _apply_temperature_name_hints(result: dict, hints: dict[str, str]) -> dict:
@@ -843,7 +1784,7 @@ def _write_project_temperature_name_hints(project_dir: Path, project_name: str, 
             if isinstance(prev_by_key, dict):
                 for k, v in prev_by_key.items():
                     kk = str(k or "").strip().upper()
-                    vv = str(v or "").strip()
+                    vv = _coerce_display_hint(v)
                     if kk and vv:
                         payload.setdefault("by_key", {})[kk] = vv
                 if payload.get("by_key"):
@@ -861,195 +1802,81 @@ def _write_project_temperature_name_hints(project_dir: Path, project_name: str, 
 
 def _build_hwm_temperature_query_result(db_path: Path, product_name: str, chip_name: str,
                                         probe_path: Path | None, spec: dict | None) -> dict:
-    result: dict = {
-        "query_key": {
-            "product_name": product_name,
-            "chip_name": chip_name,
-            "section": "HWM.Temperature",
-        },
-        "status": None,
-        "prod_chip": None,
-        "rows": [],
-        "source": "PROBE_CHANNELS_DB_DEFAULTS",
-    }
-
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        prod = con.execute(
-            """
-            SELECT id, product_name, chip_name, hardware_id, config_chip
-            FROM ProductChip
-            WHERE product_name = ? AND chip_name = ?
-            LIMIT 1
-            """,
-            (product_name, chip_name),
-        ).fetchone()
-        if prod is None:
-            result["status"] = "NO_SUCH_PRODUCT_CHIP"
-            result["row_count"] = 0
-            return result
-
-        result["prod_chip"] = dict(prod)
-        defaults = _load_temperature_defaults(db_path)
-        result["defaults"] = defaults
-        alias_by_item = _spec_temperature_alias_map(spec)
-
-        report_names = _probe_ok_temperature_report_names(probe_path)
-        if not report_names:
-            result["status"] = "SECTION_EMPTY"
-            result["row_count"] = 0
-            result["error"] = "NO_OK_HWM_TEMPERATURE_IN_PROBE"
-            return result
-
-        ph = ",".join(["?"] * len(report_names))
-        ch_rows = con.execute(
-            f'''SELECT report_name, channel_name, channel_id
-                FROM "HWM.Temperature.Channels"
-                WHERE report_name IN ({ph})
-                ORDER BY id''',
-            tuple(report_names),
-        ).fetchall()
-        ch_map = {r["report_name"]: dict(r) for r in ch_rows}
-
-        out_rows: list[dict] = []
-        missing_reports: list[str] = []
-        for rn in report_names:
-            c = ch_map.get(rn)
-            if not c:
-                missing_reports.append(rn)
-                continue
-            item_name = _temp_item_name_from_report(rn)
-            channel_id = c.get("channel_id") or ""
-            out_rows.append({
-                "item_name": item_name,
-                "channel": channel_id,
-                "channel_id": channel_id,
-                "io_port": defaults["io_port"],
-                "option": defaults["options"],
-                "offset": defaults["offset"],
-                "disp_name": alias_by_item.get(item_name.upper(), defaults.get("disp_name", "")),
-                "report_name": rn,
-            })
-
-        result["rows"] = out_rows
-        result["row_count"] = len(out_rows)
-        result["status"] = "FOUND" if out_rows else "SECTION_EMPTY"
-        if missing_reports:
-            result["missing_report_name_mappings"] = missing_reports
+    result = query_section(db_path, product_name, chip_name, "HWM.Temperature")
+    result["source"] = "PROBE_CHANNELS_BY_HARDWARE_ID"
+    report_names = _probe_ok_temperature_report_names(probe_path)
+    if not report_names:
+        result["status"] = "SECTION_EMPTY"
+        result["rows"] = []
+        result["row_count"] = 0
+        result["error"] = "NO_OK_HWM_TEMPERATURE_IN_PROBE"
         return result
-    finally:
-        con.close()
 
+    wanted = set(report_names)
+    alias_by_item = _spec_temperature_alias_map(spec)
+    db_rows = {str(r.get("report_name") or ""): r for r in result.get("rows") or []
+               if isinstance(r, dict)}
+    out_rows: list[dict] = []
+    missing_reports: list[str] = []
+    for rn in report_names:
+        row = db_rows.get(rn)
+        if row is None:
+            missing_reports.append(rn)
+            continue
+        item_name = _temp_item_name_from_report(rn)
+        out = dict(row)
+        out["item_name"] = item_name
+        out["channel"] = out.get("channel_id", "")
+        out["option"] = out.get("options", "")
+        # channel_name/report_name are SUSI/internal reference fields, not INI display Name.
+        # Only use explicit alias evidence; otherwise keep Name blank.
+        out["disp_name"] = alias_by_item.get(item_name.upper(), "")
+        out_rows.append(out)
 
-def _load_voltage_defaults(db_path: Path) -> dict[str, str]:
-    defaults: dict[str, str] = {
-        "io_port": "0",
-        "options": "0x80000000",
-        "resistor1": "0",
-        "resistor2": "0",
-        "offset": "0",
-    }
-
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute('SELECT name, value FROM "HWM.Voltage.Defaults"').fetchall()
-        for r in rows:
-            k = (r["name"] or "").strip()
-            if k in defaults:
-                defaults[k] = (r["value"] or "").strip()
-    finally:
-        con.close()
-
-    return defaults
+    result["rows"] = out_rows
+    result["row_count"] = len(out_rows)
+    result["status"] = "FOUND" if out_rows else "SECTION_EMPTY"
+    if missing_reports:
+        result["missing_report_name_mappings"] = missing_reports
+    return result
 
 
 def _build_ec_voltage_query_result(db_path: Path, product_name: str, chip_name: str,
                                    probe_path: Path | None) -> dict:
-    result: dict = {
-        "query_key": {
-            "product_name": product_name,
-            "chip_name": chip_name,
-            "section": "HWM.Voltage",
-        },
-        "status": None,
-        "prod_chip": None,
-        "rows": [],
-        "source": "EC_PROBE_CHANNELS",
-    }
-
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        prod = con.execute(
-            """
-            SELECT id, product_name, chip_name, hardware_id, config_chip
-            FROM ProductChip
-            WHERE product_name = ? AND chip_name = ?
-            LIMIT 1
-            """,
-            (product_name, chip_name),
-        ).fetchone()
-        if prod is None:
-            result["status"] = "NO_SUCH_PRODUCT_CHIP"
-            result["row_count"] = 0
-            return result
-
-        result["prod_chip"] = dict(prod)
-        defaults = _load_voltage_defaults(db_path)
-        result["defaults"] = defaults
-
-        report_names = _probe_ok_voltage_report_names(probe_path)
-        if not report_names:
-            result["status"] = "SECTION_EMPTY"
-            result["row_count"] = 0
-            result["error"] = "NO_OK_HWM_VOLTAGE_IN_PROBE"
-            return result
-
-        ph = ",".join(["?"] * len(report_names))
-        ch_rows = con.execute(
-            f'''SELECT report_name, channel_name, channel_id
-                FROM "HWM.Voltage.Channels"
-                WHERE report_name IN ({ph})
-                ORDER BY id''',
-            tuple(report_names),
-        ).fetchall()
-
-        ch_map = {r["report_name"]: dict(r) for r in ch_rows}
-
-        out_rows: list[dict] = []
-        missing_reports: list[str] = []
-        for rn in report_names:
-            c = ch_map.get(rn)
-            if not c:
-                missing_reports.append(rn)
-                continue
-            channel_id = c.get("channel_id") or ""
-            out_rows.append({
-                "item_name": _canonical_voltage_item_name(
-                    rn,
-                    c.get("channel_name") or rn.replace("HWM_VOLTAGE_", ""),
-                ),
-                "channel": channel_id,
-                "channel_id": channel_id,
-                "io_port": defaults["io_port"],
-                "option": defaults["options"],
-                "resistor1": defaults["resistor1"],
-                "resistor2": defaults["resistor2"],
-                "offset": defaults["offset"],
-                "disp_name": "",
-                "report_name": rn,
-            })
-
-        result["rows"] = out_rows
-        result["row_count"] = len(out_rows)
-        result["status"] = "FOUND" if out_rows else "SECTION_EMPTY"
-        if missing_reports:
-            result["missing_report_name_mappings"] = missing_reports
+    result = query_section(db_path, product_name, chip_name, "HWM.Voltage")
+    result["source"] = "EC_PROBE_CHANNELS_BY_HARDWARE_ID"
+    report_names = _probe_ok_voltage_report_names(probe_path)
+    if not report_names:
+        result["status"] = "SECTION_EMPTY"
+        result["rows"] = []
+        result["row_count"] = 0
+        result["error"] = "NO_OK_HWM_VOLTAGE_IN_PROBE"
         return result
-    finally:
-        con.close()
+
+    db_rows = {str(r.get("report_name") or ""): r for r in result.get("rows") or []
+               if isinstance(r, dict)}
+    out_rows: list[dict] = []
+    missing_reports: list[str] = []
+    for rn in report_names:
+        row = db_rows.get(rn)
+        if row is None:
+            missing_reports.append(rn)
+            continue
+        out = dict(row)
+        out["item_name"] = _canonical_voltage_item_name(rn, out.get("channel_name", ""))
+        out["channel"] = out.get("channel_id", "")
+        out["option"] = out.get("options", "")
+        # channel_name/report_name are SUSI/internal reference fields, not INI display Name.
+        # Leave Name blank at this stage; alias backfill is handled by later merge steps.
+        out["disp_name"] = ""
+        out_rows.append(out)
+
+    result["rows"] = out_rows
+    result["row_count"] = len(out_rows)
+    result["status"] = "FOUND" if out_rows else "SECTION_EMPTY"
+    if missing_reports:
+        result["missing_report_name_mappings"] = missing_reports
+    return result
 
 
 def _render_section_lines(section: str, query_result: dict) -> list[str]:
@@ -1060,10 +1887,28 @@ def _render_section_lines(section: str, query_result: dict) -> list[str]:
     if isinstance(prod_chip, dict):
         hwid = prod_chip.get("hardware_id") or ""
 
-    for row in rows:
+    for idx, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         key = row.get("item_name") or f"ITEM{row.get('id', '')}"
+        if section == "HWM.CaseOpen":
+            key = f"CO{idx}"
+        elif section == "WDT":
+            key = f"WDT{idx + 1}"
+        elif section == "StorageArea":
+            key = f"Area{idx}"
+        elif section == "ThermalProtect":
+            key = f"TPCH{idx}"
+        elif section == "HWM.Current":
+            # Normalize DB item names (e.g. CURRENT_OEM0) to INI convention OEM0/OEM1...
+            key = f"OEM{idx}"
+        elif section == "VGA.Backlight":
+            # Normalize DB item names (e.g. BACKLIGHT_1) to INI convention BACKLIGHT1/BACKLIGHT2...
+            key = f"BACKLIGHT{idx + 1}"
+        elif section == "GPIO" and isinstance(key, str):
+            m_gpio_key = re.match(r"^GPIO(\d+)$", key.strip(), re.IGNORECASE)
+            if m_gpio_key:
+                key = f"GPIO{int(m_gpio_key.group(1)):02d}"
         channel = row.get("channel") or ""
         io_port = row.get("io_port") or ""
         option = row.get("option") or ""
@@ -1080,11 +1925,15 @@ def _render_section_lines(section: str, query_result: dict) -> list[str]:
                 value = ""
         elif section == "I2C":
             # [Channel]=[HW],[Channel],[IOPort],[Option],[Name]
+            # Name field must stay blank by project rule.
             value = f"{hwid},{channel},{io_port},{option},"
-            if disp_name:
-                value += f"{disp_name}"
+        elif section == "VGA.Backlight":
+            # [Backlight]=[HW],[Channel],[IOPort],[Option],[Name]
+            # Name field must stay blank by project rule.
+            value = f"{hwid},{channel},{io_port},{option},"
         elif section == "VGA.Brightness":
             # [Brightness]=[HW],[Channel],[IOPort/Address],[Option],[Max],[Min],[Frequency],[Name]
+            # Name field must stay blank by project rule.
             # Prefer DB values (range_max/range_min/frequency); keep legacy fallback only if absent.
             range_max = row.get("range_max")
             range_min = row.get("range_min")
@@ -1099,8 +1948,6 @@ def _render_section_lines(section: str, query_result: dict) -> list[str]:
             if not freq_v:
                 freq_v = "0"
             value = f"{hwid},{channel},{io_port},{option},{max_v},{min_v},{freq_v},"
-            if disp_name:
-                value += f"{disp_name}"
         elif section == "HWM.Voltage":
             # [Voltage]=[HW],[Channel],[IOPort/Address],[Option],[R1],[R2],[Name],[Offset]
             r1 = row.get("resistor1") or "0"
@@ -1134,6 +1981,10 @@ def _render_section_lines(section: str, query_result: dict) -> list[str]:
             value = f"{hwid},{channel},{io_port},{option},{group},{bit},"
             if disp_name:
                 value += f"{disp_name}"
+        elif section in {"HWM.CaseOpen", "WDT", "HWM.Current", "StorageArea", "ThermalProtect"}:
+            # Keep the Name field blank for sections whose rows are identified by
+            # stable keys rather than user-facing display aliases.
+            value = f"{hwid},{channel},{io_port},{option},"
         else:
             value = f"{hwid},{channel},{io_port},{option}"
             if disp_name:
@@ -1147,6 +1998,40 @@ def _render_section_lines(section: str, query_result: dict) -> list[str]:
 
 def _norm_chip_name(chip_name: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", (chip_name or "").upper())
+
+
+def _is_superio_voltage_seed_chip(chip_name: str) -> bool:
+    """Return True for non-EC SIO families that should emit voltage seed rows.
+
+    New rule: for NCT6694B/NCT61xxD families, HWM.Voltage v1 should keep all
+    queried channel rows as seed data, then rely on target-machine report +
+    BIOS value/name evidence for item remap in v2.
+    """
+    c = _norm_chip_name(chip_name)
+    return c.startswith(("NCT6694B", "NCT6106D", "NCT6116D", "NCT6126D", "NCT6776D"))
+
+
+def _apply_superio_voltage_seed_rows(rows: list[dict]) -> list[dict]:
+    """Normalize non-EC SIO HWM.Voltage rows for first-pass seed INI output.
+
+    - Keep every queried channel row (do not prune by duplicate/channel heuristics).
+    - Prefer conventional INI keys when report_name suffix is recognizable.
+    - Keep unresolved rows as-is for follow-up target validation.
+    """
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        r = dict(row)
+        report_name = str(r.get("report_name") or r.get("item_name") or "")
+        fallback = str(r.get("item_name") or r.get("channel_name") or "")
+        item = _canonical_voltage_item_name(report_name, fallback)
+        if item:
+            r["item_name"] = item
+        r["channel"] = r.get("channel") or r.get("channel_id") or ""
+        r["option"] = r.get("option") or r.get("options") or ""
+        out.append(r)
+    return out
 
 
 def _resolve_chip_name_for_section(base_chip_name: str, section: str) -> str:
@@ -1218,6 +2103,16 @@ def _duplicate_channels(rows: list[dict]) -> list[str]:
 
 def _evaluate_non_ec_hwm_voltage(product_name: str, chip_name: str, rows: list[dict]) -> dict:
     """Return non-EC HWM.Voltage routing decision before diagram evidence is applied."""
+    if _is_superio_voltage_seed_chip(chip_name):
+        return {
+            "route": "SUPERIO_SEED_CHANNEL_SCAN",
+            "rule": None,
+            "pending": False,
+            "status": "FOUND",
+            "reason": "SIO seed-mode: keep all queried channels for target validation v1",
+            "duplicate_channels": _duplicate_channels(rows),
+        }
+
     rule = _is_r014_r015_target(product_name, chip_name)
     dups = _duplicate_channels(rows)
 
@@ -1458,7 +2353,7 @@ def _build_i2c_query_result(db_path: Path, product_name: str, chip_name: str,
     result["i2c_skipped_oem_ids"] = sorted(set(skipped_oem_ids))
     if rows:
         result["status"] = "FOUND"
-        result["reason"] = "I2C fields composed from config.db and full probe OEM IDs"
+        result["reason"] = "I2C fields composed from config_new.db and full probe OEM IDs"
     else:
         result["status"] = "PENDING_I2C_PROBE"
         result["reason"] = "I2C DB row has no channel and full probe has no usable OEM ID"
@@ -1507,6 +2402,7 @@ def _build_smbus_query_result(
         *,
         intel_oem_idxs: list[int] | None = None,
         amd_secondary_idx4: bool = False,
+        fixed_channel2: dict | None = None,
     ) -> list[dict]:
         rows: list[dict] = []
         prod_chip = result.get("prod_chip") or {}
@@ -1561,10 +2457,31 @@ def _build_smbus_query_result(
                 "option": "0xA0000000",
                 "disp_name": "",
             }
+
+        # NCT6694B EC/SOC SMBus policy: Channel2 may be forced by SMBus table fixed row.
+        if isinstance(fixed_channel2, dict):
+            rows[1] = {
+                "item_name": "Channel2",
+                "hw": str(fixed_channel2.get("hw") or ec_hwid),
+                "channel": str(fixed_channel2.get("channel") or ""),
+                "io_port": str(fixed_channel2.get("io_port") or ""),
+                "option": str(fixed_channel2.get("option") or ""),
+                "disp_name": "",
+            }
         return rows
 
     cpu = _classify_cpu_platform_from_probe(probe_path)
     result["cpu"] = cpu
+
+    chip_norm = _norm_chip_name(chip_name)
+    is_sio_route = chip_norm.startswith(("NCT6106D", "NCT6116D", "NCT6126D", "NCT6776D"))
+    # SMBus policy lock:
+    # - SIO route: SMBus remains empty by default.
+    # - EC route + Intel: Channel1 must exist even when spec.features.smbus=false.
+    if is_sio_route:
+        result["status"] = "SECTION_EMPTY"
+        result["reason"] = "SIO route: SMBus is empty by policy"
+        return result
 
     features = spec.get("features") if isinstance(spec, dict) else None
     feature_details = spec.get("feature_details") if isinstance(spec, dict) else None
@@ -1582,12 +2499,69 @@ def _build_smbus_query_result(
     result["smbus_feature_enabled"] = smbus_enabled
     result["smbus_feature_chip_desc"] = smbus_chip_desc
 
-    if not smbus_enabled:
+    if (not smbus_enabled) and (not cpu.get("is_intel")):
         result["status"] = "SECTION_EMPTY"
         result["reason"] = "spec.features.smbus=false; skip SMBus generation"
         return result
 
-    ec_related = ("EC" in smbus_chip_desc.upper()) if smbus_chip_desc else False
+    def _smbus_desc_is_ec_or_soc(desc: str) -> bool:
+        d = str(desc or "").upper()
+        if not d:
+            return False
+        # Treat explicit EC/SOC wording or common EC chip family tokens as EC-related.
+        ec_tokens = ("EC", "SOC", "EIO", "ITE", "NCT", "MEC", "RDC")
+        return any(tok in d for tok in ec_tokens)
+
+    def _load_smbus_fixed_channel2_row() -> dict | None:
+        prod_chip = result.get("prod_chip") or {}
+        hwid = str(prod_chip.get("hardware_id") or "").strip() if isinstance(prod_chip, dict) else ""
+        if not hwid:
+            return None
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        try:
+            row = con.execute(
+                """
+                SELECT hardware_id, channel_id, io_port, options
+                FROM SMBus
+                WHERE hardware_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (hwid,),
+            ).fetchone()
+            if row is None:
+                return None
+            channel = str(row["channel_id"] or "").strip()
+            io_port = str(row["io_port"] or "").strip()
+            option = str(row["options"] or "").strip()
+            if not channel or not io_port or not option:
+                return None
+            return {
+                "hw": str(row["hardware_id"] or "").strip(),
+                "channel": channel,
+                "io_port": io_port,
+                "option": option,
+            }
+        finally:
+            con.close()
+
+    ec_related = _smbus_desc_is_ec_or_soc(smbus_chip_desc)
+    chip_norm = _norm_chip_name(chip_name)
+    is_nct6694b = chip_norm.startswith("NCT6694B")
+
+    # EC/SOC SMBus hint policy:
+    # - NCT6694B: Channel2 SMBus-table row is mandatory (pending if absent)
+    # - non-NCT6694B EC/SOC chips: opportunistically use SMBus-table row for Channel2 when present
+    use_db_fixed_channel2 = smbus_enabled and ec_related
+    require_db_fixed_channel2 = is_nct6694b and use_db_fixed_channel2
+    fixed_channel2 = _load_smbus_fixed_channel2_row() if use_db_fixed_channel2 else None
+    if use_db_fixed_channel2:
+        result["smbus_fixed_channel2"] = fixed_channel2
+    if require_db_fixed_channel2 and not isinstance(fixed_channel2, dict):
+        result["status"] = "PENDING_SMBUS_FIXED_CHANNEL2_DB_ROW"
+        result["reason"] = "NCT6694B + EC/SOC SMBus requires fixed Channel2 row from SMBus table"
+        return result
 
     if not probe_path or not probe_path.exists():
         result["status"] = "PENDING_PROBE_FOR_SMBUS_PLATFORM_GATE"
@@ -1611,13 +2585,19 @@ def _build_smbus_query_result(
 
         primary_idx = int(idxs[0])
         amd_secondary_idx4 = ec_related and 0 <= primary_idx <= 3
-        result["rows"] = _channel_rows(primary_idx, amd_secondary_idx4=amd_secondary_idx4)
+        result["rows"] = _channel_rows(primary_idx, amd_secondary_idx4=amd_secondary_idx4, fixed_channel2=fixed_channel2)
         result["row_count"] = len(result["rows"])
         result["status"] = "FOUND"
-        if amd_secondary_idx4:
+        if amd_secondary_idx4 and isinstance(fixed_channel2, dict):
+            result["reason"] = (
+                "AMD SMBus Channel1 from SPD idx; Channel2 filled by SMBus table fixed row (EC/SOC spec hint)"
+            )
+        elif amd_secondary_idx4:
             result["reason"] = (
                 "AMD SMBus Channel1 from SPD idx; Channel2 fixed to idx=4 because spec SMBus is EC-related"
             )
+        elif isinstance(fixed_channel2, dict):
+            result["reason"] = "AMD SMBus Channel1 derived from SPD idx; Channel2 filled by SMBus table fixed row"
         else:
             result["reason"] = "AMD SMBus Channel1 derived from SPD idx probe"
         return result
@@ -1625,10 +2605,14 @@ def _build_smbus_query_result(
     if cpu.get("is_intel"):
         intel_oem_idxs = _intel_oem_idxs_from_full_probe(probe_path) if ec_related else []
         result["intel_oem_idxs"] = intel_oem_idxs
-        result["rows"] = _channel_rows(0, intel_oem_idxs=intel_oem_idxs)
+        result["rows"] = _channel_rows(0, intel_oem_idxs=intel_oem_idxs, fixed_channel2=fixed_channel2)
         result["row_count"] = len(result["rows"])
         result["status"] = "FOUND"
-        if intel_oem_idxs:
+        if isinstance(fixed_channel2, dict):
+            result["reason"] = (
+                "Intel SMBus uses fixed Channel1 idx=0 + Channel2 filled by SMBus table fixed row (EC/SOC spec hint)"
+            )
+        elif intel_oem_idxs:
             result["reason"] = (
                 "Intel SMBus uses fixed Channel1 idx=0 + Channel2+ from full probe SMBUS_OEMn EXISTS"
             )
@@ -1744,7 +2728,7 @@ def _load_project_fan_name_hints(project_dir: Path, project_name: str, bios_cach
     if isinstance(by_key, dict):
         for k, v in by_key.items():
             kk = str(k or "").strip().upper()
-            vv = str(v or "").strip()
+            vv = _coerce_display_hint(v)
             if kk and vv:
                 out.setdefault("by_key", {})[kk] = vv
 
@@ -1755,7 +2739,7 @@ def _load_project_fan_name_hints(project_dir: Path, project_name: str, bios_cach
                 ii = int(str(k).strip(), 0)
             except Exception:
                 continue
-            vv = str(v or "").strip()
+            vv = _coerce_display_hint(v)
             if vv:
                 out.setdefault("by_idx", {})[ii] = vv
 
@@ -1798,7 +2782,7 @@ def _write_project_fan_name_hints(project_dir: Path, project_name: str, bios_cac
             if isinstance(prev_by_key, dict):
                 for k, v in prev_by_key.items():
                     kk = str(k or "").strip().upper()
-                    vv = str(v or "").strip()
+                    vv = _coerce_display_hint(v)
                     if kk and vv:
                         payload.setdefault("by_key", {})[kk] = vv
 
@@ -1809,7 +2793,7 @@ def _write_project_fan_name_hints(project_dir: Path, project_name: str, bios_cac
                         ii = int(str(k).strip(), 0)
                     except Exception:
                         continue
-                    vv = str(v or "").strip()
+                    vv = _coerce_display_hint(v)
                     if vv:
                         payload.setdefault("by_idx", {})[ii] = vv
 
@@ -1882,7 +2866,7 @@ def _fan_keys_from_hints(fan_name_hints: dict | None) -> list[str]:
     if isinstance(by_key, dict):
         for k, v in by_key.items():
             kk = str(k or "").strip().upper()
-            vv = str(v or "").strip()
+            vv = _coerce_display_hint(v)
             if not kk or not vv:
                 continue
             if re.match(r"^(FCPU2?|FSYS|FOEM\d+)$", kk) and kk not in keys:
@@ -1909,6 +2893,74 @@ def _fan_keys_from_hints(fan_name_hints: dict | None) -> list[str]:
                 keys.append(kk)
 
     return sorted(keys, key=_fan_key_sort_value)
+
+
+def _is_nct61xxd_fan_chip(chip_name: str) -> bool:
+    c = _norm_chip_name(chip_name)
+    return c.startswith(("NCT6106D", "NCT6116D", "NCT6126D", "NCT6776D"))
+
+
+def _fan_db_row_key(row: dict) -> str:
+    rn = str(row.get("report_name") or "").upper().strip()
+    if "FAN_CPU" in rn:
+        return "FCPU"
+    if "FAN_SYSTEM" in rn:
+        return "FSYS"
+    m = re.search(r"FAN_OEM(\d+)", rn)
+    if m:
+        return f"FOEM{int(m.group(1))}"
+    return ""
+
+
+def _build_hwm_fan_rows_from_db_keys(db_path: Path, product_name: str, chip_name: str,
+                                     fan_keys: list[str], fan_name_hints: dict | None = None) -> list[dict]:
+    """Build HWM.Fan rows by reverse lookup from DB rows for requested fan keys.
+
+    Used by non-EC NCT61xxD-like chips when probe fan channels are unavailable
+    (common all-ERR probe case) and fan keys come from BIOS hints.
+    """
+    if not fan_keys:
+        return []
+
+    q = query_section(
+        db_path=db_path,
+        product_name=product_name,
+        chip_name=chip_name,
+        section="HWM.Fan",
+    )
+    rows = q.get("rows") or []
+    if q.get("status") != "FOUND" or not rows:
+        return []
+
+    by_key: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        k = _fan_db_row_key(r)
+        if k and k not in by_key:
+            by_key[k] = r
+
+    out: list[dict] = []
+    for key in fan_keys:
+        k = str(key or "").strip().upper()
+        r = by_key.get(k)
+        if not isinstance(r, dict):
+            continue
+        ch = str(r.get("channel_id") or r.get("channel") or "").strip()
+        io = str(r.get("io_port") or "").strip()
+        opt = str(r.get("options") or r.get("option") or "").strip()
+        pul = str(r.get("pulses") or r.get("offset") or "0").strip() or "0"
+        if not ch:
+            continue
+        out.append({
+            "item_name": k,
+            "channel": ch,
+            "io_port": io,
+            "option": opt,
+            "offset": pul,
+            "disp_name": _resolve_fan_disp_name(k, None, fan_name_hints),
+        })
+    return out
 
 
 def _extract_first_json_block(text: str) -> dict | None:
@@ -1995,6 +3047,9 @@ def _ensure_gpio_vision_images(project_dir: Path, project_name: str) -> list[Pat
 
 
 def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: str | None = None) -> Path | None:
+    if not _chip_requires_circuit_evidence(chip_name):
+        return None
+
     out_path = project_dir / f"{project_name}-gpio-trace.json"
     images = _ensure_gpio_vision_images(project_dir, project_name)
     if not images:
@@ -2006,7 +3061,11 @@ def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: s
     if chip_u.startswith(("NCT6126D", "NCT6116D", "NCT6106D", "NCT6776D")):
         target_signal_hint = "SIO_GPIO*"
         target_signal_re = re.compile(r"^SIO_GPIO\d+$", re.IGNORECASE)
-    elif chip_u.startswith(("NCT6694B", "EIO-300")):
+    elif chip_u.startswith("NCT6694B"):
+        # NCT6694B GPIO tracing scope lock: only EC_P1_GPIOn signals.
+        target_signal_hint = "EC_P1_GPIOn"
+        target_signal_re = re.compile(r"^EC_P1_GPIO\d+$", re.IGNORECASE)
+    elif chip_u.startswith("EIO-300"):
         target_signal_hint = "EC_P*_GPIO*"
         target_signal_re = re.compile(r"^EC_P\d+_GPIO\d+$", re.IGNORECASE)
     elif chip_u.startswith("EIO-211"):
@@ -2063,8 +3122,9 @@ def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: s
             group = _parse_int_value(it.get("group"))
             bit = _parse_int_value(it.get("bit"))
 
-            # Deterministic fallback: parse GPxy style function labels.
+            # Deterministic fallback: parse GPxy or GPIOxy style function labels.
             m_gp = re.search(r"\bGP\s*([0-9])\s*([0-9])\b", function_label.upper())
+            m_gpio = re.search(r"\bGPIO\s*([0-9]{2})\b", function_label.upper())
             if m_gp:
                 gp_group = int(m_gp.group(1))
                 gp_bit = int(m_gp.group(2))
@@ -2072,6 +3132,12 @@ def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: s
                 bit = gp_bit
                 if not str(it.get("report_name") or "").strip():
                     it["report_name"] = f"GPIO{gp_group}{gp_bit}"
+            elif m_gpio:
+                gpio_num = int(m_gpio.group(1))
+                gp_group = gpio_num // 10
+                gp_bit = gpio_num % 10
+                group = gp_group
+                bit = gp_bit
 
             item = {
                 "report_name": str(it.get("report_name") or "").strip().upper(),
@@ -2141,6 +3207,9 @@ def _load_gpio_trace_result(project_dir: Path, project_name: str) -> dict | None
 
 
 def _should_regen_gpio_trace(project_dir: Path, chip_name: str, gpio_trace_raw: dict | None) -> bool:
+    if not _chip_requires_circuit_evidence(chip_name):
+        return False
+
     if not isinstance(gpio_trace_raw, dict):
         return True
 
@@ -2199,10 +3268,12 @@ def _should_regen_gpio_trace(project_dir: Path, chip_name: str, gpio_trace_raw: 
         if p.name.lower() not in analyzed_names:
             return True
 
-    # Chip-aware scope sanity: for SIO chips, trace should contain SIO_GPIO* evidence.
+    # Chip-aware scope sanity:
+    # - SIO chips require SIO_GPIOn evidence.
+    # - NCT6694B route requires EC_P1_GPIOn evidence.
     chip_u = (chip_name or "").upper()
+    items = gpio_trace_raw.get("items")
     if chip_u.startswith(("NCT6126D", "NCT6116D", "NCT6106D", "NCT6776D")):
-        items = gpio_trace_raw.get("items")
         if not isinstance(items, list) or not items:
             return True
         has_sio = any(
@@ -2211,6 +3282,17 @@ def _should_regen_gpio_trace(project_dir: Path, chip_name: str, gpio_trace_raw: 
             for it in items
         )
         if not has_sio:
+            return True
+
+    if chip_u.startswith("NCT6694B"):
+        if not isinstance(items, list) or not items:
+            return True
+        has_ec_p1 = any(
+            isinstance(it, dict)
+            and re.match(r"^EC_P1_GPIO\d+$", str(it.get("signal") or ""), re.IGNORECASE)
+            for it in items
+        )
+        if not has_ec_p1:
             return True
 
     return False
@@ -2267,14 +3349,15 @@ def _canonical_gpio_key(report_name: str, signal: str, group: int | None, bit: i
 
     m_sig = re.match(r"^SIO_GPIO(\d+)$", sig)
     if m_sig:
-        return f"GPIO{m_sig.group(1)}"
+        return f"GPIO{int(m_sig.group(1)):02d}"
 
     m_rn_sio = re.match(r"^SIO_GPIO(\d+)$", rn)
     if m_rn_sio:
-        return f"GPIO{m_rn_sio.group(1)}"
+        return f"GPIO{int(m_rn_sio.group(1)):02d}"
 
-    if rn.startswith("GPIO") and len(rn) > 4:
-        return rn
+    m_rn_gpio = re.match(r"^GPIO(\d+)$", rn)
+    if m_rn_gpio:
+        return f"GPIO{int(m_rn_gpio.group(1)):02d}"
 
     if isinstance(group, int) and isinstance(bit, int):
         return f"GPIO{group}{bit}"
@@ -2295,28 +3378,46 @@ def _trace_item_quality(it: dict) -> int:
 
 
 def _load_gpio_defaults(db_path: Path) -> dict:
+    """Fallback values for circuit-trace GPIO rows.
+
+    GPIO database rows are now hardware-specific and are loaded through
+    query_section().  This helper is only retained for the trace branch,
+    where the circuit evidence supplies group/bit and these stable protocol
+    defaults are needed for rendering.
+    """
     out = {
         "base_addr": "0",
         "io_port": "0",
         "options": "0xA0000003",
         "disp_name": "",
     }
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute("SELECT name, value FROM 'GPIO.Defaults'").fetchall()
-        for r in rows:
-            name = str(r["name"] or "").strip()
-            if name in out:
-                out[name] = str(r["value"] or "").strip()
-        return out
-    except Exception:
-        return out
-    finally:
-        con.close()
+    return out
 
 
-def _resolve_gpio_expected_count(spec: dict | None) -> int | None:
+def _is_non_ec_sio_gpio_chip(chip_norm: str) -> bool:
+    if chip_norm.startswith("NCT6694B"):
+        return True
+    if chip_norm.startswith("NCT61") and chip_norm.endswith("D"):
+        return True
+    return False
+
+
+def _resolve_gpio_expected_count(spec: dict | None, probe_spec: dict | None = None) -> int | None:
+    # 1) Probe-first: when probe exposes concrete GPIO keys/count, trust it.
+    if isinstance(probe_spec, dict):
+        gp = probe_spec.get("gpio")
+        if isinstance(gp, dict):
+            keys = gp.get("keys")
+            if isinstance(keys, list):
+                norm_keys = [str(k).strip().upper() for k in keys if str(k).strip()]
+                norm_keys = [k for k in norm_keys if re.match(r"^GPIO\d+$", k)]
+                if norm_keys:
+                    return len(norm_keys)
+            c_probe = _parse_int_value(gp.get("count"))
+            if isinstance(c_probe, int) and c_probe > 0:
+                return c_probe
+
+    # 2) Spec fallback
     if not isinstance(spec, dict):
         return None
     gpio = spec.get("gpio")
@@ -2333,31 +3434,10 @@ def _resolve_gpio_expected_count(spec: dict | None) -> int | None:
     return None
 
 
-def _load_gpio_group_pins(db_path: Path) -> list[dict]:
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        rows = con.execute(
-            "SELECT report_name, `group`, pin FROM 'GPIO.GroupPins' ORDER BY id"
-        ).fetchall()
-    except Exception:
-        rows = []
-    finally:
-        con.close()
-
-    out: list[dict] = []
-    for r in rows:
-        out.append({
-            "report_name": str(r["report_name"] or "").strip().upper(),
-            "group": str(r["group"] or "").strip(),
-            "pin": str(r["pin"] or "").strip(),
-        })
-    return out
-
-
 def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
                              spec: dict | None, gpio_trace: dict | None = None,
-                             is_ec: bool | None = None) -> tuple[dict, dict]:
+                             is_ec: bool | None = None,
+                             probe_spec: dict | None = None) -> tuple[dict, dict]:
     result: dict = {
         "query_key": {
             "product_name": product_name,
@@ -2397,6 +3477,10 @@ def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
     result["prod_chip"] = prod
 
     defaults = _load_gpio_defaults(db_path)
+    if is_ec is False and _is_non_ec_sio_gpio_chip(chip_norm):
+        defaults["base_addr"] = "0"
+        defaults["io_port"] = "0x2E"
+        defaults["options"] = "0xA0000003"
 
     # 1) Prefer circuit-trace contract when available for NON-EC/SIO route,
     #    and require trace-first for NCT6694B-routed GPIO in compound EIO-300 cases.
@@ -2413,6 +3497,36 @@ def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
             and _parse_int_value(it.get("bit")) is not None
             and str(it.get("status") or "").upper() not in {"OUT_OF_SCOPE", "INVALID"}
         ]
+
+        # NCT61xxD/SIO strict scope: only accept SIO_GPIOn traced signals.
+        # Do not ingest generic/non-target GPIO labels for this route.
+        if is_ec is False and chip_norm.startswith(("NCT6106D", "NCT6116D", "NCT6126D", "NCT6776D")):
+            confirmed = [
+                it for it in confirmed
+                if re.match(r"^SIO_GPIO\d+$", str(it.get("signal") or "").strip(), re.IGNORECASE)
+            ]
+
+            # SIO_GPIOn strict-scope quality guard (no fixed count):
+            # if we have function-label evidence (GPxy), prefer those rows and drop
+            # self-labeled placeholders like function_label=SIO_GPIOxx that can cause
+            # duplicated/phantom channels from mixed extraction passes.
+            has_gp_function = any(
+                re.search(r"\bGP\s*[0-9]\s*[0-9]\b", str(it.get("function_label") or "").strip(), re.IGNORECASE)
+                for it in confirmed
+            )
+            if has_gp_function:
+                confirmed = [
+                    it for it in confirmed
+                    if re.search(r"\bGP\s*[0-9]\s*[0-9]\b", str(it.get("function_label") or "").strip(), re.IGNORECASE)
+                ]
+
+        # NCT6694B strict scope: only accept EC_P1_GPIOn traced signals.
+        if chip_norm.startswith("NCT6694B"):
+            confirmed = [
+                it for it in confirmed
+                if re.match(r"^EC_P1_GPIO\d+$", str(it.get("signal") or "").strip(), re.IGNORECASE)
+            ]
+
         decision["gpio_trace_confirmed_count"] = len(confirmed)
 
         if confirmed:
@@ -2424,25 +3538,25 @@ def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
                 signal_name = str(it.get("signal") or "").strip()
                 function_label = str(it.get("function_label") or "").strip()
 
-                # For EC_P*_GPIOn traces, prefer function label GPIOxy as final INI key.
-                # Example: EC_P1_GPIO2 -> GPIO36 => group=3, bit=6.
-                m_gpio = re.search(r"\bGPIO\s*([0-9]{1,2})\b", function_label, re.IGNORECASE)
-                if m_gpio and signal_name.upper().startswith("EC_P"):
-                    key = f"GPIO{int(m_gpio.group(1)):02d}"
-                else:
-                    key = _canonical_gpio_key(
-                        report_name,
-                        signal_name,
-                        group,
-                        bit,
-                        idx,
-                    )
+                # Keep GPIO key in fixed GPIO00/GPIO01... form from trace report_name/signal.
+                # Do not override key by alternate pin mux label (e.g., SPIP1_*/GPIO73).
+                key = _canonical_gpio_key(
+                    report_name,
+                    signal_name,
+                    group,
+                    bit,
+                    idx,
+                )
                 prev = best_by_key.get(key)
                 if prev is None or _trace_item_quality(it) > _trace_item_quality(prev):
                     best_by_key[key] = it
 
+            def _gpio_item_sort_key(k: str) -> int:
+                m = re.search(r"(\d+)$", str(k or ""))
+                return int(m.group(1)) if m else 10**9
+
             out_rows: list[dict] = []
-            for idx, (item_key, it) in enumerate(best_by_key.items()):
+            for idx, (item_key, it) in enumerate(sorted(best_by_key.items(), key=lambda kv: _gpio_item_sort_key(str(kv[0])))):
                 group = _parse_int_value(it.get("group"))
                 bit = _parse_int_value(it.get("bit"))
                 disp_name = str(it.get("name") or "").strip()
@@ -2483,36 +3597,73 @@ def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
         decision["reason"] = "NCT6694B GPIO must be built from circuit trace evidence; DB fallback is disabled"
         return result, decision
 
-    gp_rows = _load_gpio_group_pins(db_path)
+    gpio_query = query_section(db_path, product_name, chip_name, "GPIO")
+    if gpio_query.get("status") != "FOUND":
+        result["status"] = gpio_query.get("status") or "SECTION_EMPTY"
+        result["row_count"] = 0
+        decision["pending"] = True
+        decision["status"] = result["status"]
+        decision["reason"] = "No hardware-specific GPIO rows in config_new.db"
+        return result, decision
+    gp_rows = gpio_query.get("rows") or []
     decision["gpio_group_pins_total"] = len(gp_rows)
 
     if not gp_rows:
         result["status"] = "SECTION_EMPTY"
         result["row_count"] = 0
         decision["pending"] = True
-        decision["status"] = "GPIO_GROUPPINS_EMPTY"
-        decision["reason"] = "GPIO.GroupPins has no rows"
+        decision["status"] = "GPIO_ROWS_EMPTY"
+        decision["reason"] = "Hardware-specific GPIO query returned no rows"
         return result, decision
 
-    expected = _resolve_gpio_expected_count(spec)
+    expected = _resolve_gpio_expected_count(spec, probe_spec=probe_spec)
     decision["gpio_expected_count"] = expected
 
     use_rows = gp_rows
-    if isinstance(expected, int) and expected > 0 and len(gp_rows) > expected:
-        use_rows = gp_rows[:expected]
+
+    probe_gpio_keys: list[str] = []
+    if isinstance(probe_spec, dict):
+        gp = probe_spec.get("gpio")
+        if isinstance(gp, dict):
+            keys = gp.get("keys")
+            if isinstance(keys, list):
+                for k in keys:
+                    kk = str(k or "").strip().upper()
+                    if re.match(r"^GPIO\d+$", kk) and kk not in probe_gpio_keys:
+                        probe_gpio_keys.append(kk)
+
+    if probe_gpio_keys:
+        desired = set(probe_gpio_keys)
+        filtered = []
+        for r in gp_rows:
+            rn = str(r.get("report_name") or r.get("item_name") or "").strip().upper()
+            m = re.match(r"^GPIO(\d+)$", rn)
+            key = f"GPIO{int(m.group(1)):02d}" if m else rn
+            if key in desired:
+                filtered.append(r)
+        if filtered:
+            use_rows = filtered
+            decision["gpio_trimmed_count"] = len(gp_rows) - len(use_rows)
+
+    if isinstance(expected, int) and expected > 0 and len(use_rows) > expected:
+        use_rows = use_rows[:expected]
         decision["gpio_trimmed_count"] = len(gp_rows) - len(use_rows)
 
     out_rows: list[dict] = []
     for idx, r in enumerate(use_rows):
-        key = r.get("report_name") or f"GPIO{idx:02d}"
+        key = r.get("report_name") or r.get("item_name") or f"GPIO{idx:02d}"
+        row_base_addr = r.get("base_addr") or defaults["base_addr"]
+        row_io_port = r.get("io_port") or defaults["io_port"]
+        row_options = r.get("options") or r.get("option") or defaults["options"]
         out_rows.append({
             "item_name": key,
-            "channel": defaults["base_addr"],
-            "io_port": defaults["io_port"],
-            "option": defaults["options"],
+            "channel": row_base_addr,
+            "io_port": row_io_port,
+            "option": row_options,
             "group": r.get("group"),
-            "bit": r.get("pin"),
-            "disp_name": defaults.get("disp_name", ""),
+            "bit": r.get("pin") or r.get("bit"),
+            # channel_name is app-reference metadata; do not emit it as INI Name.
+            "disp_name": r.get("disp_name") or defaults.get("disp_name", ""),
         })
 
     if not out_rows:
@@ -2526,7 +3677,7 @@ def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
     result["rows"] = out_rows
     result["row_count"] = len(out_rows)
     result["status"] = "FOUND"
-    decision["reason"] = "Built GPIO from ProductChip HWID + GPIO.Defaults + GPIO.GroupPins (trimmed by spec gpio.count)"
+    decision["reason"] = "Built GPIO from hardware-specific GPIO rows (trimmed by probe gpio evidence / spec gpio.count)"
     return result, decision
 
 
@@ -2569,16 +3720,35 @@ def _build_hwm_fan_query_result(db_path: Path, product_name: str, chip_name: str
         probe_keys = sorted([str(k).strip().upper() for k in by_key.keys() if str(k).strip()], key=_fan_key_sort_value)
 
     # NON-EC/SIO fallback: when probe fan items are unsupported/missing,
-    # derive fan keys from BIOS fan-name hints (names+count), then channels
-    # are still resolved by pairing/convention in the next steps.
+    # derive fan keys from BIOS fan-name hints.
+    from_bios_hints = False
     if not probe_keys and is_ec is False:
         probe_keys = _fan_keys_from_hints(fan_name_hints)
+        from_bios_hints = bool(probe_keys)
 
     if not probe_keys:
         result["status"] = "SECTION_EMPTY"
         result["row_count"] = 0
         result["error"] = "NO_FAN_KEYS_FROM_PROBE_OR_PAIRING_OR_BIOS_HINTS"
         return result
+
+    # NCT61xxD/SIO all-ERR probe route:
+    # fan keys come from BIOS hints, then reverse-lookup DB HWM.Fan rows
+    # to fill channel/io_port/options/pulses by mapped item key.
+    if is_ec is False and _is_nct61xxd_fan_chip(chip_name) and from_bios_hints:
+        db_rows = _build_hwm_fan_rows_from_db_keys(
+            db_path=db_path,
+            product_name=product_name,
+            chip_name=chip_name,
+            fan_keys=probe_keys,
+            fan_name_hints=fan_name_hints,
+        )
+        if db_rows:
+            result["rows"] = db_rows
+            result["row_count"] = len(db_rows)
+            result["status"] = "FOUND"
+            result["source"] = "BIOS_FAN_KEYS_DB_REVERSE_LOOKUP"
+            return result
 
     out_rows: list[dict] = []
     used_idx: set[int] = set()
@@ -2941,12 +4111,14 @@ def _apply_fan_control_topology(
 def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path,
                             db_path: Path, product_name: str, chip_name: str,
                             probe_spec: dict | None, probe_path: Path | None,
-                            sections: list[str]) -> tuple[list[Path], Path, Path, Path, Path | None, Path | None]:
+                            sections: list[str],
+                            temperature_fallback_candidates: list[str] | None = None,
+                            temperature_fallback_runner_cmd: str | None = None) -> tuple[list[Path], Path, Path, Path, Path | None, Path | None]:
     spec = _load_spec_json(in_json_path)
 
     proj_dir = out_ini_path.parent
     name = out_ini_path.stem.replace("-pre", "")
-    bios_cache_path = _build_bios_image_cache(proj_dir, name)
+    bios_cache_path = _build_bios_image_cache(proj_dir, name, chip_name=chip_name)
     bios_cache_path = _vision_populate_bios_cache(bios_cache_path)
     _write_project_temperature_name_hints(proj_dir, name, bios_cache_path)
     _write_project_fan_name_hints(proj_dir, name, bios_cache_path)
@@ -2965,11 +4137,13 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
     fan_pairing_raw = _load_fan_pairing_result(proj_dir, name)
     fan_pairing = _normalize_fan_pairing_result(fan_pairing_raw)
 
-    gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
-    if _should_regen_gpio_trace(proj_dir, chip_name, gpio_trace_raw):
-        _auto_generate_gpio_trace(proj_dir, name, chip_name=chip_name)
+    gpio_trace = None
+    if _chip_requires_circuit_evidence(chip_name):
         gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
-    gpio_trace = _normalize_gpio_trace_result(gpio_trace_raw)
+        if _should_regen_gpio_trace(proj_dir, chip_name, gpio_trace_raw):
+            _auto_generate_gpio_trace(proj_dir, name, chip_name=chip_name)
+            gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
+        gpio_trace = _normalize_gpio_trace_result(gpio_trace_raw)
 
     latest_fan_rows: list[dict] = []
     latest_fan_result: dict | None = None
@@ -3020,13 +4194,23 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 bios_cache_path=bios_cache_path,
             )
         elif sec == "HWM.Temperature":
-            result = _build_hwm_temperature_query_result(
-                db_path=db_path,
-                product_name=product_name,
-                chip_name=section_chip_name,
-                probe_path=probe_path,
-                spec=spec,
-            )
+            if is_ec is not True and _is_superio_temperature_seed_chip(section_chip_name):
+                # non-EC SuperIO v1 seed: keep all queried channel rows first
+                result = query_section(
+                    db_path=db_path,
+                    product_name=product_name,
+                    chip_name=section_chip_name,
+                    section=sec,
+                )
+                result["source"] = "SUPERIO_SEED_CHANNEL_SCAN"
+            else:
+                result = _build_hwm_temperature_query_result(
+                    db_path=db_path,
+                    product_name=product_name,
+                    chip_name=section_chip_name,
+                    probe_path=probe_path,
+                    spec=spec,
+                )
             result = _apply_temperature_name_hints(
                 result,
                 _load_project_temperature_name_hints(proj_dir, name),
@@ -3087,6 +4271,7 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 spec=spec,
                 gpio_trace=gpio_trace,
                 is_ec=is_ec,
+                probe_spec=probe_spec,
             )
             route = f"{route}+{gpio_decision.get('route')}"
             fan_meta = {
@@ -3124,19 +4309,52 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
 
         status = result.get("status")
 
+        if status == "FOUND" and sec in {"HWM.Current", "HWM.CaseOpen", "WDT"}:
+            rows = result.get("rows") or []
+            if isinstance(rows, list) and len(rows) > 1:
+                result = dict(result)
+                result["rows"] = rows[:1]
+                result["row_count"] = 1
+
         if sec == "HWM.Fan" and status == "FOUND":
             latest_fan_rows = result.get("rows") or []
             latest_fan_result = result
 
         if status == "FOUND":
             # HWM.Voltage has EC vs non-EC routing differences.
-            if sec == "HWM.Voltage" and is_ec is False:
+            if sec == "HWM.Voltage" and is_ec is not True:
+                if _is_superio_voltage_seed_chip(section_chip_name):
+                    result = dict(result)
+                    result["rows"] = _apply_superio_voltage_seed_rows(result.get("rows") or [])
+                    result["row_count"] = len(result.get("rows") or [])
+
+                    # v2 refine (when probe + BIOS cache are both available):
+                    # keep BIOS-visible + probe-OK items, and backfill Name(alias).
+                    result = _apply_superio_voltage_v2_refine(
+                        result=result,
+                        bios_cache_path=bios_cache_path,
+                        probe_path=probe_path,
+                    )
+                    v2_meta = result.get("superio_v2") if isinstance(result, dict) else None
+                    if isinstance(v2_meta, dict) and v2_meta.get("enabled"):
+                        route = f"{route}+{v2_meta.get('route')}"
+                        fan_meta.update({
+                            "voltage_v2_enabled": True,
+                            "voltage_v2_kept_count": v2_meta.get("kept_count"),
+                            "voltage_v2_dropped_count": v2_meta.get("dropped_count"),
+                        })
+
                 eval_non_ec = _evaluate_non_ec_hwm_voltage(
                     product_name=product_name,
                     chip_name=section_chip_name,
                     rows=result.get("rows") or [],
                 )
-                route = eval_non_ec["route"]
+                # keep v2 suffix if route already carries it
+                base_route = eval_non_ec["route"]
+                if "+SUPERIO_V2_BIOS_PROBE_ALIAS" in route:
+                    route = f"{base_route}+SUPERIO_V2_BIOS_PROBE_ALIAS"
+                else:
+                    route = base_route
 
                 if eval_non_ec["pending"]:
                     matrix.append({
@@ -3150,8 +4368,32 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                         "rule": eval_non_ec.get("rule"),
                         "duplicate_channels": eval_non_ec.get("duplicate_channels", []),
                         "reason": eval_non_ec.get("reason"),
+                        **fan_meta,
                     })
                     continue
+
+            # HWM.Temperature non-EC SuperIO v1/v2 flow:
+            # v1 seed all rows -> v2 keep BIOS-visible + probe-OK + alias backfill.
+            if sec == "HWM.Temperature" and is_ec is not True and _is_superio_temperature_seed_chip(section_chip_name):
+                result = dict(result)
+                result["rows"] = _apply_superio_temperature_seed_rows(result.get("rows") or [])
+                result["row_count"] = len(result.get("rows") or [])
+
+                result = _apply_superio_temperature_v2_refine(
+                    result=result,
+                    bios_cache_path=bios_cache_path,
+                    probe_path=probe_path,
+                )
+                t_v2_meta = result.get("superio_temp_v2") if isinstance(result, dict) else None
+                if isinstance(t_v2_meta, dict) and t_v2_meta.get("enabled"):
+                    route = f"SUPERIO_TEMP_SEED_CHANNEL_SCAN+{t_v2_meta.get('route')}"
+                    fan_meta.update({
+                        "temperature_v2_enabled": True,
+                        "temperature_v2_kept_count": t_v2_meta.get("kept_count"),
+                        "temperature_v2_dropped_count": t_v2_meta.get("dropped_count"),
+                    })
+                else:
+                    route = "SUPERIO_TEMP_SEED_CHANNEL_SCAN"
 
             sec_lines = info_lines + _render_section_lines(sec, result)
             sec_path = proj_dir / f"{name}_{sec}.ini"
@@ -3207,6 +4449,37 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
 
     out_ini_path.write_text("\n".join(pre_lines) + "\n", encoding="utf-8")
 
+    # Non-EC SuperIO temperature fallback hook (A-side orchestrated):
+    # if baseline probe HWM_TEMP_* are all ERR, prepare/iterate candidate
+    # (io_port, options) tuples through helper for both section INI and pre.ini.
+    # Optional runner command can deploy+probe each candidate and stop at first pass.
+    temperature_entry = next((m for m in matrix if m.get("section") == "HWM.Temperature"), None)
+    if (
+        isinstance(temperature_entry, dict)
+        and str(temperature_entry.get("status", "")).upper() == "GENERATED"
+        and is_ec is not True
+        and _is_superio_temperature_seed_chip(chip_name)
+        and probe_path is not None
+    ):
+        temperature_sec_path = Path(str(temperature_entry.get("path") or "")).resolve()
+        fb = _run_temperature_option_fallback_helper(
+            ini_paths=[temperature_sec_path, out_ini_path.resolve()],
+            probe_path=probe_path.resolve(),
+            section="HWM.Temperature",
+            candidates=temperature_fallback_candidates,
+            runner_cmd=temperature_fallback_runner_cmd,
+        )
+        temperature_entry["temperature_option_fallback"] = fb
+        fb_decision = str(fb.get("decision") or "")
+        if fb_decision in (
+            "CANDIDATE_PREPARED_NEEDS_VALIDATION",
+            "CANDIDATE_VALIDATED_PASS",
+            "ALL_CANDIDATES_FAILED",
+        ):
+            base_route = str(temperature_entry.get("route") or "")
+            if "TEMP_OPTION_FALLBACK" not in base_route:
+                temperature_entry["route"] = f"{base_route}+TEMP_OPTION_FALLBACK" if base_route else "TEMP_OPTION_FALLBACK"
+
     matrix_path = proj_dir / f"{name}-section-matrix.json"
     matrix_path.write_text(
         json.dumps(
@@ -3250,7 +4523,7 @@ def main():
         help=(
             "extract   — PDF → form.json\n"
             "understand — form.json → spec.json (LLM, needs LLM_API_KEY)\n"
-            "generate  — config.db query → pre-INI + section INIs\n"
+            "generate  — config_new.db query → pre-INI + section INIs\n"
             "all       — extract + understand + generate"
         ),
     )
@@ -3265,7 +4538,7 @@ def main():
     parser.add_argument("--sections",
                         help=("Comma-separated subset of sections to emit (e.g. "
                               "'HWM.CaseOpen,HWM.Current,HWM.Voltage,StorageArea,ThermalProtect,WDT,VGA.Backlight,VGA.Brightness')"))
-    parser.add_argument("--db", default="/home/company2/AIagent_susi/config.db", help="Path to config.db")
+    parser.add_argument("--db", default="/home/company2/AIagent_susi/config_new.db", help="Path to config_new.db")
     parser.add_argument("--product-name", help="Override ProductChip product_name key (default inferred from project, e.g. SOM-6833->SOM)")
     parser.add_argument("--chip-name", help="Override ProductChip chip_name key (default inferred from spec.json, e.g. EIO-211)")
     parser.add_argument(
@@ -3275,6 +4548,19 @@ def main():
     parser.add_argument(
         "--skip-understand", dest="skip_understand", action="store_true",
         help="In 'all' mode: skip understand stage (use form.json directly for generate)",
+    )
+    parser.add_argument(
+        "--temp-fallback-candidate",
+        action="append",
+        default=[],
+        help="Repeatable candidate tuple for HWM.Temperature fallback: 'io_port,options'",
+    )
+    parser.add_argument(
+        "--temp-fallback-runner-cmd",
+        help=(
+            "Optional command for each temperature fallback attempt; command should deploy/reload/probe "
+            "and refresh --probe report before pass/fail parsing."
+        ),
     )
     args = parser.parse_args()
 
@@ -3287,22 +4573,37 @@ def main():
     selected_sections = _parse_sections_arg(args.sections)
 
     json_path = None
+    request_form_missing = False
 
     # ── Stage: extract ──────────────────────────────────────────────────────
     if args.stage in ("extract", "all"):
-        _, json_path = resolve_extract_paths(args.project, args.input_pdf, args.out_json, root)
+        pdf_path, json_path = resolve_extract_paths(args.project, args.input_pdf, args.out_json, root)
+        if not pdf_path.exists():
+            request_form_missing = True
+            print(
+                f"Request form not found: {pdf_path} — will not auto-select other PDFs as spec.json source"
+            )
+
         if json_path.exists():
             print(f"Skip extract: {json_path} already exists")
         else:
-            pdf_path, json_path = resolve_extract_paths(args.project, args.input_pdf, args.out_json, root)
-            json_path = extract_pdf_to_json(pdf_path, json_path)
-            print(f"Extract done: {json_path}")
+            if request_form_missing:
+                print(
+                    "Skip extract: request form is missing. "
+                    "Continue with CLI-provided rules (e.g. --sections/--chip-name) and BIOS evidence."
+                )
+            else:
+                json_path = extract_pdf_to_json(pdf_path, json_path)
+                print(f"Extract done: {json_path}")
 
     # ── Stage: understand ────────────────────────────────────────────────────
     run_understand = (
         args.stage == "understand"
         or (args.stage == "all" and not args.skip_understand)
     )
+    if run_understand and request_form_missing and not args.in_json:
+        print("Skip understand: request form is missing and no --in-json was provided")
+        run_understand = False
     if run_understand:
         in_json_arg = args.in_json or (str(json_path) if json_path else None)
         spec_path = understand(
@@ -3314,7 +4615,7 @@ def main():
         )
         print(f"Understand done: {spec_path}")
 
-    # ── Stage: generate (config.db only) ───────────────────────────────────
+    # ── Stage: generate (config_new.db only) ───────────────────────────────
     if args.stage in ("generate", "all"):
         in_json_arg = args.in_json or (str(json_path) if json_path else None)
         in_json_path, out_ini_path = resolve_generate_paths(args.project, in_json_arg, args.out_ini, root)
@@ -3347,6 +4648,8 @@ def main():
             probe_spec=probe_spec,
             probe_path=probe_path,
             sections=sections_to_emit,
+            temperature_fallback_candidates=args.temp_fallback_candidate,
+            temperature_fallback_runner_cmd=args.temp_fallback_runner_cmd,
         )
 
         print(f"Generate done: {full_ini}")
