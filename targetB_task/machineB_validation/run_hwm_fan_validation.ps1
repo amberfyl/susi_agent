@@ -322,12 +322,8 @@ $report.result_breakdown = [ordered]@{
     na = $naItems
 }
 
+$verdict = Apply-VerdictPolicy -Report $report
 $path = Save-ValidationReport -report $report -outDir $OutDir -prefix 'hwm_fan'
-Write-Output "DONE. Report: $path"
+Write-Output "DONE. Result=$($report.result); sw_verdict=$($verdict.sw_verdict); dqa_verdict=$($verdict.dqa_verdict); Report=$path"
 
-switch ($report.result) {
-    'PASS' { exit 0 }
-    'CONDITIONAL' { exit 2 }
-    'CONDITIONAL_NO_FIXTURE' { exit 2 }
-    default { exit 1 }
-}
+exit ([int]$verdict.exit_code)

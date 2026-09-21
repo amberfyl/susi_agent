@@ -448,6 +448,64 @@ function Save-ValidationReport([hashtable]$report, [string]$outDir, [string]$pre
     return $path
 }
 
+function Resolve-DqaVerdictFromLayers {
+    param(
+        [System.Collections.IDictionary]$Layers
+    )
+
+    $l5 = [string](Get-ConfigValue -Config $Layers -Name 'L5_functional' -Default 'PENDING')
+    $l6 = [string](Get-ConfigValue -Config $Layers -Name 'L6_recovery' -Default 'PENDING')
+    $states = @($l5, $l6)
+
+    if (@($states | Where-Object { $_ -like 'FAIL*' }).Count -gt 0) {
+        return 'FAIL_DQA'
+    }
+
+    $naStates = @('N_A', 'NOT_REQUIRED')
+    if (@($states | Where-Object { $_ -notin $naStates }).Count -eq 0) {
+        return 'N_A_DQA'
+    }
+
+    if (@($states | Where-Object { $_ -eq 'PASS' }).Count -eq $states.Count) {
+        return 'PASS_DQA'
+    }
+
+    return 'PENDING_DQA'
+}
+
+function Apply-VerdictPolicy {
+    param(
+        [System.Collections.IDictionary]$Report
+    )
+
+    $layers = Get-ConfigValue -Config $Report -Name 'validation_layers' -Default ([ordered]@{})
+    $swLayers = @(
+        [string](Get-ConfigValue -Config $layers -Name 'L1_configuration' -Default 'PENDING'),
+        [string](Get-ConfigValue -Config $layers -Name 'L2_capability' -Default 'PENDING'),
+        [string](Get-ConfigValue -Config $layers -Name 'L3_api' -Default 'PENDING'),
+        [string](Get-ConfigValue -Config $layers -Name 'L4_readback' -Default 'PENDING')
+    )
+
+    $swFail = @($swLayers | Where-Object { $_ -like 'FAIL*' }).Count -gt 0
+    $swVerdict = if ($swFail) { 'FAIL_SW' } else { 'PASS_SW' }
+    $dqaVerdict = Resolve-DqaVerdictFromLayers -Layers $layers
+    $exitCode = if ($swVerdict -eq 'FAIL_SW') { 1 } else { 0 }
+
+    $Report.sw_verdict = $swVerdict
+    $Report.dqa_verdict = $dqaVerdict
+    $Report.ci_exit_code = $exitCode
+    $Report.exit_code_policy = [ordered]@{
+        fail_sw = 1
+        pass_sw = 0
+    }
+
+    return [ordered]@{
+        sw_verdict = $swVerdict
+        dqa_verdict = $dqaVerdict
+        exit_code = $exitCode
+    }
+}
+
 function Invoke-ApiHarness([string]$apiHarness, [string]$section, [string]$configPath) {
     if ([string]::IsNullOrWhiteSpace($apiHarness)) { return $null }
     if (-not (Test-Path $apiHarness)) { return $null }

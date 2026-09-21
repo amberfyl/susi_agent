@@ -295,6 +295,21 @@ def build_fan_config(
             "tach_mapping_or_api_failure": "FAIL_API",
             "formal_fixture_missing": "FAIL_FUNCTIONAL",
         },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {
+                "FAIL_SW": 1,
+                "PASS_SW": 0
+            }
+        },
         "safety": {
             "hardware_write": False,
         },
@@ -392,6 +407,21 @@ def build_control_config(
             "expected_delta_rpm_min": expected_delta_rpm_min,
         },
         "rpm_dependency": dependency,
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {
+                "FAIL_SW": 1,
+                "PASS_SW": 0
+            }
+        },
         "safety": {
             "requires_explicit_allow_control": True,
             "restore_required": True,
@@ -513,6 +543,21 @@ def build_smbus_config(
             "result": "CONDITIONAL",
             "reason": "BLOCKED_FIXTURE: no approved SMBus slave/register contract for transaction validation",
         },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {
+                "FAIL_SW": 1,
+                "PASS_SW": 0
+            }
+        },
         # legacy compatibility for simple runner access
         "sample_count": sample_count,
         "sample_interval_ms": sample_interval_ms,
@@ -627,6 +672,21 @@ def build_wdt_config(
             "destructive_skipped_breakdown_bucket": "pending",
             "api_or_capability_failure": "FAIL_API",
             "functional_failure": "FAIL_FUNCTIONAL",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {
+                "FAIL_SW": 1,
+                "PASS_SW": 0
+            }
         },
         "safety": {
             "allow_destructive_reset": allow_destructive_reset,
