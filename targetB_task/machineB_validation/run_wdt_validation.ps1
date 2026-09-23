@@ -106,13 +106,23 @@ try {
     $semantics = Get-ConfigValue -Config $config -Name 'result_semantics' -Default ([ordered]@{})
 
     $ndEnabled = [bool](Get-ConfigValue -Config $nondestructive -Name 'enabled' -Default $true)
-    $desEnabled = [bool](Get-ConfigValue -Config $destructive -Name 'enabled' -Default $false)
-    $allowDestructive = [bool](Get-ConfigValue -Config $destructive -Name 'allow_destructive_reset' -Default $false)
+
+    # SAFETY: reboot/power-cycle WDT tests are disabled at runner level.
+    # Do not remove this hard gate until a dedicated recovery harness and explicit
+    # operator approval exist. In particular, do not call SusiWDogStart with
+    # SUSI_WDT_EVENT_TYPE_PWRCYCLE, and do not intentionally wait for timeout.
+    $desEnabledConfigured = [bool](Get-ConfigValue -Config $destructive -Name 'enabled' -Default $false)
+    $allowDestructiveConfigured = [bool](Get-ConfigValue -Config $destructive -Name 'allow_destructive_reset' -Default $false)
+    $desEnabled = $false
+    $allowDestructive = $false
 
     $report.metrics.policy = [ordered]@{
         nondestructive_enabled = $ndEnabled
         destructive_enabled = $desEnabled
+        destructive_enabled_configured = $desEnabledConfigured
         allow_destructive_reset = $allowDestructive
+        allow_destructive_reset_configured = $allowDestructiveConfigured
+        destructive_runner_gate = 'DISABLED'
     }
 
     $timeoutSec = [int](Get-ConfigValue -Config $nondestructive -Name 'test_timeout_sec' (Get-ConfigValue -Config $config -Name 'test_timeout_sec' 30))
@@ -180,12 +190,16 @@ try {
     }
 
     $destructiveSkipped = $false
-    if ($desEnabled -and $allowDestructive) {
-        # This runner intentionally avoids reboot-required paths.
+    # DISABLED TEST BLOCK: WDT Start/timeout/Stop and PWRCYCLE/reset validation.
+    # These tests can alter reboot/power behavior and are intentionally commented
+    # out until a recovery-capable harness is approved.
+    if ($false -and $desEnabled -and $allowDestructive) {
+        # SusiWDogStart / timeout / SusiWDogStop would belong here.
+        # Never enable this branch for ordinary machineB validation.
         $report.metrics.destructive = [ordered]@{
             attempted = $false
-            allowed_by_policy = $true
-            reason = 'Runner scope excludes reboot-required destructive checks'
+            allowed_by_policy = $false
+            reason = 'Disabled safety gate: reboot/power-cycle WDT tests are not run'
         }
         $destructiveSkipped = $true
     } else {

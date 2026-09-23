@@ -52,6 +52,15 @@ public struct SusiFanControl
     public SusiAutoFan AutoControl;
 }
 
+[StructLayout(LayoutKind.Sequential)]
+public struct SusiThermalProtect
+{
+    public UInt32 SourceId;
+    public UInt32 EventType;
+    public UInt32 SendEventTemperature;
+    public UInt32 ClearEventTemperature;
+}
+
 public static class NativeSusi
 {
     [DllImport("Susi4.dll")]
@@ -67,6 +76,45 @@ public static class NativeSusi
     public static extern UInt32 SusiBoardSetValue(UInt32 Id, ref UInt32 pValue);
 
     [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBWriteQuick(UInt32 Id, byte Addr);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBWriteByte(UInt32 Id, byte Addr, byte Cmd, byte Data);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBReadByte(UInt32 Id, byte Addr, byte Cmd, out byte pBuffer);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBWriteWord(UInt32 Id, byte Addr, byte Cmd, UInt16 Data);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBReadWord(UInt32 Id, byte Addr, byte Cmd, out UInt16 pBuffer);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBSendByte(UInt32 Id, byte Addr, byte Data);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBReceiveByte(UInt32 Id, byte Addr, out byte pData);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBWriteBlock(UInt32 Id, byte Addr, byte Cmd, byte[] pBuffer, UInt32 Length);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBReadBlock(UInt32 Id, byte Addr, byte Cmd, [In, Out] byte[] pBuffer, ref UInt32 pLength);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBI2CWriteBlock(UInt32 Id, byte Addr, byte Cmd, byte[] pBuffer, UInt32 Length);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiSMBI2CReadBlock(UInt32 Id, byte Addr, byte Cmd, [In, Out] byte[] pBuffer, UInt32 Length);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiI2CGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiI2CGetFrequency(UInt32 Id, out UInt32 pFreq);
+
+    [DllImport("Susi4.dll")]
     public static extern UInt32 SusiFanControlGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
 
     [DllImport("Susi4.dll")]
@@ -74,6 +122,51 @@ public static class NativeSusi
 
     [DllImport("Susi4.dll")]
     public static extern UInt32 SusiFanControlSetConfig(UInt32 Id, ref SusiFanControl pConfig);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiThermalProtectionGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiThermalProtectionGetConfig(UInt32 Id, out SusiThermalProtect pConfig);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiStorageGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiStorageAreaRead(UInt32 Id, UInt32 Offset, [In, Out] byte[] pBuffer, UInt32 BufLen);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiStorageAreaWrite(UInt32 Id, UInt32 Offset, byte[] pBuffer, UInt32 BufLen);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiGPIOGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiGPIOGetDirection(UInt32 Id, UInt32 Bitmask, out UInt32 pDirection);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiGPIOSetDirection(UInt32 Id, UInt32 Bitmask, UInt32 Direction);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiGPIOGetLevel(UInt32 Id, UInt32 Bitmask, out UInt32 pLevel);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiGPIOSetLevel(UInt32 Id, UInt32 Bitmask, UInt32 Level);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiVgaGetBacklightEnable(UInt32 Id, out UInt32 pEnable);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiVgaSetBacklightEnable(UInt32 Id, UInt32 Enable);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiVgaGetBacklightBrightness(UInt32 Id, out UInt32 pBright);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiVgaSetBacklightBrightness(UInt32 Id, UInt32 Bright);
+
+    // Storage lock/unlock intentionally disabled for initial validation.
+    // SusiStorageAreaSetUnlock / SusiStorageAreaSetLock are not declared or called.
 }
 "@
     if (-not ('NativeSusi' -as [type])) {
@@ -110,7 +203,13 @@ function Sample-Channel([UInt32]$id, [int]$count, [int]$intervalMs, [scriptblock
             $decoded = if ($decode) { & $decode $r.value } else { [double]$r.value }
             $series += [ordered]@{ ts = (Get-Date).ToString('o'); raw = $r.value; value = $decoded }
         } else {
-            $series += [ordered]@{ ts = (Get-Date).ToString('o'); raw = $null; value = $null; status = Get-StatusName $r.status }
+            $series += [ordered]@{
+                ts = (Get-Date).ToString('o')
+                raw = $null
+                value = $null
+                status = Get-StatusName $r.status
+                status_code = ('0x{0:X8}' -f [UInt32]$r.status)
+            }
         }
         if ($i -lt ($count - 1)) { Start-Sleep -Milliseconds $intervalMs }
     }

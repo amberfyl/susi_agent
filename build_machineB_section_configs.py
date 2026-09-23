@@ -14,10 +14,69 @@ from typing import Any
 
 SECTION_OUTPUTS = {
     "SMBus": "{model}_smbus.json",
+    "I2C": "{model}_i2c.json",
+    "GPIO": "{model}_gpio.json",
+    "HWM.Temperature": "{model}_temperature.json",
+    "HWM.Voltage": "{model}_voltage.json",
+    "HWM.CaseOpen": "{model}_caseopen.json",
+    "HWM.Current": "{model}_current.json",
     "HWM.Fan": "{model}_fan.json",
     "HWM.Fan.Control": "{model}_fancontrol.json",
+    "StorageArea": "{model}_storage.json",
+    "ThermalProtect": "{model}_thermalprotect.json",
     "WDT": "{model}_wdt.json",
+    "VGA.Backlight": "{model}_backlight.json",
+    "VGA.Brightness": "{model}_brightness.json",
 }
+
+# HWM.Temperature INI tuples use 0x80000000 + index as the configuration
+# channel.  SusiBoardGetValue uses a different public API namespace.  This
+# mapping mirrors targetB_task/susi_board_probe.ps1 (0x00020000 + index).
+TEMPERATURE_API_INDEX = {
+    "TCPU": 0,
+    "TCHIPSET": 1,
+    "TSYS": 2,
+    "TCPU2": 3,
+    "TOEM0": 4,
+    "TOEM1": 5,
+    "TOEM2": 6,
+    "TOEM3": 7,
+    "TOEM4": 8,
+    "TOEM5": 9,
+    "TSYS2": 10,
+    "TGRAPHIC": 11,
+}
+
+# HWM.Voltage INI tuples use project/configuration channels, while
+# SusiBoardGetValue uses the public voltage namespace 0x00021000 + index.
+# The report/display name is authoritative for aliases such as V50/+5V and
+# V120/+12V; the key is retained as a fallback for standard names.
+VOLTAGE_API_INDEX = {
+    "VCORE": 0, "VCORE2": 1, "2V5": 2, "3V3": 3,
+    "5V": 4, "+5V": 4, "V50": 4,
+    "12V": 5, "+12V": 5, "V120": 5,
+    "5VSB": 6, "+5VSB": 6, "V5SB": 6,
+    "3VSB": 7, "+3VSB": 7, "V3SB": 7,
+    "VBAT": 8, "5NV": 9, "12NV": 10, "VTT": 11,
+    "24V": 12, "DC": 13, "DCSTBY": 14, "VBATLI": 15,
+    "OEM0": 16, "OEM1": 17, "OEM2": 18,
+    "1V05": 19, "1V5": 20, "1V8": 21,
+    "12VS5": 22, "5VS5": 23, "3V3S5": 24,
+}
+
+# HWM.Current INI tuples use 0x80000000 + index as configuration channels,
+# while SusiBoardGetValue uses the public current namespace 0x00023000 + index.
+CURRENT_API_INDEX = {"OEM0": 0, "OEM1": 1, "OEM2": 2}
+CASEOPEN_API_INDEX = {"CO0": 0, "CO1": 1, "CO2": 2}
+THERMALPROTECT_API_INDEX = {
+    "TPCH0": 0,
+    "TPCH1": 1,
+    "TPCH2": 2,
+    "TPCH3": 3,
+}
+STORAGE_API_INDEX = {f"AREA{i}": i for i in range(12)}
+BACKLIGHT_API_INDEX = {f"BACKLIGHT{i}": i - 1 for i in range(1, 5)}
+BRIGHTNESS_API_INDEX = {f"BRIGHTNESS{i}": i - 1 for i in range(1, 5)}
 
 DEFAULTS = {
     "fan": {
@@ -60,6 +119,67 @@ DEFAULTS = {
             "enforce_mask_match": True,
         },
     },
+    "i2c": {
+        "capability_check": {
+            "supported_id": "0x00030100",
+            "sample_count": 5,
+            "sample_interval_ms": 200,
+            "min_success_rate": 1.0,
+            "require_stable_mask": True,
+            "enforce_mask_match": True,
+        },
+        "frequency_check": {
+            "min_khz": 1,
+            "max_khz": 1000,
+            "require_api_success": False,
+        },
+        "caps_check": {
+            "maximum_block_length_item_id": "0x00000000",
+            "require_api_success": False,
+        },
+    },
+    "temperature": {
+        "read_check": {
+            "sample_count": 10,
+            "sample_interval_ms": 1000,
+            "min_success_rate": 0.9,
+            "min_celsius": -40.0,
+            "max_celsius": 125.0,
+            "max_span_celsius": 30.0,
+        },
+    },
+    "current": {
+        "read_check": {
+            "sample_count": 10,
+            "sample_interval_ms": 500,
+            "min_success_rate": 0.9,
+            "min_milliamps": 0.0,
+            "max_milliamps": 100000.0,
+            "max_span_milliamps": 10000.0,
+        },
+    },
+    "caseopen": {
+        "read_check": {
+            "sample_count": 10,
+            "sample_interval_ms": 500,
+            "min_success_rate": 0.9,
+            "allowed_values": [0, 1],
+        },
+    },
+    "storage": {
+        "read_check": {
+            "offset": 0,
+            "length": 16,
+            "sample_count": 1,
+            "min_success_rate": 1.0,
+        },
+        "write_check": {
+            "enabled": True,
+            "verify": True,
+            "restore_original": True,
+            "pattern_hex": "A5",
+        },
+    },
     "wdt": {
         "capability_check": {
             "sample_count": 3,
@@ -73,6 +193,8 @@ DEFAULTS = {
             "refresh_cycles": 3,
             "stop_wait_margin_sec": 5,
         },
+        # SAFETY: keep reboot/power-cycle WDT tests disabled until an approved
+        # recovery harness is available. The runner also has an independent gate.
         "destructive_check": {
             "enabled": False,
             "allow_destructive_reset": False,
@@ -439,6 +561,777 @@ def build_control_config(
     }
 
 
+def build_temperature_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    read_policy = policy_section(policy, "temperature_sampling")
+    defaults = DEFAULTS["temperature"]["read_check"]
+
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=True,
+        empty_lines_in_values=False,
+    )
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+
+    section_name = next(
+        (name for name in parser.sections() if name.lower() == "hwm.temperature"),
+        None,
+    )
+    if section_name is None:
+        raise BuildError(f"{path} must contain [HWM.Temperature]")
+
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(
+                f"[HWM.Temperature]{key} in {path} has fewer than 4 tuple fields"
+            )
+        normalized_key = key.strip().upper()
+        if normalized_key not in TEMPERATURE_API_INDEX:
+            raise BuildError(
+                f"[HWM.Temperature]{key} has no canonical SUSI Board API mapping"
+            )
+        tuple_channel = parse_int_auto(fields[1])
+        api_id = 0x00020000 + TEMPERATURE_API_INDEX[normalized_key]
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "api_id": f"0x{api_id:08X}",
+            "api_id_source": "SUSI_HWM_TEMPERATURE_NAMESPACE",
+            "decode": "kelvin_x10_to_celsius",
+            "display_name": fields[5].strip('"') if len(fields) >= 6 else key,
+        }
+
+    sample_count = int(policy_value(read_policy, "sample_count", defaults["sample_count"]))
+    sample_interval_ms = int(
+        policy_value(
+            read_policy,
+            "sample_interval_ms",
+            defaults["sample_interval_ms"],
+        )
+    )
+    min_success_rate = float(
+        policy_value(
+            read_policy,
+            "min_success_rate",
+            defaults["min_success_rate"],
+        )
+    )
+    min_celsius = float(policy_value(read_policy, "min_celsius", defaults["min_celsius"]))
+    max_celsius = float(policy_value(read_policy, "max_celsius", defaults["max_celsius"]))
+    max_span_celsius = float(
+        policy_value(read_policy, "max_span_celsius", defaults["max_span_celsius"])
+    )
+
+    return {
+        "schema_version": "1.0",
+        "category": "HWM.Temperature",
+        "model": model,
+        "source_ini": source_metadata(path, "HWM.Temperature"),
+        "required_channels": keys,
+        "channels": channels,
+        "read_check": {
+            "sample_count": sample_count,
+            "sample_interval_ms": sample_interval_ms,
+            "min_success_rate": min_success_rate,
+            "min_celsius": min_celsius,
+            "max_celsius": max_celsius,
+            "max_span_celsius": max_span_celsius,
+        },
+        "result_semantics": {
+            "api_or_mapping_failure": "FAIL_API",
+            "readback_out_of_range": "FAIL_READBACK",
+            "fixture_missing": "CONDITIONAL",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {
+                "FAIL_SW": 1,
+                "PASS_SW": 0
+            }
+        },
+        # legacy compatibility for simple runner access
+        "sample_count": sample_count,
+        "sample_interval_ms": sample_interval_ms,
+        "minimum_success_rate": min_success_rate,
+        "min_celsius": min_celsius,
+        "max_celsius": max_celsius,
+        "max_span_celsius": max_span_celsius,
+    }
+
+
+def build_voltage_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    read_policy = policy_section(policy, "voltage_sampling")
+    defaults = {
+        "sample_count": 10,
+        "sample_interval_ms": 500,
+        "min_success_rate": 0.9,
+        "min_millivolts": 0.0,
+        "max_millivolts": 30000.0,
+        "max_span_millivolts": 5000.0,
+    }
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+
+    section_name = next((name for name in parser.sections() if name.lower() == "hwm.voltage"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [HWM.Voltage]")
+
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(f"[HWM.Voltage]{key} in {path} has fewer than 4 tuple fields")
+        report_name = fields[6].strip('"') if len(fields) >= 7 else key
+        report_norm = report_name.upper().replace(" ", "")
+        key_norm = key.strip().upper()
+        api_index = VOLTAGE_API_INDEX.get(report_norm)
+        if api_index is None:
+            api_index = VOLTAGE_API_INDEX.get(key_norm)
+        if api_index is None:
+            raise BuildError(f"[HWM.Voltage]{key} has no canonical SUSI Board API mapping (report_name={report_name})")
+        tuple_channel = parse_int_auto(fields[1])
+        api_id = 0x00021000 + api_index
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "api_id": f"0x{api_id:08X}",
+            "api_id_source": "SUSI_HWM_VOLTAGE_NAMESPACE",
+            "decode": "millivolts",
+            "display_name": report_name,
+        }
+
+    sample_count = int(policy_value(read_policy, "sample_count", defaults["sample_count"]))
+    sample_interval_ms = int(policy_value(read_policy, "sample_interval_ms", defaults["sample_interval_ms"]))
+    min_success_rate = float(policy_value(read_policy, "min_success_rate", defaults["min_success_rate"]))
+    min_millivolts = float(policy_value(read_policy, "min_millivolts", defaults["min_millivolts"]))
+    max_millivolts = float(policy_value(read_policy, "max_millivolts", defaults["max_millivolts"]))
+    max_span_millivolts = float(policy_value(read_policy, "max_span_millivolts", defaults["max_span_millivolts"]))
+
+    return {
+        "schema_version": "1.0",
+        "category": "HWM.Voltage",
+        "model": model,
+        "source_ini": source_metadata(path, "HWM.Voltage"),
+        "required_channels": keys,
+        "channels": channels,
+        "read_check": {
+            "sample_count": sample_count,
+            "sample_interval_ms": sample_interval_ms,
+            "min_success_rate": min_success_rate,
+            "min_millivolts": min_millivolts,
+            "max_millivolts": max_millivolts,
+            "max_span_millivolts": max_span_millivolts,
+        },
+        "result_semantics": {
+            "api_or_mapping_failure": "FAIL_API",
+            "readback_out_of_range": "FAIL_READBACK",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {"FAIL_SW": 1, "PASS_SW": 0}
+        },
+        "sample_count": sample_count,
+        "sample_interval_ms": sample_interval_ms,
+        "minimum_success_rate": min_success_rate,
+        "min_millivolts": min_millivolts,
+        "max_millivolts": max_millivolts,
+        "max_span_millivolts": max_span_millivolts,
+    }
+
+
+def build_current_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    read_policy = policy_section(policy, "current_sampling")
+    defaults = DEFAULTS["current"]["read_check"]
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+    section_name = next((name for name in parser.sections() if name.lower() == "hwm.current"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [HWM.Current]")
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(f"[HWM.Current]{key} in {path} has fewer than 4 tuple fields")
+        normalized_key = key.strip().upper()
+        if normalized_key not in CURRENT_API_INDEX:
+            raise BuildError(f"[HWM.Current]{key} has no canonical SUSI Board API mapping")
+        tuple_channel = parse_int_auto(fields[1])
+        api_id = 0x00023000 + CURRENT_API_INDEX[normalized_key]
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "api_id": f"0x{api_id:08X}",
+            "api_id_source": "SUSI_HWM_CURRENT_NAMESPACE",
+            "decode": "milliamps",
+            "display_name": "",
+        }
+    values = {}
+    for name in ("sample_count", "sample_interval_ms", "min_success_rate", "min_milliamps", "max_milliamps", "max_span_milliamps"):
+        values[name] = policy_value(read_policy, name, defaults[name])
+    values["sample_count"] = int(values["sample_count"])
+    values["sample_interval_ms"] = int(values["sample_interval_ms"])
+    values["min_success_rate"] = float(values["min_success_rate"])
+    for name in ("min_milliamps", "max_milliamps", "max_span_milliamps"):
+        values[name] = float(values[name])
+    return {
+        "schema_version": "1.0",
+        "category": "HWM.Current",
+        "model": model,
+        "source_ini": source_metadata(path, "HWM.Current"),
+        "required_channels": keys,
+        "channels": channels,
+        "read_check": values,
+        "result_semantics": {"api_or_mapping_failure": "FAIL_API", "readback_out_of_range": "FAIL_READBACK"},
+        "verdict_policy": {
+            "sw_verdict": {"pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"], "fail_on": ["FAIL*"]},
+            "dqa_verdict": {"layers": ["L5_functional", "L6_recovery"], "na_states": ["N_A", "NOT_REQUIRED"], "pending_states": ["PENDING", "CONDITIONAL*"]},
+            "ci_exit_code": {"FAIL_SW": 1, "PASS_SW": 0},
+        },
+        **values,
+        "minimum_success_rate": values["min_success_rate"],
+    }
+
+
+def build_thermalprotect_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+    section_name = next((name for name in parser.sections() if name.lower() == "thermalprotect"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [ThermalProtect]")
+
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(f"[ThermalProtect]{key} in {path} has fewer than 4 tuple fields")
+        normalized_key = key.strip().upper()
+        if normalized_key not in THERMALPROTECT_API_INDEX:
+            raise BuildError(f"[ThermalProtect]{key} has no canonical SUSI Thermal API mapping")
+        tuple_channel = parse_int_auto(fields[1])
+        thermal_id = THERMALPROTECT_API_INDEX[normalized_key]
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "thermal_api_id": f"0x{thermal_id:08X}",
+            "thermal_api_id_name": f"SUSI_ID_THERMAL_PROTECT_{thermal_id + 1}",
+            "api_id_source": "SUSI_THERMAL_PROTECT_CHANNEL_ID",
+            "config_source_id_type": "SUSI_HWM_TEMPERATURE_ID",
+        }
+
+    return {
+        "schema_version": "1.0",
+        "category": "ThermalProtect",
+        "model": model,
+        "source_ini": source_metadata(path, "ThermalProtect"),
+        "required_channels": keys,
+        "channels": channels,
+        "capability_check": {
+            "item_ids": {
+                "support_flags": "0x00000000",
+                "trigger_maximum": "0x00000001",
+                "trigger_minimum": "0x00000002",
+                "clear_maximum": "0x00000003",
+                "clear_minimum": "0x00000004",
+            },
+            "read_only": True,
+        },
+        "config_check": {
+            "read_only": True,
+            "temperature_unit": "0.1_kelvins",
+            "allowed_event_types": {
+                "shutdown": "0x00000000",
+                "throttle": "0x00000001",
+                "poweroff": "0x00000002",
+                "none": "0x000000FF",
+            },
+        },
+        "result_semantics": {
+            "api_or_mapping_failure": "FAIL_API",
+            "invalid_config": "FAIL_READBACK",
+            "functional_stimulus": "CONDITIONAL",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {"FAIL_SW": 1, "PASS_SW": 0},
+        },
+    }
+
+
+def build_caseopen_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    read_policy = policy_section(policy, "caseopen_sampling")
+    defaults = DEFAULTS["caseopen"]["read_check"]
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+
+    section_name = next((name for name in parser.sections() if name.lower() == "hwm.caseopen"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [HWM.CaseOpen]")
+
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(f"[HWM.CaseOpen]{key} in {path} has fewer than 4 tuple fields")
+        normalized_key = key.strip().upper()
+        if normalized_key not in CASEOPEN_API_INDEX:
+            raise BuildError(f"[HWM.CaseOpen]{key} has no canonical SUSI Board API mapping")
+        tuple_channel = parse_int_auto(fields[1])
+        api_id = 0x00024000 + CASEOPEN_API_INDEX[normalized_key]
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "api_id": f"0x{api_id:08X}",
+            "api_id_source": "SUSI_HWM_CASEOPEN_NAMESPACE",
+            "decode": "boolean_u32",
+            "display_name": key,
+        }
+
+    sample_count = int(policy_value(read_policy, "sample_count", defaults["sample_count"]))
+    sample_interval_ms = int(policy_value(read_policy, "sample_interval_ms", defaults["sample_interval_ms"]))
+    min_success_rate = float(policy_value(read_policy, "min_success_rate", defaults["min_success_rate"]))
+    allowed_values = list(policy_value(read_policy, "allowed_values", defaults["allowed_values"]))
+    return {
+        "schema_version": "1.0",
+        "category": "HWM.CaseOpen",
+        "model": model,
+        "source_ini": source_metadata(path, "HWM.CaseOpen"),
+        "required_channels": keys,
+        "channels": channels,
+        "read_check": {
+            "sample_count": sample_count,
+            "sample_interval_ms": sample_interval_ms,
+            "min_success_rate": min_success_rate,
+            "allowed_values": allowed_values,
+        },
+        "result_semantics": {
+            "api_or_mapping_failure": "FAIL_API",
+            "readback_invalid_value": "FAIL_READBACK",
+            "fixture_missing": "CONDITIONAL",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {"FAIL_SW": 1, "PASS_SW": 0}
+        },
+        "sample_count": sample_count,
+        "sample_interval_ms": sample_interval_ms,
+        "minimum_success_rate": min_success_rate,
+        "allowed_values": allowed_values,
+    }
+
+
+def build_storage_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    read_policy = policy_section(policy, "storage_read")
+    write_policy = policy_section(policy, "storage_write")
+    defaults_read = DEFAULTS["storage"]["read_check"]
+    defaults_write = DEFAULTS["storage"]["write_check"]
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+    section_name = next((name for name in parser.sections() if name.lower() == "storagearea"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [StorageArea]")
+
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(f"[StorageArea]{key} in {path} has fewer than 4 tuple fields")
+        normalized_key = key.strip().upper()
+        if normalized_key not in STORAGE_API_INDEX:
+            raise BuildError(f"[StorageArea]{key} has no canonical SUSI Storage API mapping")
+        tuple_channel = parse_int_auto(fields[1])
+        storage_id = STORAGE_API_INDEX[normalized_key]
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "storage_api_id": f"0x{storage_id:08X}",
+            "storage_api_id_name": "SUSI_ID_STORAGE_STD" if storage_id == 0 else f"SUSI_ID_STORAGE_OEM{storage_id - 1}",
+            "api_id_source": "SUSI_STORAGE_AREA_ID",
+        }
+
+    offset = int(policy_value(read_policy, "offset", defaults_read["offset"]))
+    length = int(policy_value(read_policy, "length", defaults_read["length"]))
+    sample_count = int(policy_value(read_policy, "sample_count", defaults_read["sample_count"]))
+    min_success_rate = float(policy_value(read_policy, "min_success_rate", defaults_read["min_success_rate"]))
+    if offset < 0 or length <= 0 or sample_count <= 0:
+        raise BuildError("StorageArea read policy requires offset >= 0, length > 0, sample_count > 0")
+
+    return {
+        "schema_version": "1.0",
+        "category": "StorageArea",
+        "model": model,
+        "source_ini": source_metadata(path, "StorageArea"),
+        "required_channels": keys,
+        "channels": channels,
+        "capability_check": {
+            "item_ids": {
+                "total_size": "0x00000000",
+                "block_size": "0x00000001",
+                "lock_status": "0x00010000",
+                "password_max_length": "0x00010001",
+            },
+        },
+        "read_check": {
+            "offset": offset,
+            "length": length,
+            "sample_count": sample_count,
+            "min_success_rate": min_success_rate,
+        },
+        "write_check": {
+            "enabled": bool(policy_value(write_policy, "enabled", defaults_write["enabled"])),
+            "verify": bool(policy_value(write_policy, "verify", defaults_write["verify"])),
+            "restore_original": bool(policy_value(write_policy, "restore_original", defaults_write["restore_original"])),
+            "pattern_hex": str(policy_value(write_policy, "pattern_hex", defaults_write["pattern_hex"])),
+        },
+        "result_semantics": {
+            "capability_or_mapping_failure": "FAIL_API",
+            "read_failure": "FAIL_READBACK",
+            "write_not_requested": "CONDITIONAL",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {"FAIL_SW": 1, "PASS_SW": 0}
+        },
+    }
+
+
+def build_gpio_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a GPIO bank/mask contract from the generated section INI."""
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+    section_name = next((name for name in parser.sections() if name.lower() == "gpio"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [GPIO]")
+
+    channels: dict[str, Any] = {}
+    bank_masks: dict[int, int] = {}
+    for key in keys:
+        normalized_key = key.strip().upper()
+        suffix = normalized_key[4:] if normalized_key.startswith("GPIO") else ""
+        if not suffix.isdigit():
+            raise BuildError(f"[GPIO]{key} must use GPIO<number> naming")
+        gpio_id = int(suffix, 10)
+        if gpio_id > 127:
+            raise BuildError(f"[GPIO]{key} public ID must be in range 0..127")
+
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 6:
+            raise BuildError(f"[GPIO]{key} in {path} has fewer than 6 tuple fields")
+        tuple_group = parse_int_auto(fields[4])
+        tuple_pin = parse_int_auto(fields[5])
+        bank_no = gpio_id >> 5
+        bank_bitmask = 1 << (gpio_id & 0x1F)
+        bank_masks[bank_no] = bank_masks.get(bank_no, 0) | bank_bitmask
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_group": tuple_group,
+            "tuple_pin": tuple_pin,
+            "gpio_api_id": f"0x{gpio_id:08X}",
+            "bank": bank_no,
+            "bank_id": f"0x{0x00010000 + bank_no:08X}",
+            "bank_bitmask": f"0x{bank_bitmask:08X}",
+            "api_id_source": "GPIO_KEY_SUFFIX",
+        }
+
+    functional = policy_section(policy, "gpio_functional")
+    banks = {
+        f"Bank{bank_no}": {
+            "bank_number": bank_no,
+            "bank_id": f"0x{0x00010000 + bank_no:08X}",
+            "expected_mask": f"0x{mask:08X}",
+        }
+        for bank_no, mask in sorted(bank_masks.items())
+    }
+    return {
+        "schema_version": "1.0",
+        "category": "GPIO",
+        "model": model,
+        "source_ini": source_metadata(path, "GPIO"),
+        "required_channels": keys,
+        "channels": channels,
+        "banks": banks,
+        "capability_items": {
+            "input_support": "0x00000000",
+            "output_support": "0x00000001",
+        },
+        "functional_check": {
+            "enabled": bool(policy_value(functional, "enabled", True)),
+            "patterns": ["0x00000000", "EXPECTED_MASK"],
+            "settle_time_ms": int(policy_value(functional, "settle_time_ms", 100)),
+            "restore_original": True,
+        },
+        "safety": {
+            "requires_explicit_functional_switch": True,
+            "restore_original_level_and_direction": True,
+        },
+        "result_semantics": {
+            "capability_or_read_failure": "FAIL_API",
+            "functional_not_requested": "CONDITIONAL",
+            "set_readback_or_restore_failure": "FAIL_FUNCTIONAL",
+        },
+    }
+
+
+def build_brightness_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read JSON/INI {path}: {exc}") from exc
+    section_name = next((name for name in parser.sections() if name.lower() == "vga.brightness"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [VGA.Brightness]")
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 5:
+            raise BuildError(f"[VGA.Brightness]{key} in {path} has fewer than 5 tuple fields")
+        normalized_key = key.strip().upper()
+        if normalized_key not in BRIGHTNESS_API_INDEX:
+            raise BuildError(f"[VGA.Brightness]{key} has no canonical SUSI Brightness API mapping")
+        tuple_channel = parse_int_auto(fields[1])
+        api_id = BRIGHTNESS_API_INDEX[normalized_key]
+        min_value = parse_int_auto(fields[4]) if fields[4] else 0
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "brightness_api_id": f"0x{api_id:08X}",
+            "api_id": f"0x{api_id:08X}",
+            "api_id_source": "SUSI_ID_BACKLIGHT_N",
+            "configured_max": min_value,
+        }
+    functional = policy_section(policy, "brightness_functional")
+    return {
+        "schema_version": "1.0",
+        "category": "VGA.Brightness",
+        "model": model,
+        "source_ini": source_metadata(path, "VGA.Brightness"),
+        "required_channels": keys,
+        "channels": channels,
+        "read_check": {"min_brightness": 0, "max_brightness": 100},
+        "functional_check": {
+            "enabled": bool(policy_value(functional, "enabled", True)),
+            "test_value": int(policy_value(functional, "test_value", 0)),
+            "verify": bool(policy_value(functional, "verify", True)),
+            "restore_original": bool(policy_value(functional, "restore_original", True)),
+        },
+        "result_semantics": {
+            "api_or_mapping_failure": "FAIL_API",
+            "set_or_restore_failure": "FAIL_FUNCTIONAL",
+            "functional_not_requested": "CONDITIONAL",
+        },
+        "safety": {"reversible_set": True, "restore_original": True},
+    }
+
+
+def build_backlight_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    parser = configparser.ConfigParser(interpolation=None, strict=True, empty_lines_in_values=False)
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+    section_name = next((name for name in parser.sections() if name.lower() == "vga.backlight"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [VGA.Backlight]")
+
+    channels: dict[str, Any] = {}
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(f"[VGA.Backlight]{key} in {path} has fewer than 4 tuple fields")
+        normalized_key = key.strip().upper()
+        if normalized_key not in BACKLIGHT_API_INDEX:
+            raise BuildError(f"[VGA.Backlight]{key} has no canonical SUSI Backlight API mapping")
+        tuple_channel = parse_int_auto(fields[1])
+        api_id = BACKLIGHT_API_INDEX[normalized_key]
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "tuple_channel": f"0x{tuple_channel:08X}",
+            "backlight_api_id": f"0x{api_id:08X}",
+            "api_id": f"0x{api_id:08X}",
+            "api_id_source": "SUSI_ID_BACKLIGHT_N",
+        }
+
+    functional = policy_section(policy, "backlight_functional")
+    return {
+        "schema_version": "1.0",
+        "category": "VGA.Backlight",
+        "model": model,
+        "source_ini": source_metadata(path, "VGA.Backlight"),
+        "required_channels": keys,
+        "channels": channels,
+        "functional_check": {
+            "enabled": bool(policy_value(functional, "enabled", True)),
+            "toggle_to": int(policy_value(functional, "toggle_to", 0)),
+            "verify": bool(policy_value(functional, "verify", True)),
+            "restore_original": bool(policy_value(functional, "restore_original", True)),
+        },
+        "result_semantics": {
+            "api_or_mapping_failure": "FAIL_API",
+            "toggle_or_restore_failure": "FAIL_FUNCTIONAL",
+            "functional_not_requested": "CONDITIONAL",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"]
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"]
+            },
+            "ci_exit_code": {"FAIL_SW": 1, "PASS_SW": 0}
+        },
+        "safety": {
+            "reversible_toggle": True,
+            "restore_original": True,
+        },
+    }
+
+
 def build_smbus_config(
     model: str,
     path: Path,
@@ -565,6 +1458,117 @@ def build_smbus_config(
         "require_stable_mask": require_stable_mask,
         "enforce_mask_match": enforce_mask_match,
         "supported_id": supported_id,
+    }
+
+
+def build_i2c_config(
+    model: str,
+    path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    capability_policy = policy_section(policy, "i2c_capability")
+    frequency_policy = policy_section(policy, "i2c_frequency")
+    caps_policy = policy_section(policy, "i2c_caps")
+    capability_defaults = DEFAULTS["i2c"]["capability_check"]
+    frequency_defaults = DEFAULTS["i2c"]["frequency_check"]
+    caps_defaults = DEFAULTS["i2c"]["caps_check"]
+
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=True,
+        empty_lines_in_values=False,
+    )
+    parser.optionxform = str
+    try:
+        with path.open("r", encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except (OSError, configparser.Error) as exc:
+        raise BuildError(f"cannot read INI {path}: {exc}") from exc
+
+    section_name = next((name for name in parser.sections() if name.lower() == "i2c"), None)
+    if section_name is None:
+        raise BuildError(f"{path} must contain [I2C]")
+
+    channels: dict[str, Any] = {}
+    used_api_ids: set[int] = set()
+    for key in keys:
+        raw = parser[section_name].get(key, "").strip()
+        fields = [item.strip() for item in raw.split(",")]
+        if len(fields) < 4:
+            raise BuildError(f"[I2C]{key} in {path} has fewer than 4 tuple fields")
+        encoded_channel = parse_int_auto(fields[1])
+        api_id = encoded_channel - 0x80000000 if encoded_channel >= 0x80000000 else encoded_channel
+        if api_id < 0 or api_id > 31:
+            raise BuildError(f"[I2C]{key} public API ID must be in [0,31], got {api_id}")
+        if api_id in used_api_ids:
+            raise BuildError(f"[I2C] duplicate public API ID {api_id} at {key}")
+        used_api_ids.add(api_id)
+        channels[key] = {
+            "raw_tuple": raw,
+            "tuple_fields": fields,
+            "encoded_channel": f"0x{encoded_channel:08X}",
+            "i2c_api_id": f"0x{api_id:08X}",
+            "i2c_api_id_value": api_id,
+            "capability_bit": api_id,
+        }
+
+    sample_count = int(policy_value(capability_policy, "sample_count", capability_defaults["sample_count"]))
+    sample_interval_ms = int(policy_value(capability_policy, "sample_interval_ms", capability_defaults["sample_interval_ms"]))
+    min_success_rate = float(policy_value(capability_policy, "min_success_rate", capability_defaults["min_success_rate"]))
+    require_stable_mask = bool(policy_value(capability_policy, "require_stable_mask", capability_defaults["require_stable_mask"]))
+    enforce_mask_match = bool(policy_value(capability_policy, "enforce_mask_match", capability_defaults["enforce_mask_match"]))
+    supported_id = str(policy_value(capability_policy, "supported_id", capability_defaults["supported_id"]))
+
+    return {
+        "schema_version": "1.0",
+        "category": "I2C",
+        "model": model,
+        "source_ini": source_metadata(path, "I2C"),
+        "required_channels": keys,
+        "channels": channels,
+        "capability_check": {
+            "supported_id": supported_id,
+            "sample_count": sample_count,
+            "sample_interval_ms": sample_interval_ms,
+            "min_success_rate": min_success_rate,
+            "require_stable_mask": require_stable_mask,
+            "enforce_mask_match": enforce_mask_match,
+        },
+        "frequency_check": {
+            "min_khz": int(policy_value(frequency_policy, "min_khz", frequency_defaults["min_khz"])),
+            "max_khz": int(policy_value(frequency_policy, "max_khz", frequency_defaults["max_khz"])),
+            "require_api_success": bool(policy_value(frequency_policy, "require_api_success", frequency_defaults["require_api_success"])),
+        },
+        "caps_check": {
+            "maximum_block_length_item_id": str(policy_value(caps_policy, "maximum_block_length_item_id", caps_defaults["maximum_block_length_item_id"])),
+            "require_api_success": bool(policy_value(caps_policy, "require_api_success", caps_defaults["require_api_success"])),
+        },
+        "transaction_policy": {
+            "enabled": False,
+            "read_only": True,
+            "require_fixture_for_transaction": True,
+            "legacy_fixture_addresses_encoded": ["0xAC", "0xAE"],
+            "legacy_fixture_addresses_7bit": ["0x56", "0x57"],
+        },
+        "expected_without_fixture": {
+            "result": "CONDITIONAL",
+            "sw_verdict": "PASS_SW",
+            "dqa_verdict": "PENDING_DQA",
+            "reason": "I2C transaction validation requires an approved slave/fixture contract",
+        },
+        "verdict_policy": {
+            "sw_verdict": {
+                "pass_when_layers": ["L1_configuration", "L2_capability", "L3_api", "L4_readback"],
+                "fail_on": ["FAIL*"],
+            },
+            "dqa_verdict": {
+                "layers": ["L5_functional", "L6_recovery"],
+                "na_states": ["N_A", "NOT_REQUIRED"],
+                "pending_states": ["PENDING", "CONDITIONAL*"],
+            },
+            "ci_exit_code": {"FAIL_SW": 1, "PASS_SW": 0},
+        },
     }
 
 
@@ -772,7 +1776,7 @@ def main() -> int:
                 continue
 
             try:
-                if section_name == "HWM.Fan":
+                if section_name in ("HWM.Fan", "GPIO"):
                     minimum_fields = 6
                 elif section_name == "HWM.Fan.Control":
                     minimum_fields = 5
@@ -791,8 +1795,28 @@ def main() -> int:
                         fan_entry,
                         f"{model}_fan.json",
                     )
+                elif section_name == "HWM.Temperature":
+                    config = build_temperature_config(model, source_path, keys, policy)
+                elif section_name == "HWM.Voltage":
+                    config = build_voltage_config(model, source_path, keys, policy)
+                elif section_name == "HWM.CaseOpen":
+                    config = build_caseopen_config(model, source_path, keys, policy)
+                elif section_name == "HWM.Current":
+                    config = build_current_config(model, source_path, keys, policy)
+                elif section_name == "ThermalProtect":
+                    config = build_thermalprotect_config(model, source_path, keys, policy)
+                elif section_name == "StorageArea":
+                    config = build_storage_config(model, source_path, keys, policy)
+                elif section_name == "GPIO":
+                    config = build_gpio_config(model, source_path, keys, policy)
+                elif section_name == "I2C":
+                    config = build_i2c_config(model, source_path, keys, policy)
                 elif section_name == "WDT":
                     config = build_wdt_config(model, source_path, keys, policy)
+                elif section_name == "VGA.Backlight":
+                    config = build_backlight_config(model, source_path, keys, policy)
+                elif section_name == "VGA.Brightness":
+                    config = build_brightness_config(model, source_path, keys, policy)
                 else:
                     config = build_smbus_config(model, source_path, keys, policy)
                 write_config(output_path, config)

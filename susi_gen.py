@@ -2328,8 +2328,18 @@ def _build_i2c_query_result(db_path: Path, product_name: str, chip_name: str,
             continue
         db_channel = str(db_row.get("channel") or "").strip()
         if db_channel:
+            encoded_channel = _parse_int_value(db_channel)
+            if encoded_channel is None:
+                continue
+            bus_id = encoded_channel - 0x80000000 if encoded_channel >= 0x80000000 else encoded_channel
+            slot = bus_id + 1
+            if slot < 1 or slot > 5:
+                skipped_oem_ids.append(bus_id)
+                continue
             row = dict(db_row)
-            row["item_name"] = "Channel1"
+            # INI keys are slots; the tuple keeps the encoded SUSI bus ID.
+            # Reusing Channel1 for every DB row creates invalid duplicate keys.
+            row["item_name"] = f"Channel{slot}"
             row["i2c_channel_source"] = "DB"
             rows.append(row)
             continue
