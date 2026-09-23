@@ -1903,8 +1903,8 @@ def _render_section_lines(section: str, query_result: dict) -> list[str]:
             # Normalize DB item names (e.g. CURRENT_OEM0) to INI convention OEM0/OEM1...
             key = f"OEM{idx}"
         elif section == "VGA.Backlight":
-            # Normalize DB item names (e.g. BACKLIGHT_1) to INI convention BACKLIGHT1/BACKLIGHT2...
-            key = f"BACKLIGHT{idx + 1}"
+            # INI key casing is strict: Backlight1, Backlight2, ...
+            key = f"Backlight{idx + 1}"
         elif section == "GPIO" and isinstance(key, str):
             m_gpio_key = re.match(r"^GPIO(\d+)$", key.strip(), re.IGNORECASE)
             if m_gpio_key:

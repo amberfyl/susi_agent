@@ -18,6 +18,7 @@
 |---|---|---|
 | `HWM.Fan` | `<model>_fan.json` | `run_hwm_fan_validation.ps1` |
 | `HWM.Fan.Control` | `<model>_fancontrol.json` | `run_hwm_fan_control_validation.ps1` |
+| `StorageArea` | `<model>_storage.json` | `run_storage_validation.ps1` |
 
 所有輸出都包含：
 - `schema_version`

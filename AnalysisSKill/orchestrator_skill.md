@@ -104,6 +104,11 @@
 - 若 section 無值/無內容，標記 `SKIPPED_EMPTY_SECTION`，且不輸出該 section ini。
 - 對 machine B 的交付物是「有內容的 section ini 集合」；空 section 只保留於流程狀態記錄中。
 
+## `[VGA.Backlight]` INI key 大小寫契約
+- INI key 大小寫相容性不成立，輸出時必須嚴格使用 `Backlight1=`、`Backlight2=`、`Backlight3=` 等形式。
+- 禁止輸出 `BACKLIGHT1=`、`BACKLIGHT2=` 等全大寫形式；DB/JSON 的 item name 即使為大寫，也不得直接沿用到 INI key。
+- 此規則由總控 `susi_gen.py` 的 INI renderer 落實；回歸測試需驗證精確大小寫，並拒絕錯誤大小寫。
+
 ## Probe 判讀用途（除 status 之外）
 - `status`：確認該項是否可讀/可用（SUCCESS vs UNSUPPORTED/ERR）。
 - `string`（如 `BOARD_NAME_STR` / `BOARD_BIOS_REVISION_STR` / `BOARD_EC_FW_STR`）：
