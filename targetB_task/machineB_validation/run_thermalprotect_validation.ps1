@@ -3,7 +3,8 @@ param(
     [string]$ConfigPath = "$PSScriptRoot\MIO-2375_thermalprotect.json",
     [string]$IniPath = "",
     [string]$IniDir = "$env:WINDIR\SUSI",
-    [string]$OutDir = ".\out"
+    [string]$OutDir = ".\out",
+    [switch]$EnableSetConfigTest
 )
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\common_susi.ps1"
@@ -33,11 +34,10 @@ function Get-ThermalEventName([UInt32]$eventType) {
 $report = New-ValidationReport -category 'ThermalProtect' -configPath $ConfigPath
 $initialized = $false
 try {
-    # [RUNNER SKELETON] 1) config + section gate
-    # SAFETY: only GetCaps/GetConfig are enabled in this runner.
-    # SusiThermalProtectionSetConfig and any thermal event trigger are intentionally
-    # disabled because EventType may be SHUTDOWN or POWEROFF.
-    $allowThermalPowerStateChange = $false
+    # Default remains read-only. SetConfig testing requires explicit -EnableSetConfigTest.
+    # If the original EventType is SHUTDOWN/POWEROFF, replace it with NONE and
+    # verify that safe state before proceeding; never restore a power-action config.
+    $allowThermalSetConfig = [bool]$EnableSetConfigTest
     $config = Read-JsonFileAsHashtable -path $ConfigPath
     $iniResolved = Resolve-SectionIniPath -Config $config -IniPath $IniPath -IniDir $IniDir
     $source = Get-ConfigValue -Config $config -Name 'source_ini'
@@ -62,9 +62,9 @@ try {
     $report.source_ini = [ordered]@{ configured_path=$IniPath; resolved_path=$iniResolved; section=$sourceSection }
     $report.metrics.requested_item_ids = $capItems
     $report.metrics.safety = [ordered]@{
-        set_config_enabled = $allowThermalPowerStateChange
+        set_config_test_enabled = $allowThermalSetConfig
         event_trigger_enabled = $false
-        disabled_reason = 'SetConfig/shutdown/poweroff thermal tests are disabled by safety policy'
+        policy = 'SetConfig test writes EventType=NONE first; SHUTDOWN/POWEROFF originals are not restored'
     }
     $report.validation_layers.L1_configuration = 'PASS'
 
@@ -104,16 +104,64 @@ try {
         $eventType = [UInt32]$thermalConfig.EventType
         $sendTemp = [UInt32]$thermalConfig.SendEventTemperature
         $clearTemp = [UInt32]$thermalConfig.ClearEventTemperature
+        $setTest = [ordered]@{ attempted=$false; set_status=$null; safe_readback_status=$null; safe_readback_verified=$false; restore_attempted=$false; restore_status=$null; restore_verified=$null; original_power_action=($eventType -eq 0 -or $eventType -eq 2); final_state='UNCHANGED' }
+
+        if ($allowThermalSetConfig -and $configStatus -eq 0) {
+            $setTest.attempted = $true
+            $safeConfig = New-Object SusiThermalProtect
+            $safeConfig.SourceId = [UInt32]0
+            $safeConfig.EventType = [UInt32]0xFF
+            $safeConfig.SendEventTemperature = [UInt32]0
+            $safeConfig.ClearEventTemperature = [UInt32]0
+            $setStatus = [NativeSusi]::SusiThermalProtectionSetConfig($thermalId, [ref]$safeConfig)
+            $setTest.set_status = ('0x{0:X8}' -f [UInt32]$setStatus)
+            Add-ApiCall -report $report -name ("ThermalSetConfigSafe:{0}" -f $ch) -status $setStatus
+
+            if ($setStatus -eq 0) {
+                $safeRead = New-Object SusiThermalProtect
+                $safeReadStatus = [NativeSusi]::SusiThermalProtectionGetConfig($thermalId, [ref]$safeRead)
+                $setTest.safe_readback_status = ('0x{0:X8}' -f [UInt32]$safeReadStatus)
+                $setTest.safe_readback_verified = ($safeReadStatus -eq 0 -and [UInt32]$safeRead.EventType -eq 0xFF -and [UInt32]$safeRead.SourceId -eq 0)
+                Add-ApiCall -report $report -name ("ThermalVerifySafeConfig:{0}" -f $ch) -status $safeReadStatus -value ([ordered]@{ source_id=('0x{0:X8}' -f [UInt32]$safeRead.SourceId); event_type=('0x{0:X8}' -f [UInt32]$safeRead.EventType) })
+
+                if ($setTest.safe_readback_verified) {
+                    if ($setTest.original_power_action) {
+                        $setTest.final_state = 'LEFT_SAFE_NOT_RESTORED_POWER_ACTION_ORIGINAL'
+                    } else {
+                        $original = New-Object SusiThermalProtect
+                        $original.SourceId = $sourceId
+                        $original.EventType = $eventType
+                        $original.SendEventTemperature = $sendTemp
+                        $original.ClearEventTemperature = $clearTemp
+                        $setTest.restore_attempted = $true
+                        $restoreStatus = [NativeSusi]::SusiThermalProtectionSetConfig($thermalId, [ref]$original)
+                        $setTest.restore_status = ('0x{0:X8}' -f [UInt32]$restoreStatus)
+                        Add-ApiCall -report $report -name ("ThermalRestoreOriginal:{0}" -f $ch) -status $restoreStatus
+                        if ($restoreStatus -eq 0) {
+                            $restoreRead = New-Object SusiThermalProtect
+                            $restoreReadStatus = [NativeSusi]::SusiThermalProtectionGetConfig($thermalId, [ref]$restoreRead)
+                            $restoreVerified = ($restoreReadStatus -eq 0 -and [UInt32]$restoreRead.SourceId -eq $sourceId -and [UInt32]$restoreRead.EventType -eq $eventType -and [UInt32]$restoreRead.SendEventTemperature -eq $sendTemp -and [UInt32]$restoreRead.ClearEventTemperature -eq $clearTemp)
+                            $setTest.restore_verified = $restoreVerified
+                            $setTest.final_state = if ($restoreVerified) { 'ORIGINAL_RESTORED' } else { 'RESTORE_UNVERIFIED' }
+                            Add-ApiCall -report $report -name ("ThermalVerifyRestore:{0}" -f $ch) -status $restoreReadStatus
+                        } else { $setTest.final_state = 'SAFE_CONFIG_SET_RESTORE_FAILED' }
+                    }
+                } else { $setTest.final_state = 'SAFE_CONFIG_READBACK_FAILED' }
+            } else { $setTest.final_state = 'SAFE_CONFIG_SET_FAILED' }
+        }
+
         $sourceConfigured = ($sourceId -ge 0x00020000 -and $sourceId -lt 0x0002000C)
         $disabledConfig = ($eventType -eq 0xFF -and $sourceId -eq 0)
         $sourceValid = ($sourceConfigured -or $disabledConfig)
         $eventValid = ($eventType -eq 0 -or $eventType -eq 1 -or $eventType -eq 2 -or $eventType -eq 0xFF)
         $configValid = ($configStatus -eq 0 -and $sourceValid -and $eventValid)
-        if (-not $configValid) { $configFailures += $ch }
+        $setConfigTestValid = (-not $allowThermalSetConfig) -or ($setTest.attempted -and $setTest.safe_readback_verified -and ($setTest.original_power_action -or $setTest.restore_verified))
+        if (-not $configValid -or -not $setConfigTestValid) { $configFailures += $ch }
         $channelMetrics[$ch] = [ordered]@{
             tuple = $tuple
             thermal_api_id = ('0x{0:X8}' -f [UInt32]$thermalId)
             caps = $caps
+            set_config_test = $setTest
             get_config = [ordered]@{
                 status = ('0x{0:X8}' -f [UInt32]$configStatus)
                 status_name = Get-StatusName $configStatus
@@ -146,12 +194,12 @@ try {
         $report.validation_layers.L3_api = 'PASS'
         $report.validation_layers.L4_readback = 'FAIL'
     } else {
-        # [RUNNER SKELETON] 5) safe verdict mapping; no SetConfig and no event trigger
+        # [RUNNER SKELETON] 5) verdict mapping; event trigger APIs are never called
         $report.validation_layers.L2_capability = 'PASS'
         $report.validation_layers.L3_api = 'PASS'
         $report.validation_layers.L4_readback = 'PASS'
         $report.result = 'CONDITIONAL'
-        $report.reason = 'ThermalProtect GetCaps/GetConfig passed; no SetConfig or thermal event trigger was executed.'
+        $report.reason = if ($allowThermalSetConfig) { 'ThermalProtect GetCaps/GetConfig and explicitly enabled safe SetConfig round-trip completed; shutdown/poweroff originals remain replaced with NONE.' } else { 'ThermalProtect GetCaps/GetConfig passed; SetConfig test was not enabled.' }
     }
     $report.checks.read_stability = 'NOT_APPLICABLE'
     $report.checks.control_effect = 'NOT_RUN'

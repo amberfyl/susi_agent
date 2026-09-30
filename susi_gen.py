@@ -2321,6 +2321,13 @@ def _build_i2c_query_result(db_path: Path, product_name: str, chip_name: str,
         oem_buses.append({"name": bus_name, "id": bus_id})
     oem_buses.sort(key=lambda bus: bus["id"])
 
+    probe_bus_names = {str(bus.get("name") or "").strip().upper() for bus in probe_buses}
+    probe_bus_ids = {
+        bus.get("probe_id")
+        for bus in probe_buses
+        if isinstance(bus.get("probe_id"), int) and not isinstance(bus.get("probe_id"), bool)
+    }
+
     rows: list[dict] = []
     skipped_oem_ids: list[int] = []
     for db_row in result.get("rows") or []:
@@ -2336,6 +2343,21 @@ def _build_i2c_query_result(db_path: Path, product_name: str, chip_name: str,
             if slot < 1 or slot > 5:
                 skipped_oem_ids.append(bus_id)
                 continue
+
+            # config_new.db is the maximum topology. When the full probe has
+            # enumerated supported buses, intersect the DB rows with that
+            # probe result so unsupported OEM channels are not emitted.
+            if probe_buses:
+                db_report_name = str(db_row.get("report_name") or "").strip().upper()
+                is_supported = (
+                    db_report_name in probe_bus_names
+                    if db_report_name
+                    else bus_id in probe_bus_ids
+                )
+                if not is_supported:
+                    skipped_oem_ids.append(bus_id)
+                    continue
+
             row = dict(db_row)
             # INI keys are slots; the tuple keeps the encoded SUSI bus ID.
             # Reusing Channel1 for every DB row creates invalid duplicate keys.

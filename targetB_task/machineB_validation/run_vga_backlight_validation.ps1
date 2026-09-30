@@ -81,6 +81,7 @@ try {
         Add-ApiCall -report $report -name ("VgaGetBacklightEnable:{0}:initial" -f $ch) -status $initial.status -value $initial.value
         $entry = [ordered]@{
             backlight_api_id=('0x{0:X8}' -f $id)
+            api_result=if ($initial.status -eq 0) { 'PASS' } else { 'FAIL' }
             initial=$initial
             functional=[ordered]@{ attempted=$false; result='NOT_RUN' }
         }
@@ -119,6 +120,26 @@ try {
         $report.metrics.channels[$ch] = $entry
     }
 
+    $passedChannels = @($required | Where-Object { $apiFailures -notcontains $_ })
+    $failedChannelDetails = @(
+        foreach ($failedChannel in $apiFailures) {
+            $failedEntry = $report.metrics.channels[[string]$failedChannel]
+            [ordered]@{
+                channel = [string]$failedChannel
+                status = [string]$failedEntry.initial.status_name
+                status_code = ('0x{0:X8}' -f [UInt32]$failedEntry.initial.status)
+            }
+        }
+    )
+    $report.channel_summary = [ordered]@{
+        overall = if ($apiFailures.Count -eq 0) { 'PASS' } elseif ($passedChannels.Count -gt 0) { 'PARTIAL_FAIL' } else { 'FAIL' }
+        total = $required.Count
+        passed = $passedChannels.Count
+        failed = $apiFailures.Count
+        passed_channels = @($passedChannels)
+        failed_channels = @($failedChannelDetails)
+    }
+
     $report.validation_layers.L2_capability = if ($apiFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
     $report.validation_layers.L3_api = if ($apiFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
     $report.validation_layers.L4_readback = if ($apiFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
@@ -132,7 +153,12 @@ try {
         $report.validation_layers.L5_functional = if ($apiFailures.Count -gt 0) { 'N_A' } elseif ($functionalFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
         $report.validation_layers.L6_recovery = if ($apiFailures.Count -gt 0) { 'N_A' } elseif ($recoveryFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
     }
-    if ($apiFailures.Count -gt 0) { $report.result='FAIL_API'; $report.reason='VGA Backlight GetEnable failed.' }
+    if ($apiFailures.Count -gt 0) {
+        $passedDescription = if ($passedChannels.Count -gt 0) { $passedChannels -join ',' } else { 'none' }
+        $failedDescription = @($failedChannelDetails | ForEach-Object { "$($_.channel)=$($_.status_code)" }) -join ','
+        $report.result='FAIL_API'
+        $report.reason=("VGA Backlight partial channel result: {0}/{1} passed; passed=[{2}]; failed=[{3}]." -f $passedChannels.Count, $required.Count, $passedDescription, $failedDescription)
+    }
     elseif ($functionalFailures.Count -gt 0 -or $recoveryFailures.Count -gt 0) { $report.result='FAIL_FUNCTIONAL'; $report.reason='VGA Backlight toggle/restore failed.' }
     else { $report.result='PASS'; $report.reason='VGA Backlight API and validation passed.' }
     $report.checks.read_stability = if ($report.result -like 'FAIL*') { 'FAIL' } else { 'PASS' }

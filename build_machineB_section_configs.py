@@ -1709,8 +1709,176 @@ def build_wdt_config(
 
 
 def write_config(path: Path, config: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    """Atomically write one generated Machine-B section config."""
+
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path.write_text(
+            json.dumps(config, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary_path.replace(path)
+    except OSError as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise BuildError(f"cannot write config {path}: {exc}") from exc
+
+
+def _build_config_for_section(
+    *,
+    section_name: str,
+    model: str,
+    source_path: Path,
+    keys: list[str],
+    policy: dict[str, Any],
+    entry: dict[str, Any],
+    fan_entry: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if section_name == "HWM.Fan":
+        return build_fan_config(model, source_path, keys, policy)
+    if section_name == "HWM.Fan.Control":
+        return build_control_config(
+            model,
+            source_path,
+            keys,
+            policy,
+            entry,
+            fan_entry,
+            f"{model}_fan.json",
+        )
+    if section_name == "HWM.Temperature":
+        return build_temperature_config(model, source_path, keys, policy)
+    if section_name == "HWM.Voltage":
+        return build_voltage_config(model, source_path, keys, policy)
+    if section_name == "HWM.CaseOpen":
+        return build_caseopen_config(model, source_path, keys, policy)
+    if section_name == "HWM.Current":
+        return build_current_config(model, source_path, keys, policy)
+    if section_name == "ThermalProtect":
+        return build_thermalprotect_config(model, source_path, keys, policy)
+    if section_name == "StorageArea":
+        return build_storage_config(model, source_path, keys, policy)
+    if section_name == "GPIO":
+        return build_gpio_config(model, source_path, keys, policy)
+    if section_name == "I2C":
+        return build_i2c_config(model, source_path, keys, policy)
+    if section_name == "WDT":
+        return build_wdt_config(model, source_path, keys, policy)
+    if section_name == "VGA.Backlight":
+        return build_backlight_config(model, source_path, keys, policy)
+    if section_name == "VGA.Brightness":
+        return build_brightness_config(model, source_path, keys, policy)
+    return build_smbus_config(model, source_path, keys, policy)
+
+
+def build_section_configs(
+    *,
+    matrix_path: str | Path,
+    output_dir: str | Path | None = None,
+    policy_path: str | Path | None = None,
+    model: str | None = None,
+    prune_stale: bool = False,
+) -> dict[str, Any]:
+    """Build all GENERATED section configs through a callable Python API.
+
+    Config objects are fully constructed before any output is changed. This
+    prevents a source/configuration failure from leaving a partially refreshed
+    config set for the orchestrator to consume.
+    """
+
+    resolved_matrix = Path(matrix_path).expanduser().resolve()
+    if not resolved_matrix.is_file():
+        raise BuildError(f"missing matrix: {resolved_matrix}")
+
+    matrix = read_json(resolved_matrix)
+    resolved_model = str(
+        model
+        or matrix.get("project")
+        or resolved_matrix.stem.replace("-section-matrix", "")
+    )
+    resolved_output_dir = Path(output_dir or resolved_matrix.parent).expanduser().resolve()
+    policy = (
+        read_json(Path(policy_path).expanduser().resolve()) if policy_path else {}
+    )
+    entries: dict[str, dict[str, Any] | None] = {
+        name: matrix_section(matrix, name) for name in SECTION_OUTPUTS
+    }
+    fan_entry = entries["HWM.Fan"]
+    pending_configs: list[tuple[str, Path, dict[str, Any]]] = []
+    skipped_sections: list[str] = []
+    stale_paths: list[Path] = []
+    errors: list[str] = []
+
+    for section_name, template in SECTION_OUTPUTS.items():
+        entry = entries[section_name]
+        output_path = resolved_output_dir / template.format(model=resolved_model)
+        generated = bool(
+            entry and str(entry.get("status", "")).upper() == "GENERATED"
+        )
+        raw_path = entry.get("path") if entry else None
+
+        if not generated or not raw_path:
+            skipped_sections.append(section_name)
+            if prune_stale and output_path.exists():
+                stale_paths.append(output_path)
+            continue
+
+        source_path = resolve_source_path(resolved_matrix, str(raw_path)).resolve()
+        if not source_path.is_file():
+            errors.append(f"{section_name}: missing source INI {source_path}")
+            continue
+
+        try:
+            if section_name in ("HWM.Fan", "GPIO"):
+                minimum_fields = 6
+            elif section_name == "HWM.Fan.Control":
+                minimum_fields = 5
+            else:
+                minimum_fields = 4
+            keys = read_ini_section(source_path, section_name, minimum_fields)
+            config = _build_config_for_section(
+                section_name=section_name,
+                model=resolved_model,
+                source_path=source_path,
+                keys=keys,
+                policy=policy,
+                entry=entry or {},
+                fan_entry=fan_entry,
+            )
+            pending_configs.append((section_name, output_path, config))
+        except (BuildError, KeyError, TypeError, ValueError) as exc:
+            errors.append(f"{section_name}: {exc}")
+
+    if errors:
+        raise BuildError("; ".join(errors))
+
+    for section_name, output_path, config in pending_configs:
+        write_config(output_path, config)
+    removed_stale_configs: list[str] = []
+    for stale_path in stale_paths:
+        try:
+            stale_path.unlink()
+        except OSError as exc:
+            raise BuildError(f"cannot remove stale config {stale_path}: {exc}") from exc
+        removed_stale_configs.append(str(stale_path))
+
+    config_paths = {
+        section_name: str(output_path)
+        for section_name, output_path, _ in pending_configs
+    }
+    return {
+        "status": "PASS",
+        "model": resolved_model,
+        "matrix_path": str(resolved_matrix),
+        "output_dir": str(resolved_output_dir),
+        "generated_sections": list(config_paths),
+        "config_paths": config_paths,
+        "skipped_sections": skipped_sections,
+        "removed_stale_configs": removed_stale_configs,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -1741,100 +1909,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    matrix_path = args.matrix.resolve()
-    if not matrix_path.is_file():
-        print(f"ERROR: missing matrix: {matrix_path}", file=sys.stderr)
-        return 2
-
     try:
-        matrix = read_json(matrix_path)
-        model = str(args.model or matrix.get("project") or matrix_path.stem.replace("-section-matrix", ""))
-        output_dir = (args.output_dir or matrix_path.parent).resolve()
-        policy = read_json(args.policy.resolve()) if args.policy else {}
-        results: list[str] = []
-        errors: list[str] = []
-        entries: dict[str, dict[str, Any] | None] = {
-            name: matrix_section(matrix, name) for name in SECTION_OUTPUTS
-        }
-        fan_entry = entries["HWM.Fan"]
-        for section_name, template in SECTION_OUTPUTS.items():
-            entry = entries[section_name]
-            output_path = output_dir / template.format(model=model)
-            generated = bool(entry and str(entry.get("status", "")).upper() == "GENERATED")
-            raw_path = entry.get("path") if entry else None
-
-            if not generated or not raw_path:
-                results.append(f"SKIP {section_name}: section not generated")
-                if args.prune_stale and output_path.exists():
-                    output_path.unlink()
-                    results.append(f"REMOVE {output_path}")
-                continue
-
-            source_path = resolve_source_path(matrix_path, str(raw_path)).resolve()
-            if not source_path.is_file():
-                errors.append(f"{section_name}: missing source INI {source_path}")
-                continue
-
-            try:
-                if section_name in ("HWM.Fan", "GPIO"):
-                    minimum_fields = 6
-                elif section_name == "HWM.Fan.Control":
-                    minimum_fields = 5
-                else:
-                    minimum_fields = 4
-                keys = read_ini_section(source_path, section_name, minimum_fields)
-                if section_name == "HWM.Fan":
-                    config = build_fan_config(model, source_path, keys, policy)
-                elif section_name == "HWM.Fan.Control":
-                    config = build_control_config(
-                        model,
-                        source_path,
-                        keys,
-                        policy,
-                        entry or {},
-                        fan_entry,
-                        f"{model}_fan.json",
-                    )
-                elif section_name == "HWM.Temperature":
-                    config = build_temperature_config(model, source_path, keys, policy)
-                elif section_name == "HWM.Voltage":
-                    config = build_voltage_config(model, source_path, keys, policy)
-                elif section_name == "HWM.CaseOpen":
-                    config = build_caseopen_config(model, source_path, keys, policy)
-                elif section_name == "HWM.Current":
-                    config = build_current_config(model, source_path, keys, policy)
-                elif section_name == "ThermalProtect":
-                    config = build_thermalprotect_config(model, source_path, keys, policy)
-                elif section_name == "StorageArea":
-                    config = build_storage_config(model, source_path, keys, policy)
-                elif section_name == "GPIO":
-                    config = build_gpio_config(model, source_path, keys, policy)
-                elif section_name == "I2C":
-                    config = build_i2c_config(model, source_path, keys, policy)
-                elif section_name == "WDT":
-                    config = build_wdt_config(model, source_path, keys, policy)
-                elif section_name == "VGA.Backlight":
-                    config = build_backlight_config(model, source_path, keys, policy)
-                elif section_name == "VGA.Brightness":
-                    config = build_brightness_config(model, source_path, keys, policy)
-                else:
-                    config = build_smbus_config(model, source_path, keys, policy)
-                write_config(output_path, config)
-                results.append(f"WRITE {output_path}")
-            except (BuildError, KeyError, TypeError, ValueError) as exc:
-                errors.append(f"{section_name}: {exc}")
-
-        if errors:
-            for message in errors:
-                print(f"ERROR: {message}", file=sys.stderr)
-            return 2
-
-        for message in results:
-            print(message)
-        return 0
+        result = build_section_configs(
+            matrix_path=args.matrix,
+            output_dir=args.output_dir,
+            policy_path=args.policy,
+            model=args.model,
+            prune_stale=args.prune_stale,
+        )
     except BuildError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+
+    for section_name, output_path in result["config_paths"].items():
+        print(f"WRITE {output_path}")
+    for section_name in result["skipped_sections"]:
+        print(f"SKIP {section_name}: section not generated")
+    for stale_path in result["removed_stale_configs"]:
+        print(f"REMOVE {stale_path}")
+    return 0
 
 
 if __name__ == "__main__":

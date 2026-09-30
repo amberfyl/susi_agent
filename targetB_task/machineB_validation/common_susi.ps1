@@ -130,6 +130,9 @@ public static class NativeSusi
     public static extern UInt32 SusiThermalProtectionGetConfig(UInt32 Id, out SusiThermalProtect pConfig);
 
     [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiThermalProtectionSetConfig(UInt32 Id, ref SusiThermalProtect pConfig);
+
+    [DllImport("Susi4.dll")]
     public static extern UInt32 SusiStorageGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
 
     [DllImport("Susi4.dll")]
