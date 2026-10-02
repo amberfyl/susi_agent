@@ -49,7 +49,7 @@
   3. 與 BIOS 截圖值做時間接近對照（容差）
   4. CPU load 前後趨勢檢查（方向性）
 - 主要證據：time series、BIOS 對照表、容差結果
-- Non-EC/SIO fallback：若同一輪 `HWM_TEMP_*` 全為 `[ERR]`（0 OK），進入 `(io_port, option)` 候選組合迭代重測：每輪改參數→部署/重載→重抓 probe；任一輪出現非全 ERR 即命中並保留該組。若候選全數失敗，標記 `PENDING_TEMP_IO_OPTION_CANDIDATES_EXHAUSTED`。
+- 完整驗證後 route fallback：只有 section 應存在、runner 正常完成、所有 channel API 都失敗時才可觸發；`PARTIAL_FAIL`、fixture、capability-only、reload/SSH/report infrastructure 問題一律排除。v1 只輪替白名單 `IOPort/Address`，Option 保持原值；任一 channel API 成功即停止，全部失敗恢復 baseline，證據需保留每輪 INI hash/reload/report/status code。
 
 ## 5) [HWM.Voltage]
 ### Skill 說明（可直接自動化）
@@ -100,6 +100,7 @@
   2. 設定 0/25/50/75/100 並讀回
   3. restore 原值
 - 主要證據：set/get 一致性、range 合法性
+- 產物前置：驗證通道數必須使用 `VGA.Brightness Channels` probe filter 後的 INI/JSON；不得再驗 DB maximum-set 中已被剔除的多餘通道。
 - 限制：若無 lux/camera/PWM fixture，L5 只能算 API-level PASS
 
 ## 10) [VGA.Backlight]
@@ -111,6 +112,7 @@
   3. set on→read back
   4. restore
 - 主要證據：state transition、restore_result
+- 產物前置：驗證通道數必須使用 `VGA.Backlight Channels` probe filter 後的 INI/JSON；不得再驗 DB maximum-set 中已被剔除的多餘通道。
 - 限制：無外部量測時，難證明「物理背光真的變化」
 
 ## 11) [HWM.CaseOpen]

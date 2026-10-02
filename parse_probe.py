@@ -15,8 +15,11 @@ Role in pipeline:
                  channels to emit. HWID / channel code still come from chip_db;
                  labels still come from the PDF. (decided 2026-06-29)
 
-Probe does NOT cover Storage / ThermalProtect / VGA / WDT / GPIO / SmartFan;
-those classes come from the PDF + chip_db, not from the probe.
+Probe also covers I2C/GPIO and VGA channel discovery. For VGA.Brightness and
+VGA.Backlight, DB rows remain the maximum topology while primary `[OK] ...
+Status=FOUND` rows in the corresponding probe channel block determine how many
+rows are retained. Storage / ThermalProtect / WDT / SmartFan still come from
+the PDF + config DB, not from the probe.
 
 susiID class encoding (high 16 bits), confirmed from a real report:
   0x0000 = board string info     0x0001 = board numeric / version
@@ -94,6 +97,15 @@ _GPIO_PIN_LINE = re.compile(
     r"^GPIO_B(?P<bank>\d+)P(?P<pin>\d+)_GPIO(?P<gpio>\d+)_(?:Direction|Level)$",
     re.IGNORECASE,
 )
+_VGA_SECTION_HEADER = re.compile(
+    r"^=+\s*VGA\.(?P<kind>Brightness|Backlight)\s+Channels\s*=+$",
+    re.IGNORECASE,
+)
+_VGA_FOUND_LINE = re.compile(
+    r"^\[OK\]\s+(?P<kind>Brightness|Backlight)(?P<index>\d+)"
+    r"(?:_\S+)?(?:\s+.*?)?\s+Id=(?P<id>0x[0-9A-Fa-f]+)\s+Status=FOUND\s*$",
+    re.IGNORECASE,
+)
 
 
 def _strip_value(raw: str) -> str:
@@ -137,6 +149,10 @@ def parse_probe_report(path: Path) -> dict:
         "ec_fw": str,              # EC firmware version string ("" when absent)
         "features": {"smbus": bool, "i2c": bool},
         "i2c_buses": [{"name": str, "id": int, "probe_id": int}],  # supported buses from full probe
+        "vga": {
+            "brightness": {"present": bool, "channel_ids": [int], "count": int},
+            "backlight": {"present": bool, "channel_ids": [int], "count": int},
+        },
         "hwm": {                       # per sub-class: ordered, de-duped ini_keys
             "voltages": [...], "temperatures": [...], "fans": [...],
             "current": [...], "caseopen": [...],
@@ -155,10 +171,28 @@ def parse_probe_report(path: Path) -> dict:
     gpio_supported_by_bank: dict[int, int] = {}
     gpio_keys: list[str] = []
     gpio_key_seen: set[str] = set()
+    vga = {
+        "brightness": {"present": False, "channel_ids": []},
+        "backlight": {"present": False, "channel_ids": []},
+    }
+    seen_vga_ids = {"brightness": set(), "backlight": set()}
 
     with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
-            bus_match = _I2C_BUS_LINE.match(line.strip())
+            stripped = line.strip()
+            vga_header = _VGA_SECTION_HEADER.match(stripped)
+            if vga_header:
+                vga[vga_header.group("kind").lower()]["present"] = True
+
+            vga_found = _VGA_FOUND_LINE.match(stripped)
+            if vga_found:
+                kind = vga_found.group("kind").lower()
+                channel_id = int(vga_found.group("id"), 16)
+                if channel_id not in seen_vga_ids[kind]:
+                    seen_vga_ids[kind].add(channel_id)
+                    vga[kind]["channel_ids"].append(channel_id)
+
+            bus_match = _I2C_BUS_LINE.match(stripped)
             if bus_match:
                 raw_id = bus_match.group("id")
                 probe_id = int(raw_id, 16) if raw_id.lower().startswith("0x") else int(raw_id)
@@ -249,6 +283,9 @@ def parse_probe_report(path: Path) -> dict:
         gpio_count_from_mask += int(mask).bit_count()
     gpio_count = len(gpio_keys) if gpio_keys else (gpio_count_from_mask if gpio_count_from_mask > 0 else 0)
 
+    for channel_spec in vga.values():
+        channel_spec["count"] = len(channel_spec["channel_ids"])
+
     return {
         "board_name": board_name,
         "platform_version": platform_version,
@@ -257,6 +294,7 @@ def parse_probe_report(path: Path) -> dict:
         "ec_fw": ec_fw,
         "features": {"smbus": smbus, "i2c": i2c},
         "i2c_buses": i2c_buses,
+        "vga": vga,
         "gpio": {
             "count": gpio_count,
             "keys": gpio_keys,

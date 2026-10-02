@@ -1,0 +1,103 @@
+{
+  "schema_version": "machineb.fallback_candidate_registry.v1",
+  "policy": {
+    "trigger": "EXPECTED_SECTION_ALL_CHANNEL_API_FAILED",
+    "success": "ANY_CHANNEL_API_SUCCEEDED",
+    "route_fallback_enabled": true,
+    "option_fallback_enabled": false
+  },
+  "sections": {
+    "SMBus": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "0x2E", "0x4E"],
+      "option_candidates": ["0xA0000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "I2C": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "0x2E", "0x4E"],
+      "option_candidates": ["0x20000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "VGA.Backlight": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0"],
+      "option_candidates": ["0xA0000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "VGA.Brightness": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "0x2E", "0x4E"],
+      "option_candidates": ["0x00000000", "0x20000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "HWM.Voltage": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "0x2E", "0x4E"],
+      "option_candidates": ["0x80000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "HWM.Current": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0"],
+      "option_candidates": ["0xA0000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "HWM.Temperature": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "0x2E", "0x4E"],
+      "option_candidates": ["0x80000001"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "HWM.Fan": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "0x2E", "0x4E"],
+      "option_candidates": ["0x80000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "HWM.CaseOpen": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0x2E", "0x4E", "0x9E"],
+      "option_candidates": ["0xA0000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "WDT": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "0x2E", "0x4E"],
+      "option_candidates": ["0xA0000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "GPIO": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0", "1", "0x2E", "0x4E", "0x40", "0x42", "0x44", "0x46", "0x48", "0x4A", "0x4C"],
+      "option_candidates": ["0x20000003", "0xA0000003"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false,
+      "notes": ["0x00 is numerically identical to 0 and is normalized to 0"]
+    },
+    "StorageArea": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0"],
+      "option_candidates": ["0xA0000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    },
+    "ThermalProtect": {
+      "route_field": "IOPort/Address",
+      "route_candidates": ["0"],
+      "option_candidates": ["0xA0000000"],
+      "route_fallback_enabled": true,
+      "option_fallback_enabled": false
+    }
+  }
+}

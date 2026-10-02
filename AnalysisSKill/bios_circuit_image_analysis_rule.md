@@ -456,13 +456,15 @@
 - 若候選 chip 使用其他 net 命名，或命名提示未命中，仍可搜尋 `GPIO`、`EC_GPIO`、`SIO_GPIO`、`EC_GP`、`GP*`、connector net 與 chip function label 作為候選定位；搜尋結果不能未經 scope 確認就加入 `target_signal_set`。
 
 ### 必做追線流程
-1. 先完成分析範圍 Gate，再掃描 `target_signal_set`；通用 GPIO/GP 搜尋只作候選定位或確認替代命名，不得把未符合目標 pattern 的 signal 加入清單。
-2. 對清單中的每一條 signal，從 signal label 或 BI/BO/IN/OUT 箭頭的實際 wire endpoint 開始。
-3. 沿 wire 逐段追蹤；遇到轉折時依 wire 的新方向繼續，不以文字所在的水平列代替連線。
-4. 遇到 junction 才視為分支；單純交叉但沒有 junction 的線不可視為相連。
-5. 追到 chip pin 後，記錄 pin number，再讀取該 pin 對應的完整 function label。
-6. 只對 `target_signal_set` 輸出一對一 mapping 表：`signal -> chip pin -> GPIO function label`；每一條目標 signal 都必須有結果或 ambiguity 標記，`OUT_OF_SCOPE` signal 不得出現在表內。
-7. 若 signal label 與 pin label 不在同一水平線，必須優先採用摺線後的實際 endpoint，並標記 `MAPPED_BY_WIRE_TRACE`。
+1. 先完成分析範圍 Gate，建立並列出完整 `target_signal_set`。
+2. 若來源為電路圖 PDF，先用目標 signal pattern/關鍵字定位命中頁面與區域，再對每個命中區域做足以清楚辨識 wire、junction、pin number、function label 的高解析裁切；禁止直接以低解析整頁圖進行最終 mapping。
+3. 高解析裁切與頁碼/關鍵字索引必須保存在專案目錄供覆核，不可只放 `/tmp`；整頁 render 只能作定位，不能取代 focused crop。
+4. 對 `target_signal_set` 中的每一條 signal，從 signal label 或 BI/BO/IN/OUT 箭頭的實際 wire endpoint 開始。
+5. 沿 wire 逐段追蹤；遇到轉折時依 wire 的新方向繼續，不以文字所在的水平列代替連線。
+6. 遇到 junction 才視為分支；單純交叉但沒有 junction 的線不可視為相連。
+7. 追到 chip pin 後，記錄 pin number，再讀取該 pin 對應的完整 function label。
+8. 只對 `target_signal_set` 輸出一對一 mapping 表：`signal -> chip pin -> GPIO function label`；每一條目標 signal 都必須有結果或 ambiguity 標記，`OUT_OF_SCOPE` signal 不得出現在表內。
+9. 若 signal label 與 pin label 不在同一水平線，必須優先採用摺線後的實際 endpoint，並標記 `MAPPED_BY_WIRE_TRACE`。
 
 ### 證據與錯誤防護
 - 只依連續 electrical wire、junction、net label 與 pin endpoint 判定；顏色、文字距離、上下排列與 OCR 座標不能單獨作為連線證據。

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from extract_pdf import extract_pdf_to_json, resolve_paths as resolve_extract_paths
 from generate_ini import resolve_paths as resolve_generate_paths
+from machineb_fallback import apply_project_route_overrides
 from parse_probe import parse_probe_report
 from query_config_db import (
     query_section,
@@ -67,6 +68,108 @@ def _load_spec_json(in_json_path: Path) -> dict | None:
         return None
     with open(spec_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _explicit_spec_section_state(section: str, spec: dict | None) -> bool | None:
+    """Return the user's explicit section intent; None means unknown/unprovided."""
+    if not isinstance(spec, dict):
+        return None
+    keys = {
+        "HWM.Current": ("currents", "current"),
+        "HWM.CaseOpen": ("caseopen", "case_open", "chassis_intrusion"),
+    }.get(section)
+    if not keys:
+        return None
+
+    def state_of(value: object) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, list):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "enabled", "enable", "yes", "found", "supported"}:
+                return True
+            if normalized in {"false", "disabled", "disable", "no", "not_found", "unsupported"}:
+                return False
+            return None
+        if isinstance(value, dict):
+            for field in ("enabled", "status"):
+                if field in value:
+                    state = state_of(value[field])
+                    if state is not None:
+                        return state
+            if "items" in value and isinstance(value["items"], list):
+                return bool(value["items"])
+        return None
+
+    for key in keys:
+        if key in spec:
+            return state_of(spec[key])
+    features = spec.get("features")
+    if isinstance(features, dict):
+        for key in keys:
+            if key in features:
+                return state_of(features[key])
+    details = spec.get("feature_details")
+    if isinstance(details, dict):
+        for key in keys:
+            if key in details:
+                return state_of(details[key])
+    return None
+
+
+def _bios_has_section_evidence(section: str, bios_cache_path: Path | None) -> bool:
+    if not bios_cache_path or not bios_cache_path.is_file():
+        return False
+    try:
+        cache = json.loads(bios_cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    items = cache.get("items") if isinstance(cache, dict) else None
+    if not isinstance(items, list):
+        return False
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if section == "HWM.Current" and any(
+            isinstance(item.get(field), list) and bool(item[field])
+            for field in ("current_label_hints", "current_value_hints")
+        ):
+            return True
+        if section == "HWM.CaseOpen" and isinstance(item.get("caseopen_hints"), list) and item["caseopen_hints"]:
+            return True
+        text = str(item.get("analysis_text") or "")
+        if section == "HWM.Current" and re.search(
+            r"(?i)\b(?:system\s+current|current\s+sensor|amperage)\b|\b\d+(?:\.\d+)?\s*m?a\b",
+            text,
+        ):
+            return True
+        if section == "HWM.CaseOpen" and re.search(
+            r"(?i)\b(?:case\s*open|chassis\s+intrusion)\b",
+            text,
+        ):
+            return True
+    return False
+
+
+def evaluate_section_applicability(
+    section: str,
+    spec: dict | None,
+    bios_cache_path: Path | None,
+) -> dict[str, object]:
+    """Decide whether a section may be queried/generated before consulting DB tuples."""
+    if section not in {"HWM.Current", "HWM.CaseOpen"}:
+        return {"applicable": True, "reason_code": "SECTION_NOT_GATED"}
+    spec_state = _explicit_spec_section_state(section, spec)
+    if spec_state is False:
+        return {"applicable": False, "reason_code": "SPEC_EXPLICITLY_DISABLED"}
+    if spec_state is True:
+        return {"applicable": True, "reason_code": "SPEC_EXPLICITLY_ENABLED"}
+    if _bios_has_section_evidence(section, bios_cache_path):
+        return {"applicable": True, "reason_code": "BIOS_EVIDENCE_FOUND"}
+    return {"applicable": False, "reason_code": "BIOS_EVIDENCE_NOT_FOUND"}
 
 
 def _infer_chip_name(spec: dict | None) -> str | None:
@@ -141,74 +244,6 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
-
-
-def _run_temperature_option_fallback_helper(
-    ini_paths: list[Path],
-    probe_path: Path,
-    section: str = "HWM.Temperature",
-    candidates: list[str] | None = None,
-    runner_cmd: str | None = None,
-) -> dict:
-    helper_path = Path(__file__).resolve().parent / "tools" / "hwm_temperature_option_fallback.py"
-    payload: dict = {
-        "helper": str(helper_path),
-        "ini_paths": [str(p) for p in ini_paths],
-        "probe_path": str(probe_path),
-        "decision": "SKIPPED",
-    }
-    if not helper_path.exists():
-        payload["decision"] = "HELPER_MISSING"
-        return payload
-    if not probe_path.exists():
-        payload["decision"] = "PROBE_MISSING"
-        return payload
-
-    missing = [str(p) for p in ini_paths if not p.exists()]
-    if missing:
-        payload["decision"] = "INI_MISSING"
-        payload["missing_ini_paths"] = missing
-        return payload
-
-    cmd = [
-        sys.executable,
-        str(helper_path),
-        "--probe",
-        str(probe_path),
-        "--section",
-        section,
-    ]
-    for p in ini_paths:
-        cmd.extend(["--ini", str(p)])
-    for c in (candidates or []):
-        if str(c).strip():
-            cmd.extend(["--candidate", str(c).strip()])
-    if runner_cmd and runner_cmd.strip():
-        cmd.extend(["--runner-cmd", runner_cmd.strip()])
-
-    cp = subprocess.run(cmd, capture_output=True, text=True)
-    if cp.returncode != 0:
-        payload.update({
-            "decision": "HELPER_ERROR",
-            "exit_code": cp.returncode,
-            "stderr": (cp.stderr or "").strip(),
-        })
-        return payload
-
-    try:
-        data = json.loads((cp.stdout or "").strip() or "{}")
-        if isinstance(data, dict):
-            payload.update(data)
-            payload["decision"] = str(data.get("decision") or "NO_CHANGE")
-            return payload
-    except Exception:
-        pass
-
-    payload.update({
-        "decision": "HELPER_OUTPUT_PARSE_ERROR",
-        "stdout": (cp.stdout or "").strip(),
-    })
-    return payload
 
 
 def _extract_voltage_label_hints(text: str) -> list[str]:
@@ -2049,6 +2084,55 @@ def _resolve_chip_name_for_section(base_chip_name: str, section: str) -> str:
     return base_chip_name
 
 
+def _resolve_gpio_trace_chip_name(base_chip_name: str) -> str:
+    """Resolve the physical chip identity that owns GPIO circuit evidence."""
+    return _resolve_chip_name_for_section(base_chip_name, "GPIO")
+
+
+def _filter_vga_rows_by_probe(result: dict, section: str, probe_spec: dict | None) -> tuple[dict, dict]:
+    """Trim DB maximum rows to the supported VGA channel count from full probe."""
+    kind_by_section = {
+        "VGA.Brightness": "brightness",
+        "VGA.Backlight": "backlight",
+    }
+    kind = kind_by_section.get(section)
+    meta = {
+        "filter_applied": False,
+        "probe_supported_count": None,
+        "db_row_count": len(result.get("rows") or []),
+        "trimmed_count": 0,
+    }
+    if kind is None or not isinstance(probe_spec, dict):
+        return result, meta
+
+    vga = probe_spec.get("vga")
+    channel_spec = vga.get(kind) if isinstance(vga, dict) else None
+    if not isinstance(channel_spec, dict) or channel_spec.get("present") is not True:
+        return result, meta
+
+    try:
+        supported_count = max(0, int(channel_spec.get("count", 0)))
+    except (TypeError, ValueError):
+        return result, meta
+
+    rows = list(result.get("rows") or [])
+    kept = rows[:supported_count]
+    filtered = dict(result)
+    filtered["rows"] = kept
+    filtered["row_count"] = len(kept)
+    if result.get("status") == "FOUND" and not kept:
+        filtered["status"] = "SECTION_EMPTY"
+
+    meta.update({
+        "filter_applied": True,
+        "probe_supported_count": supported_count,
+        "db_row_count": len(rows),
+        "trimmed_count": max(0, len(rows) - len(kept)),
+        "probe_channel_ids": list(channel_spec.get("channel_ids") or []),
+    })
+    return filtered, meta
+
+
 def _fan_template_by_chip(db_path: Path, chip_name: str) -> dict[str, str]:
     """Resolve HWM.Fan template values.
 
@@ -3302,7 +3386,7 @@ def _should_regen_gpio_trace(project_dir: Path, chip_name: str, gpio_trace_raw: 
 
     # Chip-aware scope sanity:
     # - SIO chips require SIO_GPIOn evidence.
-    # - NCT6694B route requires EC_P1_GPIOn evidence.
+    # - NCT6694B route requires EC_P*_GPIOn evidence across all visible EC ports.
     chip_u = (chip_name or "").upper()
     items = gpio_trace_raw.get("items")
     if chip_u.startswith(("NCT6126D", "NCT6116D", "NCT6106D", "NCT6776D")):
@@ -3319,15 +3403,20 @@ def _should_regen_gpio_trace(project_dir: Path, chip_name: str, gpio_trace_raw: 
     if chip_u.startswith("NCT6694B"):
         if not isinstance(items, list) or not items:
             return True
-        has_ec_p1 = any(
+        has_ec_port_gpio = any(
             isinstance(it, dict)
-            and re.match(r"^EC_P1_GPIO\d+$", str(it.get("signal") or ""), re.IGNORECASE)
+            and _is_nct6694b_gpio_signal(it.get("signal"))
             for it in items
         )
-        if not has_ec_p1:
+        if not has_ec_port_gpio:
             return True
 
     return False
+
+
+def _is_nct6694b_gpio_signal(signal: object) -> bool:
+    """Return true for the NCT6694B external GPIO target pattern EC_P*_GPIO*."""
+    return re.fullmatch(r"EC_P\d+_GPIO\d+", str(signal or "").strip(), re.IGNORECASE) is not None
 
 
 def _normalize_gpio_trace_result(raw: dict | None) -> dict | None:
@@ -3552,11 +3641,11 @@ def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
                     if re.search(r"\bGP\s*[0-9]\s*[0-9]\b", str(it.get("function_label") or "").strip(), re.IGNORECASE)
                 ]
 
-        # NCT6694B strict scope: only accept EC_P1_GPIOn traced signals.
+        # NCT6694B strict scope: accept all traced EC_P*_GPIOn signals.
         if chip_norm.startswith("NCT6694B"):
             confirmed = [
                 it for it in confirmed
-                if re.match(r"^EC_P1_GPIO\d+$", str(it.get("signal") or "").strip(), re.IGNORECASE)
+                if _is_nct6694b_gpio_signal(it.get("signal"))
             ]
 
         decision["gpio_trace_confirmed_count"] = len(confirmed)
@@ -4143,9 +4232,7 @@ def _apply_fan_control_topology(
 def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path,
                             db_path: Path, product_name: str, chip_name: str,
                             probe_spec: dict | None, probe_path: Path | None,
-                            sections: list[str],
-                            temperature_fallback_candidates: list[str] | None = None,
-                            temperature_fallback_runner_cmd: str | None = None) -> tuple[list[Path], Path, Path, Path, Path | None, Path | None]:
+                            sections: list[str]) -> tuple[list[Path], Path, Path, Path, Path | None, Path | None]:
     spec = _load_spec_json(in_json_path)
 
     proj_dir = out_ini_path.parent
@@ -4170,10 +4257,11 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
     fan_pairing = _normalize_fan_pairing_result(fan_pairing_raw)
 
     gpio_trace = None
-    if _chip_requires_circuit_evidence(chip_name):
+    gpio_trace_chip_name = _resolve_gpio_trace_chip_name(chip_name)
+    if _chip_requires_circuit_evidence(gpio_trace_chip_name):
         gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
-        if _should_regen_gpio_trace(proj_dir, chip_name, gpio_trace_raw):
-            _auto_generate_gpio_trace(proj_dir, name, chip_name=chip_name)
+        if _should_regen_gpio_trace(proj_dir, gpio_trace_chip_name, gpio_trace_raw):
+            _auto_generate_gpio_trace(proj_dir, name, chip_name=gpio_trace_chip_name)
             gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
         gpio_trace = _normalize_gpio_trace_result(gpio_trace_raw)
 
@@ -4184,6 +4272,24 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
         route = "EC" if is_ec is True else ("NON_EC" if is_ec is False else "UNKNOWN_EC")
         fan_meta: dict = {}
         section_chip_name = _resolve_chip_name_for_section(chip_name, sec)
+
+        applicability = evaluate_section_applicability(sec, spec, bios_cache_path)
+        if applicability.get("applicable") is False:
+            stale_section_path = proj_dir / f"{name}_{sec}.ini"
+            if stale_section_path.exists():
+                stale_section_path.unlink()
+            matrix.append({
+                "section": sec,
+                "status": "SKIPPED_NOT_APPLICABLE",
+                "query_status": "NOT_QUERIED",
+                "row_count": 0,
+                "path": None,
+                "query_key": None,
+                "route": f"{route}+SPEC_BIOS_APPLICABILITY",
+                "reason_code": applicability.get("reason_code"),
+                "reason": "Section disabled by explicit spec intent or absent from BIOS evidence",
+            })
+            continue
 
         if sec == "SMBus":
             result = _build_smbus_query_result(
@@ -4336,6 +4442,18 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 section=sec,
             )
 
+        if sec in {"VGA.Brightness", "VGA.Backlight"}:
+            result, vga_filter = _filter_vga_rows_by_probe(result, sec, probe_spec)
+            if vga_filter.get("filter_applied"):
+                route = f"{route}+PROBE_CHANNEL_FILTER"
+            fan_meta.update({
+                "vga_probe_filter_applied": vga_filter.get("filter_applied", False),
+                "vga_probe_supported_count": vga_filter.get("probe_supported_count"),
+                "vga_db_row_count": vga_filter.get("db_row_count"),
+                "vga_trimmed_count": vga_filter.get("trimmed_count", 0),
+                "vga_probe_channel_ids": vga_filter.get("probe_channel_ids", []),
+            })
+
         if sec == "HWM.Voltage" and is_ec is True and result.get("status") == "FOUND":
             result = _merge_voltage_alias_into_rows(result, voltage_alias_bridge_path)
 
@@ -4481,36 +4599,48 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
 
     out_ini_path.write_text("\n".join(pre_lines) + "\n", encoding="utf-8")
 
-    # Non-EC SuperIO temperature fallback hook (A-side orchestrated):
-    # if baseline probe HWM_TEMP_* are all ERR, prepare/iterate candidate
-    # (io_port, options) tuples through helper for both section INI and pre.ini.
-    # Optional runner command can deploy+probe each candidate and stop at first pass.
-    temperature_entry = next((m for m in matrix if m.get("section") == "HWM.Temperature"), None)
-    if (
-        isinstance(temperature_entry, dict)
-        and str(temperature_entry.get("status", "")).upper() == "GENERATED"
-        and is_ec is not True
-        and _is_superio_temperature_seed_chip(chip_name)
-        and probe_path is not None
-    ):
-        temperature_sec_path = Path(str(temperature_entry.get("path") or "")).resolve()
-        fb = _run_temperature_option_fallback_helper(
-            ini_paths=[temperature_sec_path, out_ini_path.resolve()],
-            probe_path=probe_path.resolve(),
-            section="HWM.Temperature",
-            candidates=temperature_fallback_candidates,
-            runner_cmd=temperature_fallback_runner_cmd,
-        )
-        temperature_entry["temperature_option_fallback"] = fb
-        fb_decision = str(fb.get("decision") or "")
-        if fb_decision in (
-            "CANDIDATE_PREPARED_NEEDS_VALIDATION",
-            "CANDIDATE_VALIDATED_PASS",
-            "ALL_CANDIDATES_FAILED",
-        ):
-            base_route = str(temperature_entry.get("route") or "")
-            if "TEMP_OPTION_FALLBACK" not in base_route:
-                temperature_entry["route"] = f"{base_route}+TEMP_OPTION_FALLBACK" if base_route else "TEMP_OPTION_FALLBACK"
+    # A validated project route override is applied only after DB/probe/BIOS
+    # generation has completed. Option fallback remains disabled. Applying the
+    # same override to full and split INIs keeps the section-config builder's
+    # downstream JSON projection consistent with the runtime INI.
+    override_path = proj_dir / f"{name}-config-overrides.json"
+    generated_section_paths = {
+        str(entry["section"]): Path(str(entry["path"]))
+        for entry in matrix
+        if str(entry.get("status", "")).upper() == "GENERATED"
+        and entry.get("path")
+    }
+    project_override = apply_project_route_overrides(
+        project=name,
+        override_path=override_path,
+        full_ini_path=out_ini_path,
+        section_paths=generated_section_paths,
+    )
+    applied_override_sections = project_override.get("sections")
+    if not isinstance(applied_override_sections, list):
+        applied_override_sections = []
+    override_details = project_override.get("details")
+    if not isinstance(override_details, dict):
+        override_details = {}
+    for section in applied_override_sections:
+        entry = next((item for item in matrix if item.get("section") == section), None)
+        section_details = override_details.get(section)
+        if not isinstance(section_details, dict):
+            section_details = {}
+        if isinstance(entry, dict):
+            entry["project_route_override"] = {
+                "status": "APPLIED",
+                "path": str(override_path),
+                "sha256": project_override.get("sha256"),
+                **section_details,
+            }
+            base_route = str(entry.get("route") or "")
+            if "PROJECT_ROUTE_OVERRIDE" not in base_route:
+                entry["route"] = (
+                    f"{base_route}+PROJECT_ROUTE_OVERRIDE"
+                    if base_route
+                    else "PROJECT_ROUTE_OVERRIDE"
+                )
 
     matrix_path = proj_dir / f"{name}-section-matrix.json"
     matrix_path.write_text(
@@ -4580,19 +4710,6 @@ def main():
     parser.add_argument(
         "--skip-understand", dest="skip_understand", action="store_true",
         help="In 'all' mode: skip understand stage (use form.json directly for generate)",
-    )
-    parser.add_argument(
-        "--temp-fallback-candidate",
-        action="append",
-        default=[],
-        help="Repeatable candidate tuple for HWM.Temperature fallback: 'io_port,options'",
-    )
-    parser.add_argument(
-        "--temp-fallback-runner-cmd",
-        help=(
-            "Optional command for each temperature fallback attempt; command should deploy/reload/probe "
-            "and refresh --probe report before pass/fail parsing."
-        ),
     )
     args = parser.parse_args()
 
@@ -4680,8 +4797,6 @@ def main():
             probe_spec=probe_spec,
             probe_path=probe_path,
             sections=sections_to_emit,
-            temperature_fallback_candidates=args.temp_fallback_candidate,
-            temperature_fallback_runner_cmd=args.temp_fallback_runner_cmd,
         )
 
         print(f"Generate done: {full_ini}")

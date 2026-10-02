@@ -17,7 +17,9 @@ reload.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -27,6 +29,14 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from build_machineB_section_configs import BuildError, build_section_configs
+from machineb_fallback import (
+    FallbackAttemptCandidate,
+    apply_project_route_overrides,
+    execute_fallback_plan,
+    load_and_validate_fallback_plan,
+    load_candidate_registry,
+    persist_project_route_overrides,
+)
 
 
 CONTRACT_SCHEMA_VERSION = "machineb.post_ini_contract.v1"
@@ -61,7 +71,7 @@ EXECUTION_MANIFEST_SCHEMA: dict[str, Any] = {
         "contract_schema_version": {"const": CONTRACT_SCHEMA_VERSION},
         "project": {"type": "string", "minLength": 1},
         "run_id": {"type": "string", "minLength": 1},
-        "mode": {"enum": ["dry-run", "execute"]},
+        "mode": {"enum": ["dry-run", "execute", "converge"]},
         "inputs": {"type": "object"},
         "target": {"type": "object"},
         "sections": {"type": "array"},
@@ -1216,12 +1226,17 @@ def execute_validation_sections(
     transport: Any,
     *,
     timeout_seconds: int = 180,
+    remote_report_dir: str | None = None,
+    local_report_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """P8/P9: execute manifest runners in order and collect one fresh JSON report each."""
 
-    report_dir = str(PureWindowsPath(contract.target.run_output) / "reports")
+    report_dir = remote_report_dir or str(
+        PureWindowsPath(contract.target.run_output) / "reports"
+    )
+    local_reports = local_report_dir or contract.outputs.reports_dir
     transport.ensure_directories([report_dir])
-    contract.outputs.reports_dir.mkdir(parents=True, exist_ok=True)
+    local_reports.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
     by_section: dict[str, dict[str, Any]] = {}
     fan_config_path: str | None = None
@@ -1324,7 +1339,7 @@ def execute_validation_sections(
             continue
 
         remote_report = fresh_reports[0]
-        local_report = contract.outputs.reports_dir / PureWindowsPath(remote_report).name
+        local_report = local_reports / PureWindowsPath(remote_report).name
         try:
             transport.download(remote_report, local_report)
             report = json.loads(local_report.read_text(encoding="utf-8-sig"))
@@ -1381,6 +1396,332 @@ def execute_validation_sections(
         by_section[section] = completed
 
     return results
+
+
+def run_fallback_attempt(
+    contract: PostIniContract,
+    manifest: Mapping[str, Any],
+    transport: Any,
+    candidate: FallbackAttemptCandidate,
+    *,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Deploy one candidate full INI and run exactly one safe-default section."""
+
+    matches = [
+        item
+        for item in manifest.get("sections", [])
+        if str(item.get("section")) == candidate.section
+    ]
+    if len(matches) != 1:
+        raise RuntimePhaseError(
+            "FALLBACK_PLAN",
+            f"expected exactly one manifest entry for {candidate.section}, got {len(matches)}",
+        )
+    section_plan = dict(matches[0])
+    dependencies = [str(item) for item in section_plan.get("section_dependencies", [])]
+    if dependencies:
+        raise RuntimePhaseError(
+            "FALLBACK_PLAN",
+            f"dependent section is not eligible for isolated fallback: {candidate.section}",
+            details={"dependencies": dependencies},
+        )
+
+    safe_section = re.sub(r"[^a-z0-9]+", "_", candidate.section.lower()).strip("_")
+    attempt_name = f"attempt-{candidate.index:03d}"
+    local_root = contract.outputs.run_root / "fallback" / safe_section / attempt_name
+    local_reports = local_root / "reports"
+    local_ini = local_root / f"{contract.project}-candidate.ini"
+    remote_root = str(
+        PureWindowsPath(contract.target.run_output)
+        / "fallback"
+        / safe_section
+        / attempt_name
+    )
+    remote_reports = str(PureWindowsPath(remote_root) / "reports")
+    remote_ini = str(PureWindowsPath(remote_root) / local_ini.name)
+
+    local_root.mkdir(parents=True, exist_ok=True)
+    local_ini.write_text(candidate.ini_text, encoding="utf-8")
+    local_hash = hashlib.sha256(local_ini.read_bytes()).hexdigest()
+    if local_hash != candidate.ini_sha256:
+        raise RuntimePhaseError(
+            "FALLBACK_PLAN",
+            "candidate INI hash does not match candidate payload",
+            details={"expected": candidate.ini_sha256, "actual": local_hash},
+        )
+
+    deploy: dict[str, Any] = {
+        "status": "NOT_RUN",
+        "local_path": str(local_ini),
+        "remote_path": remote_ini,
+        "candidate_ini_sha256": candidate.ini_sha256,
+    }
+    reload_result: dict[str, Any] = {"status": "NOT_RUN"}
+    try:
+        transport.ensure_directories([remote_root, remote_reports])
+        transport.upload(local_ini, remote_ini)
+        remote_hash = str(transport.remote_sha256(remote_ini)).strip().lower()
+        if remote_hash != candidate.ini_sha256:
+            raise RuntimeError(
+                f"candidate upload hash mismatch: expected={candidate.ini_sha256}, actual={remote_hash}"
+            )
+        closed = int(transport.close_process("SusiDemo4"))
+        transport.copy_remote_file(remote_ini, contract.target.runtime_ini)
+        deploy.update(
+            {
+                "status": "PASS",
+                "remote_sha256": remote_hash,
+                "closed_susi_demo_processes": closed,
+                "destination": contract.target.runtime_ini,
+            }
+        )
+    except Exception as exc:
+        deploy.update({"status": "FAIL", "error": str(exc)})
+        return {"deploy": deploy, "reload": reload_result, "report": None}
+
+    try:
+        command = _command_payload(transport.invoke_batch(contract.target.reload_bat))
+        if command["exit_code"] != 0:
+            reload_result = {
+                "status": "FAIL",
+                "command": command,
+                "readiness": {"ready": False},
+                "error": f"fallback reload returned {command['exit_code']}",
+            }
+            return {"deploy": deploy, "reload": reload_result, "report": None}
+        readiness = _readiness_payload(dict(transport.query_susi_device()))
+        reload_result = {
+            "status": "PASS" if readiness["ready"] else "FAIL",
+            "command": command,
+            "readiness": readiness,
+        }
+        if not readiness["ready"]:
+            reload_result["error"] = "SUSI4 is not uniquely healthy after fallback reload"
+            return {"deploy": deploy, "reload": reload_result, "report": None}
+    except Exception as exc:
+        reload_result = {
+            "status": "FAIL",
+            "readiness": {"ready": False},
+            "error": str(exc),
+        }
+        return {"deploy": deploy, "reload": reload_result, "report": None}
+
+    results = execute_validation_sections(
+        contract,
+        {"sections": [section_plan]},
+        transport,
+        timeout_seconds=timeout_seconds,
+        remote_report_dir=remote_reports,
+        local_report_dir=local_reports,
+    )
+    result = results[0]
+    if result.get("execution_status") != "COMPLETED":
+        return {
+            "deploy": deploy,
+            "reload": reload_result,
+            "report": None,
+            "runner_result": result,
+        }
+    report_path = Path(str(result["local_report_path"]))
+    report = json.loads(report_path.read_text(encoding="utf-8-sig"))
+    return {
+        "deploy": deploy,
+        "reload": reload_result,
+        "report": report,
+        "report_path": str(report_path),
+        "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        "runner_result": result,
+    }
+
+
+def deploy_fallback_ini_only(
+    contract: PostIniContract,
+    transport: Any,
+    *,
+    ini_text: str,
+    label: str,
+) -> dict[str, Any]:
+    """Restore the last accepted generated INI without running a section."""
+
+    safe_label = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "restore"
+    local_root = contract.outputs.run_root / "fallback" / "restore"
+    local_path = local_root / f"{safe_label}.ini"
+    remote_root = str(PureWindowsPath(contract.target.run_output) / "fallback" / "restore")
+    remote_path = str(PureWindowsPath(remote_root) / local_path.name)
+    local_root.mkdir(parents=True, exist_ok=True)
+    local_path.write_text(ini_text, encoding="utf-8")
+    digest = hashlib.sha256(local_path.read_bytes()).hexdigest()
+    result: dict[str, Any] = {
+        "status": "NOT_RUN",
+        "local_path": str(local_path),
+        "remote_path": remote_path,
+        "ini_sha256": digest,
+    }
+    try:
+        transport.ensure_directories([remote_root])
+        transport.upload(local_path, remote_path)
+        remote_hash = str(transport.remote_sha256(remote_path)).strip().lower()
+        if remote_hash != digest:
+            raise RuntimeError("fallback restore upload hash mismatch")
+        transport.close_process("SusiDemo4")
+        transport.copy_remote_file(remote_path, contract.target.runtime_ini)
+        command = _command_payload(transport.invoke_batch(contract.target.reload_bat))
+        if command["exit_code"] != 0:
+            raise RuntimeError(f"fallback restore reload returned {command['exit_code']}")
+        readiness = _readiness_payload(dict(transport.query_susi_device()))
+        if not readiness["ready"]:
+            raise RuntimeError("SUSI4 is not healthy after fallback restore")
+        result.update(
+            {
+                "status": "PASS",
+                "remote_sha256": remote_hash,
+                "command": command,
+                "readiness": readiness,
+            }
+        )
+    except Exception as exc:
+        result.update({"status": "FAIL", "error": str(exc)})
+    return result
+
+
+def converge_fallback_artifacts(
+    contract: PostIniContract,
+    convergence: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Persist successes and rebuild canonical INI/matrix/section JSON artifacts."""
+
+    override_path = contract.inputs.case_dir / f"{contract.project}-config-overrides.json"
+    successful = [
+        str(item.get("section"))
+        for item in convergence.get("sections", [])
+        if isinstance(item, Mapping) and item.get("status") == "CONVERGED"
+    ]
+    if not successful:
+        return {
+            "status": "NO_CHANGE",
+            "override_path": str(override_path),
+            "sections": [],
+        }
+    override = persist_project_route_overrides(
+        override_path,
+        project=contract.project,
+        run_id=contract.run_id,
+        convergence=convergence,
+    )
+
+    applied = apply_project_route_overrides(
+        project=contract.project,
+        override_path=override_path,
+        full_ini_path=contract.inputs.full_ini,
+        section_paths=contract.inputs.split_inis,
+    )
+    matrix = json.loads(contract.inputs.section_matrix.read_text(encoding="utf-8"))
+    matrix_sections = matrix.get("sections") if isinstance(matrix, dict) else None
+    if not isinstance(matrix_sections, list):
+        raise RuntimePhaseError("FORMAL_CONVERGENCE", "section matrix has no sections list")
+    details = applied.get("details") if isinstance(applied.get("details"), Mapping) else {}
+    for entry in matrix_sections:
+        if not isinstance(entry, dict) or entry.get("section") not in successful:
+            continue
+        section = str(entry["section"])
+        section_detail = details.get(section, {}) if isinstance(details, Mapping) else {}
+        entry["project_route_override"] = {
+            "status": "APPLIED",
+            "path": str(override_path),
+            "sha256": applied.get("sha256"),
+            **(dict(section_detail) if isinstance(section_detail, Mapping) else {}),
+        }
+        route = str(entry.get("route") or "")
+        if "PROJECT_ROUTE_OVERRIDE" not in route:
+            entry["route"] = f"{route}+PROJECT_ROUTE_OVERRIDE" if route else "PROJECT_ROUTE_OVERRIDE"
+    temporary = contract.inputs.section_matrix.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(matrix, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    temporary.replace(contract.inputs.section_matrix)
+    config_build = prepare_section_configs(contract)
+    return {
+        "status": "APPLIED",
+        "override_path": str(override_path),
+        "override": override,
+        "applied": applied,
+        "config_build": config_build,
+        "sections": successful,
+    }
+
+
+def run_fallback_convergence_session(
+    contract: PostIniContract,
+    manifest: Mapping[str, Any],
+    staging_result: Mapping[str, Any],
+    transport: Any,
+    plan: Mapping[str, object],
+    *,
+    runner_timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Execute a validated plan, save evidence, converge artifacts, then recover target."""
+
+    baseline_text = contract.inputs.full_ini.read_text(encoding="utf-8")
+    restore_counter = 0
+
+    def attempt_runner(candidate: FallbackAttemptCandidate) -> Mapping[str, object]:
+        return run_fallback_attempt(
+            contract,
+            manifest,
+            transport,
+            candidate,
+            timeout_seconds=runner_timeout_seconds,
+        )
+
+    def restore_runner(section: str, ini_text: str) -> Mapping[str, object]:
+        nonlocal restore_counter
+        restore_counter += 1
+        return deploy_fallback_ini_only(
+            contract,
+            transport,
+            ini_text=ini_text,
+            label=f"{restore_counter:03d}-{section}",
+        )
+
+    convergence: dict[str, Any] = {
+        "schema_version": "machineb.fallback_convergence.v1",
+        "status": "NOT_RUN",
+        "sections": [],
+    }
+    try:
+        convergence = dict(
+            execute_fallback_plan(
+                baseline_ini_text=baseline_text,
+                plan=plan,
+                attempt_runner=attempt_runner,
+                restore_runner=restore_runner,
+            )
+        )
+        effective_text = str(convergence.pop("effective_ini_text"))
+        effective_path = contract.outputs.run_root / "fallback-effective-full.ini"
+        effective_path.write_text(effective_text, encoding="utf-8")
+        convergence["effective_ini_path"] = str(effective_path)
+        convergence["formal_convergence"] = converge_fallback_artifacts(
+            contract, convergence
+        )
+    except Exception as exc:
+        convergence = {
+            "schema_version": "machineb.fallback_convergence.v1",
+            "status": "ORCHESTRATOR_ERROR",
+            "sections": [],
+            "error": str(exc),
+        }
+    finally:
+        convergence["final_runtime_recovery"] = rollback_runtime_ini(
+            contract, staging_result, transport
+        )
+    if convergence["final_runtime_recovery"].get("status") != "PASS":
+        convergence["status"] = "ORCHESTRATOR_ERROR"
+    output = contract.outputs.run_root / "fallback-convergence.json"
+    temporary = output.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(convergence, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.replace(output)
+    convergence["output_path"] = str(output)
+    return convergence
 
 
 def rollback_runtime_ini(
@@ -1600,12 +1941,20 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Stage, activate, run safe validation, collect reports, and roll back",
     )
-    parser.add_argument("--host", help="Machine-B SSH host (required with --execute)")
-    parser.add_argument("--user", help="Machine-B SSH user (required with --execute)")
+    mode.add_argument(
+        "--converge",
+        action="store_true",
+        help="Execute a validated fallback-plan.json with isolated section attempts",
+    )
+    parser.add_argument("--fallback-plan", help="Required with --converge")
+    parser.add_argument("--host", help="Machine-B SSH host (required with --execute/--converge)")
+    parser.add_argument("--user", help="Machine-B SSH user (required with --execute/--converge)")
     parser.add_argument("--runner-timeout-seconds", type=int, default=180)
     args = parser.parse_args(argv)
-    if args.execute and (not args.host or not args.user):
-        parser.error("--host and --user are required with --execute")
+    if (args.execute or args.converge) and (not args.host or not args.user):
+        parser.error("--host and --user are required with --execute/--converge")
+    if args.converge and not args.fallback_plan:
+        parser.error("--fallback-plan is required with --converge")
     if args.runner_timeout_seconds <= 0:
         parser.error("--runner-timeout-seconds must be positive")
 
@@ -1622,9 +1971,35 @@ def main(argv: list[str] | None = None) -> int:
 
         config_build = prepare_section_configs(contract)
         manifest = build_execution_manifest(contract)
-        manifest["mode"] = "execute"
+        manifest["mode"] = "converge" if args.converge else "execute"
         manifest["config_build"] = config_build
         manifest["preflight"] = run_local_preflight(contract, manifest)
+
+        fallback_plan: dict[str, object] | None = None
+        if args.converge:
+            registry = load_candidate_registry(
+                Path(args.repo_root).expanduser().resolve()
+                / "targetB_task"
+                / "machineB_validation"
+                / "fallback_candidate_registry.json"
+            )
+            fallback_plan = load_and_validate_fallback_plan(
+                Path(args.fallback_plan).expanduser().resolve(),
+                expected_project=contract.project,
+                expected_run_id=contract.run_id,
+                expected_full_ini=contract.inputs.full_ini,
+                registry=registry,
+                applicable_sections=set(contract.inputs.generated_sections),
+            )
+            planned_sections = fallback_plan.get("sections")
+            manifest["fallback_plan"] = {
+                "path": str(Path(args.fallback_plan).expanduser().resolve()),
+                "sha256": hashlib.sha256(
+                    Path(args.fallback_plan).expanduser().resolve().read_bytes()
+                ).hexdigest(),
+                "section_count": len(planned_sections) if isinstance(planned_sections, list) else 0,
+            }
+
         contract.outputs.run_root.mkdir(parents=True, exist_ok=True)
         temporary_path = contract.outputs.manifest.with_suffix(".json.tmp")
         temporary_path.write_text(
@@ -1636,13 +2011,30 @@ def main(argv: list[str] | None = None) -> int:
 
         transport = SshPowerShellTransport(host=args.host, user=args.user)
         staging = stage_remote_bundle(contract, manifest, transport)
-        summary = run_activated_validation(
-            contract,
-            manifest,
-            staging,
-            transport,
-            runner_timeout_seconds=args.runner_timeout_seconds,
-        )
+        if args.converge:
+            if fallback_plan is None:
+                raise RuntimePhaseError("PLAN", "validated fallback plan is missing")
+            convergence = run_fallback_convergence_session(
+                contract,
+                manifest,
+                staging,
+                transport,
+                fallback_plan,
+                runner_timeout_seconds=args.runner_timeout_seconds,
+            )
+            output_path = Path(str(convergence["output_path"]))
+            status = str(convergence.get("status") or "ORCHESTRATOR_ERROR")
+            exit_code = 0 if status in {"CONVERGED", "NO_ACTION"} else (2 if status == "ORCHESTRATOR_ERROR" else 1)
+        else:
+            summary = run_activated_validation(
+                contract,
+                manifest,
+                staging,
+                transport,
+                runner_timeout_seconds=args.runner_timeout_seconds,
+            )
+            output_path = contract.outputs.summary_json
+            exit_code = int(summary["exit_code"])
     except (ContractError, RemoteStageError) as exc:
         print(json.dumps(exc.to_dict(), sort_keys=True), file=sys.stderr)
         return 2
@@ -1655,8 +2047,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    print(contract.outputs.summary_json)
-    return int(summary["exit_code"])
+    print(output_path)
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@
 > `susi_spd_idx_probe_report.txt` 只在 AMD SPD idx 路線使用；遠端固定路徑為 `C:\Users\susiaa\Desktop\suto\V7\run_susi_spd_idx_probe.bat` / `C:\Users\susiaa\Desktop\suto\V7\susi_spd_idx_probe_report.txt`。
 
 ## 圖片判讀引擎策略（已拍板）
+- **強制前置步驟**：只要本輪需要分析 BIOS 圖片、電路圖圖片或電路圖 PDF，orchestrator 必須先讀取本案目前版本的 `/home/company2/AIagent_susi/AnalysisSKill/bios_circuit_image_analysis_rule.md`，並以該檔作為 `diagram_filter_skill` 的唯一規則主檔；不可等使用者提醒，也不可只靠記憶或其他 skill 摘要執行。
 - 圖片判讀 gate 一律使用 Hermes `vision_analyze`（線上模型直接看像素）。
 - 不使用 offline OCR engine（不依賴 tesseract/rapidocr/paddleocr 等本地 OCR 安裝）。
 - 圖片輸入範圍固定包含：`bios*.png` + `circuit*.png`。
@@ -39,6 +40,68 @@
 6. 呼叫 `config_builder_skill` 產生自動化測試 cfg
 7. 收集結果交給 `verdict_report_skill`
 8. 成功則回寫考古 DB；失敗則回歸校正（不直接覆蓋 DB）
+
+## Post-INI Machine-B 固定流程（P5-P12）
+
+### `/susiagent` 頂層模式契約
+
+總控固定辨識兩種使用者入口；`--all` 是 `/susiagent` 的頂層模式旗標，不可原樣轉傳給 `susi_gen.py`：
+
+```text
+/susiagent <PROJECT>
+    → 維持既有產生階段：probe/vision/spec/pre-INI/split INI/matrix
+    → 若平台命中既有 v2 convergence gate，仍依產生流程做必要 deploy/reload/reprobe
+    → 呼叫 build_machineB_section_configs.py 產生 GENERATED section JSON
+    → 停在 P5 handoff，不進入 P6-P12 完整 Machine-B validation runners
+
+/susiagent <PROJECT> --all --host <MACHINE_B_HOST> [--user <USER>]
+    → 先完成上述產生階段
+    → 再把相同 project 的 post-INI artifacts 交給 run_machineB_full_validation.py
+    → 以 --execute --host <MACHINE_B_HOST> --user <USER> 執行 P5-P12
+```
+
+- `--user` 預設為 `susiaa`；`--all` 未提供時維持原有 probe/產生/必要 convergence 行為，但不得自動進入 P6-P12 完整驗證。P12 host 仍禁止猜測、沿用 context summary 或拿不相關 SSH alias 當目標。
+- `--all` 是當回合對安全預設完整流程的明確授權：允許 staging、runtime INI backup/deploy、一次 validation reload、安全 runners、report 回收、rollback 與一次 recovery reload。
+- `--all` **不**授權 control/fixture/functional/SetConfig/stimulus/write 等 opt-in；這些 switch 仍全部預設關閉，必須另有當回合明確授權。
+- 「全部跑完」表示對所有 `GENERATED`/runnable sections 執行完整生命週期；不代表所有 sections 必然 PASS，也不把 `SKIPPED_EMPTY_SECTION`/`PENDING_*` 假裝成 runnable。
+- 任何 pre-INI 產生 blocker 必須先停止，不能拿舊 artifacts 進 P12；任何部署/reload 基礎設施失敗依狀態機進 recovery，不能繼續 runners。
+- 內部固定 handoff 概念命令如下，`run_id` 必須每次唯一：
+
+```text
+.venv/bin/python run_machineB_full_validation.py \
+  --project <PROJECT> \
+  --repo-root /home/company2/AIagent_susi \
+  --run-id <UNIQUE_RUN_ID> \
+  --execute --host <MACHINE_B_HOST> --user <USER>
+```
+
+`/susiagent` 產生 `<project>-pre.ini`、section matrix 與 split INIs 後，分析流程在此交棒，不再重看 BIOS/電路圖、不重查 DB/probe，也不重新推導 channel：
+
+1. `build_machineB_section_configs.py` 是所有 Machine-B section JSON 的唯一 builder。
+2. `run_machineB_full_validation.py` 依固定 registry 建 manifest、做 local preflight、呼叫 `machineb_transport.py` staging/backup。
+3. 只把完整 `<project>-pre.ini` 複製為 `C:\\Windows\\SUSI\\<project>.ini`；正常流程不部署 split INI。
+4. 關閉 `SusiDemo4`，validation activation reload 一次，並以唯一 SUSI4 PnP 裝置 `Status=OK`、`Problem=0/CM_PROB_NONE` 作 readiness gate。
+5. 依 Python registry 固定順序執行 14 runners；`HWM.Fan` 與 `HWM.Fan.Control` 相鄰且具 dependency gate。
+6. 所有 runner 共用同一完整 runtime INI。`AllowControl`、fixture、functional、SetConfig、stimulus、write switches 預設全部不傳。
+7. 每段只接受本次新產生的 `<report_prefix>_*.json`，立即下載並解析；JSON verdict 為主，process exit code 保留為診斷證據。
+   - 多通道 section 任一 required channel 失敗時，整體 verdict 仍可為 `FAIL`，但報告必須標示 `PARTIAL_FAIL` 或全通道失敗，並列出 total/passed/failed、成功通道、失敗通道及 status code。
+   - 禁止將 `Backlight1=PASS、Backlight2=FAIL` 簡寫成未限定範圍的「VGA.Backlight failed」。
+8. 最後產生 JSON/text summary；無論成功或失敗都還原原 runtime INI（原先不存在則刪除）並做獨立 recovery reload。
+9. P12 實機執行必須有當回合明確授權與已確認的 Machine-B host/user。
+
+責任邊界：
+
+- `susi_gen.py`：只到 pre-INI/split-INI/matrix，不負責遠端部署與 API runner。
+- `build_machineB_section_configs.py`：只負責 section JSON。
+- `run_machineB_full_validation.py`：P5-P12 總控與狀態機。
+- `machineb_transport.py`：SSH/SCP/PowerShell transport 與遠端檔案生命週期。
+- `targetB_task/machineB_validation/*.ps1`：實際 SUSI API 驗證與 JSON report。
+- `.bat`：`reload_susi4_driver.bat` 是 lifecycle entrypoint；舊 AIMB-289 BAT 不在 14-section 正常流程。
+
+已驗證的 Windows PowerShell 相容性：
+
+- 目標 Windows PowerShell 的 `New-Item` 需使用 `-Path`；不可假設支援 `-LiteralPath`。
+- `Get-PnpDevice.Problem` 可能回傳 enum 名稱；readiness parser 必須正規化 `CM_PROB_NONE -> 0`、`CM_PROB_DISABLED -> 22`，並保留 raw 值。
 
 ### SMBus decision precedence
 - **Spec gate（最高）**：以 `{project}-spec.json` 為準。
@@ -108,6 +171,13 @@
 - INI key 大小寫相容性不成立，輸出時必須嚴格使用 `Backlight1=`、`Backlight2=`、`Backlight3=` 等形式。
 - 禁止輸出 `BACKLIGHT1=`、`BACKLIGHT2=` 等全大寫形式；DB/JSON 的 item name 即使為大寫，也不得直接沿用到 INI key。
 - 此規則由總控 `susi_gen.py` 的 INI renderer 落實；回歸測試需驗證精確大小寫，並拒絕錯誤大小寫。
+
+## VGA channel 數量：DB maximum-set + full-probe filter
+- `[VGA.Brightness]` 與 `[VGA.Backlight]` 的 tuple/template 仍以固定 `(product_name, chip_name)` 從 DB query，DB rows 視為 maximum set。
+- 當 `*susi_board_probe_report.txt` 含 `VGA.Brightness Channels` / `VGA.Backlight Channels` 區塊時，只計算各區塊中 primary channel 的 `[OK] ... Status=FOUND`；`_Max`、`_Min`、`_Enable`、`_Level` 等附屬 value rows 不得重複計數。
+- 以 probe supported count 保留 DB query 前 N rows，超出的 rows 必須從 split INI 與完整 pre-INI 剔除；Brightness 與 Backlight 分開計數、分開過濾。
+- 若報告沒有對應 VGA Channels 區塊，維持 DB maximum-set，不得因缺少 probe 區塊誤刪 rows。
+- section matrix 必須記錄 probe count、DB row count、trimmed count 與 `PROBE_CHANNEL_FILTER` route，供產物稽核。
 
 ## Probe 判讀用途（除 status 之外）
 - `status`：確認該項是否可讀/可用（SUCCESS vs UNSUPPORTED/ERR）。
@@ -221,14 +291,17 @@
     2) 重抓 probe 後第二輪再產生 v2
   - 未跑第二輪不得宣稱完成（除非有明確 blocker：SSH/driver/probe/BIOS 證據不足）。
 
-### option fallback（溫度全 ERR 時）
-- 觸發條件：`[HWM.Temperature]` 初版上機後，probe 的 `HWM_TEMP_*` 在同一輪結果全為 `[ERR]`（0 個 `[OK]`）。
-- 動作：改為候選組合迭代，針對 `[HWM.Temperature]` 同步調整 `io_port + option` 後重測。
-  - 每輪：套用一組 `(io_port, option)` → 部署/重載 → 重抓 probe。
-  - 任一輪出現 `HWM_TEMP_*` 非全 ERR（有 OK）即視為命中，停止迭代並保留該組。
-- 邊界：
-  - 不改 `channel_id/item_key`。
-  - 若候選組合全部測完仍全 ERR，標記 `PENDING_TEMP_IO_OPTION_CANDIDATES_EXHAUSTED` 並回報各輪 probe 證據。
+### 完整驗證後的 route fallback convergence
+- 這個 fallback 與上述 61**D probe→v2 收斂不同；它只處理 `/susiagent --all` 第一輪完整 INI 驗證後的 section-level API 全敗。
+- AI 責任：讀第一輪 summary/raw report，確認 section 應存在，且 runner 正常完成、所有 channel API 都失敗；排除 `PARTIAL_FAIL`、fixture、capability-only 與 infrastructure 問題；產生 `fallback-plan.json` 並解讀結果。
+- Python 責任：驗證 plan provenance/hash 與 candidate registry 白名單，固定候選順序；每輪從目前已接受的完整 INI 只改一個問題 section 的 `IOPort/Address`，執行 deploy → reload → targeted validation；保存 tuple、INI hash、reload、report、status code。
+- v1 只允許 route fallback：Option 候選可登錄，但 `option_fallback_enabled=false`，不可做 `(io_port, option)` 笛卡兒積。
+- trigger 必須是 `EXPECTED_SECTION_ALL_CHANNEL_API_FAILED`；任一 channel API 成功即不觸發或視為 candidate 命中。`PARTIAL_FAIL` 不得 fallback。
+- 候選只可來自 `targetB_task/machineB_validation/fallback_candidate_registry.json`；排除 baseline 與數值重複值，禁止 AI 自創。
+- 每輪禁止修改 `channel_id`、key、HWID、Option 或其他 tuple 欄位；SMBus `Channel1` 固定，不得修改。
+- 某 section 命中後保留該 route，再處理下一 section；候選耗盡或 infrastructure error 時，先恢復該 section 嘗試前的最後 accepted 完整 INI。
+- 成功值寫入 `{project}-config-overrides.json`；主 generator 套用到完整/分段 INI，matrix 記錄 `PROJECT_ROUTE_OVERRIDE`，section config JSON 由既有 builder 重建。全部 remote 操作結束後仍須恢復 Machine-B 原始 runtime INI。
+- 舊 `tools/hwm_temperature_option_fallback.py` 不再由主 generator 呼叫，不得把其 probe/Option 流程混入本 convergence。
 
 ## What MUST stay in Orchestrator
 - probe 觸發與回收

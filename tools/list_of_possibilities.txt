@@ -1,0 +1,51 @@
+section SMBus
+IOPort/Address 可能的值：0、0x2E、0x4E
+Option 可能的值：0xA0000000
+
+section I2C
+IOPort/Address 可能的值：0、0x2E、0x4E
+Option 可能的值：0x20000000
+
+section VGA.Backlight
+IOPort/Address 可能的值：0
+Option 可能的值：0xA0000000
+
+section VGA.Brightness
+IOPort/Address 可能的值：0、0x2E、0x4E
+Option 可能的值：0x00000000、0x20000000
+
+section HWM.Voltage
+IOPort/Address 可能的值：0、0x2E、0x4E
+Option 可能的值：0x80000000
+
+section HWM.Current
+IOPort/Address 可能的值：0
+Option 可能的值：0xA0000000
+
+section HWM.Temperature
+IOPort/Address 可能的值：0、0x2E、0x4E
+Option 可能的值：0x80000001
+
+section HWM.Fan
+IOPort/Address 可能的值：0、0x2E、0x4E
+Option 可能的值：0x80000000
+
+section HWM.CaseOpen
+IOPort/Address 可能的值：0x2E、0x4E、0x9E
+Option 可能的值：0xA0000000
+
+section WDT
+IOPort/Address 可能的值：0、0x2E、0x4E
+Option 可能的值：0xA0000000
+
+section GPIO
+IOPort/Address 可能的值：0、1、0x00、0x2E、0x4E、0x40、0x42、0x44、0x46、0x48、0x4A、0x4C
+Option 可能的值：0x20000003、0xA0000003
+
+section StorageArea
+IOPort/Address 可能的值：0
+Option 可能的值：0xA0000000
+
+section ThermalProtect
+IOPort/Address 可能的值：0
+Option 可能的值：0xA0000000

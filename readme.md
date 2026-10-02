@@ -24,6 +24,7 @@
     - /home/company2/AIagent_susi/AnalysisSKill/orchestrator_skill.md
     - /home/company2/AIagent_susi/AnalysisSKill/candidate_query_skill.md
     - /home/company2/AIagent_susi/AnalysisSKill/bios_circuit_image_analysis_rule.md
+      （只要需要 BIOS/電路圖分析，必須在該次執行先讀此檔；不可等使用者提醒）
 
     有條件有用（不是主路徑，但可能會用）
     1) /home/company2/AIagent_susi/generate_ini.py
