@@ -16,9 +16,20 @@
 
 | Section | Output | Runner |
 |---|---|---|
+| `SMBus` | `<model>_smbus.json` | `run_smbus_validation.ps1` |
+| `I2C` | `<model>_i2c.json` | `run_i2c_validation.ps1` |
+| `GPIO` | `<model>_gpio.json` | `run_gpio_validation.ps1` |
+| `HWM.Temperature` | `<model>_temperature.json` | `run_hwm_temperature_validation.ps1` |
+| `HWM.Voltage` | `<model>_voltage.json` | `run_hwm_voltage_validation.ps1` |
+| `HWM.CaseOpen` | `<model>_caseopen.json` | `run_hwm_caseopen_validation.ps1` |
+| `HWM.Current` | `<model>_current.json` | `run_hwm_current_validation.ps1` |
 | `HWM.Fan` | `<model>_fan.json` | `run_hwm_fan_validation.ps1` |
-| `HWM.Fan.Control` | `<model>_fancontrol.json` | `run_hwm_fan_control_validation.ps1` |
+| `HWM.Fan.Control` | `<model>_fancontrol.json` | `run_hwm_fan_control_validation_section.ps1` |
 | `StorageArea` | `<model>_storage.json` | `run_storage_validation.ps1` |
+| `ThermalProtect` | `<model>_thermalprotect.json` | `run_thermalprotect_validation.ps1` |
+| `WDT` | `<model>_wdt.json` | `run_wdt_validation.ps1` |
+| `VGA.Backlight` | `<model>_backlight.json` | `run_vga_backlight_validation.ps1` |
+| `VGA.Brightness` | `<model>_brightness.json` | `run_vga_brightness_validation.ps1` |
 
 所有輸出都包含：
 - `schema_version`

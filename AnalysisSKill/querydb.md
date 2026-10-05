@@ -55,20 +55,22 @@
 - `HWM.Temperature`
 - `HWM.Voltage`
 
-共同欄位（依各表實際 schema）：
+所有 section table 的共同欄位：
 - `id` (INTEGER, PK)
 - `hardware_id` (TEXT, NOT NULL)
 - `report_name` (TEXT, NOT NULL, default `""`)
-- `channel_name` (TEXT, NOT NULL, default `""`)
-- `channel_id` (TEXT, NOT NULL, default `""`)
 - `io_port` (TEXT, NOT NULL, default `""`)
 - `options` (TEXT, NOT NULL, default `""`)
+
+除 `GPIO` 外，其餘 section table 另外共同具有：
+- `channel_name` (TEXT, NOT NULL, default `""`)
+- `channel_id` (TEXT, NOT NULL, default `""`)
 
 欄位語意：
 - `hardware_id`：section row 的硬體模板識別值。
 - `report_name`：SUSI probe 回報的 channel／item 名稱，是 report mapping 的主要欄位。
-- `channel_name`：DB 整理時使用的輔助名稱，不作 query key。
-- `channel_id`：INI `Channel` 欄位對應值。
+- `channel_name`：非 GPIO section 的輔助名稱，不作 query key。
+- `channel_id`：非 GPIO section 的 INI `Channel` 欄位對應值。
 - `io_port`：INI `IOPort/Device Address` 欄位對應值。
 - `options`：INI `Option` 欄位對應值。
 
@@ -81,14 +83,16 @@
 
 ### 3.1 WDT、SMBus、I2C、HWM.Current、HWM.CaseOpen、StorageArea、ThermalProtect、VGA.Backlight
 
-除共同欄位外沒有額外欄位。
+使用上述非 GPIO section 的共同欄位，沒有其他額外欄位。
 
 ### 3.2 GPIO
 
-除共同欄位外：
+除所有 section table 的共同欄位外：
 - `base_addr` (TEXT, NOT NULL, default `""`)
 - `group` (TEXT, NOT NULL, default `""`)
 - `pin` (TEXT, NOT NULL, default `""`)
+
+`GPIO` table 沒有 `channel_name` 或 `channel_id` 欄位。
 
 GPIO 的 `group`／`pin` 是否採用，仍依 EC 或 SIO/NCT 電路圖路徑判定；DB row 本身不是最終電路圖裁決。
 

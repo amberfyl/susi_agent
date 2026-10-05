@@ -4,3 +4,24 @@
 chip_db.py
 build_chip_db.py
 chip_db.db
+
+# Build / tooling artifacts
+__pycache__/
+node_modules/
+
+# Local-only: case data, agent workspace, handoff notes, reference headers
+CASES/
+.hermes/
+hermes_md.zip
+hermes_skill_susiagent.zip
+unused.db
+HANDOFF_*.md
+skill_only_checklist.md
+Susi4.h
+targetB_task/v2/
+
+# One-off / legacy Machine-B scripts
+targetB_task/machineB_validation/*aimb289*
+targetB_task/machineB_validation/hwm.fan.control.ps1
+targetB_task/machineB_validation/hwm.fan_verify.ps1
+targetB_task/machineB_validation/hwm_temperature_option_fallback.py

@@ -2,7 +2,9 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -70,56 +72,34 @@ def _load_spec_json(in_json_path: Path) -> dict | None:
         return json.load(f)
 
 
-def _explicit_spec_section_state(section: str, spec: dict | None) -> bool | None:
-    """Return the user's explicit section intent; None means unknown/unprovided."""
-    if not isinstance(spec, dict):
-        return None
-    keys = {
-        "HWM.Current": ("currents", "current"),
-        "HWM.CaseOpen": ("caseopen", "case_open", "chassis_intrusion"),
-    }.get(section)
-    if not keys:
-        return None
+_BIOS_LIVE_READING_FIELDS = (
+    "voltage_value_hints",
+    "temperature_value_hints",
+    "fan_value_hints",
+    "current_value_hints",
+    "caseopen_hints",
+)
+_BIOS_SECTION_EVIDENCE_FIELDS = {
+    "HWM.Voltage": ("voltage_value_hints", "voltage_label_hints"),
+    "HWM.Temperature": ("temperature_value_hints", "temperature_label_hints"),
+    "HWM.Fan": ("fan_value_hints", "fan_label_hints"),
+    "HWM.Fan.Control": ("fan_value_hints", "fan_label_hints"),
+    "HWM.Current": ("current_value_hints", "current_label_hints"),
+    "HWM.CaseOpen": ("caseopen_hints",),
+}
 
-    def state_of(value: object) -> bool | None:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, list):
-            return bool(value)
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"true", "enabled", "enable", "yes", "found", "supported"}:
-                return True
-            if normalized in {"false", "disabled", "disable", "no", "not_found", "unsupported"}:
-                return False
-            return None
-        if isinstance(value, dict):
-            for field in ("enabled", "status"):
-                if field in value:
-                    state = state_of(value[field])
-                    if state is not None:
-                        return state
-            if "items" in value and isinstance(value["items"], list):
-                return bool(value["items"])
-        return None
 
-    for key in keys:
-        if key in spec:
-            return state_of(spec[key])
-    features = spec.get("features")
-    if isinstance(features, dict):
-        for key in keys:
-            if key in features:
-                return state_of(features[key])
-    details = spec.get("feature_details")
-    if isinstance(details, dict):
-        for key in keys:
-            if key in details:
-                return state_of(details[key])
-    return None
+def _is_bios_monitor_page(item: dict) -> bool:
+    """A BIOS page is the Hardware Monitor page only if it shows live readings."""
+    return any(isinstance(item.get(f), list) and item[f] for f in _BIOS_LIVE_READING_FIELDS)
 
 
 def _bios_has_section_evidence(section: str, bios_cache_path: Path | None) -> bool:
+    """HWM evidence comes only from structured readings on Hardware Monitor pages.
+
+    Other BIOS pages (CPU configuration, main/version pages, ...) and free-text
+    prose (including negative sentences or setting names) are never evidence.
+    """
     if not bios_cache_path or not bios_cache_path.is_file():
         return False
     try:
@@ -130,26 +110,16 @@ def _bios_has_section_evidence(section: str, bios_cache_path: Path | None) -> bo
     if not isinstance(items, list):
         return False
 
+    fields = _BIOS_SECTION_EVIDENCE_FIELDS.get(section, ())
     for item in items:
         if not isinstance(item, dict):
             continue
-        if section == "HWM.Current" and any(
-            isinstance(item.get(field), list) and bool(item[field])
-            for field in ("current_label_hints", "current_value_hints")
-        ):
-            return True
-        if section == "HWM.CaseOpen" and isinstance(item.get("caseopen_hints"), list) and item["caseopen_hints"]:
-            return True
-        text = str(item.get("analysis_text") or "")
-        if section == "HWM.Current" and re.search(
-            r"(?i)\b(?:system\s+current|current\s+sensor|amperage)\b|\b\d+(?:\.\d+)?\s*m?a\b",
-            text,
-        ):
-            return True
-        if section == "HWM.CaseOpen" and re.search(
-            r"(?i)\b(?:case\s*open|chassis\s+intrusion)\b",
-            text,
-        ):
+        image_name = str(item.get("filename") or item.get("path") or "").strip()
+        if image_name and not Path(image_name).name.lower().startswith("bios"):
+            continue
+        if not _is_bios_monitor_page(item):
+            continue
+        if any(isinstance(item.get(f), list) and item[f] for f in fields):
             return True
     return False
 
@@ -160,13 +130,16 @@ def evaluate_section_applicability(
     bios_cache_path: Path | None,
 ) -> dict[str, object]:
     """Decide whether a section may be queried/generated before consulting DB tuples."""
-    if section not in {"HWM.Current", "HWM.CaseOpen"}:
-        return {"applicable": True, "reason_code": "SECTION_NOT_GATED"}
-    spec_state = _explicit_spec_section_state(section, spec)
-    if spec_state is False:
-        return {"applicable": False, "reason_code": "SPEC_EXPLICITLY_DISABLED"}
-    if spec_state is True:
-        return {"applicable": True, "reason_code": "SPEC_EXPLICITLY_ENABLED"}
+    bios_gated_sections = {
+        "HWM.Voltage",
+        "HWM.Current",
+        "HWM.Temperature",
+        "HWM.Fan",
+        "HWM.Fan.Control",
+        "HWM.CaseOpen",
+    }
+    if section not in bios_gated_sections:
+        return {"applicable": True, "reason_code": "SECTION_NOT_BIOS_GATED"}
     if _bios_has_section_evidence(section, bios_cache_path):
         return {"applicable": True, "reason_code": "BIOS_EVIDENCE_FOUND"}
     return {"applicable": False, "reason_code": "BIOS_EVIDENCE_NOT_FOUND"}
@@ -176,31 +149,37 @@ def _infer_chip_name(spec: dict | None) -> str | None:
     if not spec:
         return None
 
-    # 1) explicit chips.* values
+    # Candidate strings in priority order: explicit chips.* values, then
+    # gpio pin chip hints.
+    texts: list[str] = []
     chips = spec.get("chips") if isinstance(spec, dict) else None
     if isinstance(chips, dict):
         for k in ("ec", "hwm", "gpio", "smbus", "i2c"):
             v = chips.get(k)
             if isinstance(v, str) and v.strip():
-                m = re.search(r"(EIO-\d+|IT-\d+|IT\d+)", v.upper())
-                if m:
-                    x = m.group(1)
-                    if x.startswith("IT") and not x.startswith("IT-") and x[2:].isdigit():
-                        x = f"IT-{x[2:]}"
-                    return x
-
-    # 2) scan gpio pin chip hints
+                texts.append(v.upper())
     gpio = spec.get("gpio") if isinstance(spec, dict) else None
     if isinstance(gpio, dict):
         for pin in gpio.get("pins", []) if isinstance(gpio.get("pins"), list) else []:
             chip = pin.get("chip") if isinstance(pin, dict) else None
             if isinstance(chip, str):
-                m = re.search(r"(EIO-\d+|IT-\d+|IT\d+)", chip.upper())
-                if m:
-                    x = m.group(1)
-                    if x.startswith("IT") and not x.startswith("IT-") and x[2:].isdigit():
-                        x = f"IT-{x[2:]}"
-                    return x
+                texts.append(chip.upper())
+
+    # 1) EC key first. A compound string such as "NCT6694B(EIO-300)" keeps the
+    #    EC key; section routing later sends GPIO/I2C/SMBus to NCT6694B.
+    for text in texts:
+        m = re.search(r"(EIO-\d+|IT-\d+|IT\d+)", text)
+        if m:
+            x = m.group(1)
+            if x.startswith("IT") and not x.startswith("IT-") and x[2:].isdigit():
+                x = f"IT-{x[2:]}"
+            return x
+
+    # 2) Nuvoton SIO chip (e.g. NCT6126D, NCT6694B) when no EC key exists.
+    for text in texts:
+        m = re.search(r"NCT[-_ ]?(\d{4}[A-Z])", text)
+        if m:
+            return f"NCT{m.group(1)}"
 
     return None
 
@@ -374,6 +353,50 @@ def _extract_fan_value_hints(text: str) -> list[dict]:
     return _merge_value_hints([], out)
 
 
+_CASEOPEN_LIVE_STATES = {
+    "OPEN", "OPENED", "CLOSE", "CLOSED", "YES", "NO", "OK", "NORMAL",
+    "DETECTED", "INTRUDED", "TRIGGERED", "ALARM", "CLEAR", "CLEARED",
+}
+
+
+def _extract_current_value_hints(text: str) -> list[dict]:
+    """Live current readings, e.g. 'System Current 1.2 A' or 'CURRENT_VALUE: CPU Current=850mA'."""
+    patt = re.compile(
+        r"(?P<label>[A-Za-z][A-Za-z0-9 _.+-]*?\bCURRENT\b)\s*[:=]?\s*"
+        r"(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>mA|A)\b",
+        re.IGNORECASE,
+    )
+    out: list[dict] = []
+    for m in patt.finditer(text or ""):
+        label = re.sub(r"^(?:CURRENT_VALUE\s*:\s*)", "", m.group("label").strip(), flags=re.IGNORECASE).strip()
+        v = _parse_float_safe(m.group("value"))
+        if v is None or not label:
+            continue
+        unit = "mA" if m.group("unit").lower() == "ma" else "A"
+        out.append({"label": label, "value": v, "unit": unit})
+    return out
+
+
+def _extract_caseopen_hints(text: str) -> list[dict]:
+    """Live case-open/intrusion status, e.g. 'CASEOPEN_VALUE: Case Open=No'.
+
+    Settings such as 'Case Open Detection' or 'Chassis Intrusion [Disabled]'
+    and negative sentences are not live readings and yield nothing.
+    """
+    patt = re.compile(
+        r"(?P<label>case\s*open(?:\s+(?:status|warning))?|chassis\s+intrusion(?:\s+status)?)"
+        r"\s*[:=]?\s*(?P<state>[A-Za-z]+)\b",
+        re.IGNORECASE,
+    )
+    out: list[dict] = []
+    for m in patt.finditer(text or ""):
+        state = m.group("state")
+        if state.upper() not in _CASEOPEN_LIVE_STATES:
+            continue
+        out.append({"label": re.sub(r"\s+", " ", m.group("label").strip()), "state": state})
+    return out
+
+
 def _collect_scoped_vision_images(project_dir: Path, chip_name: str | None = None) -> list[Path]:
     """Collect scoped bios/circuit rasters with chip-aware scope.
 
@@ -441,6 +464,14 @@ def _build_bios_image_cache(project_dir: Path, project_name: str, chip_name: str
         if not isinstance(fan_value_hints, list):
             fan_value_hints = _extract_fan_value_hints(str(analysis_text or ""))
 
+        current_value_hints = prev.get("current_value_hints") if isinstance(prev, dict) else None
+        if not isinstance(current_value_hints, list):
+            current_value_hints = _extract_current_value_hints(str(analysis_text or ""))
+
+        caseopen_hints = prev.get("caseopen_hints") if isinstance(prev, dict) else None
+        if not isinstance(caseopen_hints, list):
+            caseopen_hints = _extract_caseopen_hints(str(analysis_text or ""))
+
         analysis_status = (prev.get("analysis_status") if isinstance(prev, dict) else None) or "PENDING_VISION_ANALYZE"
         label_hint_source = (prev.get("label_hint_source") if isinstance(prev, dict) else None) or (
             "vision_analyze" if analysis_status == "DONE_VISION_ANALYZE" else "filename_regex"
@@ -452,13 +483,15 @@ def _build_bios_image_cache(project_dir: Path, project_name: str, chip_name: str
             "sha256": sha,
             "size": st.st_size,
             "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
-            "analysis_engine": "hermes_vision_analyze",
+            "analysis_engine": "agent_vision_cli",
             "analysis_status": analysis_status,
             "analysis_text": analysis_text or "",
             "voltage_label_hints": hints,
             "voltage_value_hints": voltage_value_hints,
             "temperature_value_hints": temperature_value_hints,
             "fan_value_hints": fan_value_hints,
+            "current_value_hints": current_value_hints,
+            "caseopen_hints": caseopen_hints,
             "label_hint_source": label_hint_source,
         })
 
@@ -472,7 +505,7 @@ def _build_bios_image_cache(project_dir: Path, project_name: str, chip_name: str
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "image_glob": image_glob,
         "image_count": len(items),
-        "analysis_engine": "hermes_vision_analyze",
+        "analysis_engine": "agent_vision_cli",
         "analysis_status": overall_status,
         "items": items,
     }
@@ -480,16 +513,99 @@ def _build_bios_image_cache(project_dir: Path, project_name: str, chip_name: str
     return out
 
 
+# Model-facing judgement rules live in prompts/*.md (single source; the human
+# document AnalysisSKill/bios_circuit_image_analysis_rule.md points to them).
+# Code keeps only the fixed lead-in, per-case info and the output format.
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+BIOS_READING_PROMPT = "bios_reading.md"
+GPIO_TRACE_PROMPT = "gpio_trace.md"
+BIOS_GATED_SECTIONS = (
+    "HWM.Voltage",
+    "HWM.Current",
+    "HWM.Temperature",
+    "HWM.Fan",
+    "HWM.Fan.Control",
+    "HWM.CaseOpen",
+)
+
+
+def _load_prompt_rules(filename: str, prompts_dir: Path | None = None) -> dict:
+    """Load a prompts/*.md rule file.
+
+    Returns {"text", "issue"}. When the file cannot be used, text is None and
+    issue explains why; callers skip the AI step and report it.
+    """
+    path = (prompts_dir or PROMPTS_DIR) / filename
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {"text": None, "issue": f"PROMPT_FILE_MISSING: prompts/{filename}"}
+    if not text:
+        return {"text": None, "issue": f"PROMPT_FILE_EMPTY: prompts/{filename}"}
+    return {"text": text, "issue": None}
+
+
+def _build_bios_reading_prompt(rules_text: str, img_path: Path) -> str:
+    return (
+        "Analyze this BIOS/circuit image with high reasoning. "
+        "Follow the rules below and report only what is visible.\n\n"
+        f"{rules_text}\n\n"
+        "## Output format\n"
+        "Plain text. List the voltage labels, real-time temperature sensor names and fan names you see. "
+        "When a live value is visible, also write it in this form: "
+        "VOLTAGE_VALUE: <label>=<number><V|mV>; TEMP_VALUE: <label>=<number>C; FAN_VALUE: <label>=<number>RPM; "
+        "CURRENT_VALUE: <label>=<number><A|mA>; CASEOPEN_VALUE: <label>=<state>\n"
+        "If this is not the Hardware Monitor page, answer only: No live hardware-monitor sensor rows are visible.\n\n"
+        "## Case info\n"
+        f"Image path: {img_path}"
+    )
+
+
+def _build_gpio_trace_prompt(rules_text: str, chip_u: str, target_signal_hint: str, img: Path) -> str:
+    return (
+        "You are a schematic GPIO wire-trace analyzer. Use vision_analyze on this image. "
+        "Follow the rules below; never guess.\n\n"
+        f"{rules_text}\n\n"
+        "## Output format\n"
+        "Output a single JSON object, no markdown:\n"
+        "{\"items\":[{\"report_name\":\"GPIO00\",\"signal\":\"EC_P1_GPIO0\",\"function_label\":\"GPIOB0\","
+        "\"group\":11,\"bit\":0,\"package_pin\":\"F1\",\"status\":\"CONFIRMED|AMBIGUOUS\","
+        "\"evidence\":\"...\",\"name\":\"\"}],\"notes\":\"...\"}\n\n"
+        "## Case info\n"
+        f"Chip: {chip_u or 'UNKNOWN'}\n"
+        f"Target signal pattern: {target_signal_hint}\n"
+        f"Image path: {img}"
+    )
+
+
+# Fallback vision call used only when the agent did not pre-produce the result.
+# The agent CLI is configurable so any harness can supply its own vision tool:
+#   SUSI_VISION_CMD="<agent cli> ... {prompt} ..."   ({image} = image path, optional)
+DEFAULT_VISION_CMD = "hermes -z {prompt} -t vision"
+
+
+def _vision_command(prompt: str, image_path: Path) -> list[str]:
+    """Build the vision CLI argv from SUSI_VISION_CMD (default: Hermes)."""
+    template = os.environ.get("SUSI_VISION_CMD", "").strip() or DEFAULT_VISION_CMD
+    # Split the template first so the prompt always stays a single argument.
+    return [
+        part.replace("{prompt}", prompt).replace("{image}", str(image_path))
+        for part in shlex.split(template)
+    ]
+
+
 def _run_vision_analyze(image_path: Path, prompt: str) -> str | None:
-    """Run Hermes vision_analyze through CLI and return plain text output."""
+    """Run the configured agent vision CLI and return plain text output."""
+    cmd = _vision_command(prompt, image_path)
     try:
         proc = subprocess.run(
-            ["hermes", "-z", prompt, "-t", "vision"],
+            cmd,
             text=True,
             capture_output=True,
             check=False,
         )
-    except Exception:
+    except Exception as exc:
+        print(f"WARNING: vision command failed to start ({cmd[0]}): {exc}", file=sys.stderr)
         return None
 
     if proc.returncode != 0:
@@ -499,10 +615,19 @@ def _run_vision_analyze(image_path: Path, prompt: str) -> str | None:
     return out or None
 
 
-def _vision_populate_bios_cache(cache_path: Path) -> Path:
-    """Producer half: actively run vision for pending/missing cache items."""
+def _vision_populate_bios_cache(cache_path: Path, prompt_issues: dict | None = None,
+                                prompts_dir: Path | None = None) -> Path:
+    """Producer half: actively run vision only for pending/missing cache items.
+
+    Items already analyzed (for example by the Hermes agent before generation)
+    are used as-is. prompts/bios_reading.md is read only when an AI call is
+    needed; if it is unusable, no AI call is made and the issue is recorded in
+    prompt_issues[BIOS_READING_PROMPT].
+    """
     if not cache_path.exists():
         return cache_path
+
+    rules: dict | None = None
 
     try:
         data = _load_json(cache_path)
@@ -532,29 +657,22 @@ def _vision_populate_bios_cache(cache_path: Path) -> Path:
             "temperature_value_hints",
             "fan_value_hints",
         ])
-        is_bios = str(it.get("filename") or "").strip().lower().startswith("bios")
-        any_value_present = False
-        for k in ["voltage_value_hints", "temperature_value_hints", "fan_value_hints"]:
-            v = it.get(k)
-            if isinstance(v, list) and len(v) > 0:
-                any_value_present = True
-                break
-        needs_ai = (status != "DONE_VISION_ANALYZE") or (not analysis_text) or (not has_value_fields) or (is_bios and not any_value_present)
+        # A completed page without live readings (e.g. CPU configuration) is a
+        # valid result and must not be re-analyzed.
+        needs_ai = (status != "DONE_VISION_ANALYZE") or (not analysis_text) or (not has_value_fields)
         if not needs_ai:
             continue
 
-        prompt = (
-            "請使用高推理分析這張 BIOS/電路圖片，只能根據可見內容，不可猜測。"
-            "輸出純文字，包含："
-            "1) 電壓標籤(如 +12V,+5V,+5VSB,+3.3V,VBAT)；"
-            "2) 即時溫度感測名稱(如 CPU Temperature/System Temperature，排除 Shutdown threshold 類)；"
-            "3) 風扇名稱(如 COM Module FAN/Carrier Board FAN/CPU Fan/System Fan)。"
-            "若畫面有即時數值，請同時附上值與單位，格式盡量像："
-            "VOLTAGE_VALUE: <label>=<number><V|mV>; TEMP_VALUE: <label>=<number>C; FAN_VALUE: <label>=<number>RPM。"
-            f" 圖片路徑：{img_path}"
-        )
+        if rules is None:
+            rules = _load_prompt_rules(BIOS_READING_PROMPT, prompts_dir)
+            if rules["issue"]:
+                if prompt_issues is not None:
+                    prompt_issues[BIOS_READING_PROMPT] = rules["issue"]
+                print(f"WARNING: {rules['issue']}; BIOS image analysis skipped", file=sys.stderr)
+        if rules["issue"]:
+            continue
 
-        out = _run_vision_analyze(img_path, prompt)
+        out = _run_vision_analyze(img_path, _build_bios_reading_prompt(rules["text"], img_path))
         if not out:
             continue
 
@@ -593,6 +711,8 @@ def _vision_populate_bios_cache(cache_path: Path) -> Path:
         it["voltage_value_hints"] = voltage_value_hints
         it["temperature_value_hints"] = temperature_value_hints
         it["fan_value_hints"] = fan_value_hints
+        it["current_value_hints"] = _extract_current_value_hints(out)
+        it["caseopen_hints"] = _extract_caseopen_hints(out)
         changed = True
 
     data["analysis_status"] = "DONE" if items and all(
@@ -873,11 +993,57 @@ def _build_voltage_alias_bridge(ec_base: dict, bios_cache: dict) -> dict:
     alias_map: list[dict] = []
     unresolved: list[dict] = []
 
+    query_key = ec_base.get("query_key") if isinstance(ec_base, dict) else None
+    is_aimb_nct6126d = bool(
+        isinstance(query_key, dict)
+        and str(query_key.get("product_name") or "").strip().upper() == "AIMB"
+        and str(query_key.get("chip_name") or "").strip().upper() == "NCT6126D"
+    )
+    v5sb_to_v33_evidence_image: str | None = None
+    if is_aimb_nct6126d:
+        for bios_item in bios_items:
+            if not isinstance(bios_item, dict):
+                continue
+            image_name = str(bios_item.get("filename") or bios_item.get("path") or "").strip()
+            if image_name and not Path(image_name).name.lower().startswith("circuit"):
+                continue
+            route_hints = bios_item.get("voltage_route_hints")
+            if not isinstance(route_hints, list):
+                continue
+            for hint in route_hints:
+                if not isinstance(hint, dict):
+                    continue
+                source_item = str(hint.get("source_item") or "").strip().upper()
+                actual_rail = str(hint.get("actual_rail") or "").strip().upper().replace(" ", "")
+                evidence_level = str(hint.get("evidence_level") or "").strip().upper()
+                if (source_item in {"V5SB", "VIN0", "HWM_VOLTAGE_5VSB"}
+                        and actual_rail in {"+3.3V", "3.3V", "3V3", "+3V3", "V33"}
+                        and evidence_level in {"NET_LEVEL_CONFIRMED", "SCHEMATIC_CONFIRMED"}):
+                    v5sb_to_v33_evidence_image = Path(image_name).name if image_name else None
+                    break
+            if v5sb_to_v33_evidence_image is not None:
+                break
+
     for item in ec_base.get("items") or []:
         if not isinstance(item, dict):
             continue
         report_name = str(item.get("report_name") or "")
         channel_id = str(item.get("channel_id") or "")
+        current_item = _canonical_voltage_item_name(
+            report_name,
+            str(item.get("item_name") or item.get("channel_name") or ""),
+        )
+        if v5sb_to_v33_evidence_image is not None and current_item == "V5SB":
+            alias_map.append({
+                "report_name": report_name,
+                "channel_id": channel_id,
+                "alias": "+3.3V",
+                "confidence": "high",
+                "item_name_override": "V33",
+                "reason": "AIMB_NCT6126D_V5SB_RENAMED_TO_V33_BY_SCHEMATIC",
+                "evidence_image": v5sb_to_v33_evidence_image,
+            })
+            continue
         alias, reason = _pick_alias_from_bios_labels(report_name, merged_labels)
         if alias:
             alias_map.append({
@@ -1000,6 +1166,15 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
 
     by_key: dict[tuple[str, str], str] = {}
     by_report: dict[str, str] = {}
+    item_override_by_key: dict[tuple[str, str], str] = {}
+    item_override_by_report: dict[str, str] = {}
+    query_key = query_result.get("query_key") if isinstance(query_result, dict) else None
+    is_aimb_nct6126d = bool(
+        isinstance(query_key, dict)
+        and str(query_key.get("product_name") or "").strip().upper() == "AIMB"
+        and str(query_key.get("chip_name") or "").strip().upper() == "NCT6126D"
+    )
+    override_reason = "AIMB_NCT6126D_V5SB_RENAMED_TO_V33_BY_SCHEMATIC"
     for item in alias_map:
         if not isinstance(item, dict):
             continue
@@ -1013,10 +1188,19 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
 
         report_name = str(item.get("report_name") or "").strip()
         channel_id = str(item.get("channel_id") or "").strip()
+        item_name_override = str(item.get("item_name_override") or "").strip().upper()
+        reason = str(item.get("reason") or "").strip()
         if report_name and channel_id:
             by_key[(report_name, channel_id)] = alias
         if report_name:
             by_report[report_name] = alias
+        if (is_aimb_nct6126d
+                and item_name_override == "V33"
+                and reason == override_reason):
+            if report_name and channel_id:
+                item_override_by_key[(report_name, channel_id)] = "V33"
+            if report_name:
+                item_override_by_report[report_name] = "V33"
 
     unresolved_keys: set[tuple[str, str]] = set()
     for u in unresolved:
@@ -1037,6 +1221,8 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
 
     merged = 0
     oem_fallback_count = 0
+    item_override_count = 0
+    rows_to_remove: set[int] = set()
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -1057,7 +1243,33 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
                     and not has_true_vbat):
                 row["item_name"] = "VBAT"
                 has_true_vbat = True
+            item_override = item_override_by_key.get((report_name, channel_id))
+            if item_override is None:
+                item_override = item_override_by_report.get(report_name)
+            if item_override == "V33" and current_item == "V5SB":
+                existing_v33 = next(
+                    (
+                        candidate for candidate in rows
+                        if candidate is not row
+                        and isinstance(candidate, dict)
+                        and str(candidate.get("channel_id") or candidate.get("channel") or "").strip() == channel_id
+                        and _canonical_voltage_item_name(
+                            str(candidate.get("report_name") or ""),
+                            str(candidate.get("item_name") or candidate.get("channel_name") or ""),
+                        ) == "V33"
+                    ),
+                    None,
+                )
+                if existing_v33 is not None:
+                    existing_v33["disp_name"] = alias
+                    rows_to_remove.add(id(row))
+                else:
+                    row["item_name"] = "V33"
+                item_override_count += 1
             merged += 1
+
+    if rows_to_remove:
+        rows[:] = [row for row in rows if id(row) not in rows_to_remove]
 
     # If still unmatched after alias merge, keep count visibility by parking them
     # into VOEM<n> slots (name mismatch fallback).
@@ -1098,6 +1310,7 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
     query_result["alias_merged_count"] = merged
     query_result["alias_unresolved_count"] = len(unresolved_keys)
     query_result["alias_oem_fallback_count"] = oem_fallback_count
+    query_result["alias_item_override_count"] = item_override_count
     query_result["alias_bridge_path"] = str(alias_bridge_path)
     return query_result
 
@@ -2387,24 +2600,6 @@ def _build_i2c_query_result(db_path: Path, product_name: str, chip_name: str,
     if not isinstance(probe_buses, list):
         probe_buses = []
 
-    oem_buses: list[dict] = []
-    for bus in probe_buses:
-        if not isinstance(bus, dict):
-            continue
-        bus_name = str(bus.get("name") or "").strip().upper()
-        if not re.fullmatch(r"I2C_OEM\d+", bus_name):
-            continue
-        bus_id = bus.get("id")
-        if isinstance(bus_id, bool):
-            continue
-        if not isinstance(bus_id, int):
-            try:
-                bus_id = int(str(bus_id).strip(), 0)
-            except (TypeError, ValueError):
-                continue
-        oem_buses.append({"name": bus_name, "id": bus_id})
-    oem_buses.sort(key=lambda bus: bus["id"])
-
     probe_bus_names = {str(bus.get("name") or "").strip().upper() for bus in probe_buses}
     probe_bus_ids = {
         bus.get("probe_id")
@@ -2417,62 +2612,47 @@ def _build_i2c_query_result(db_path: Path, product_name: str, chip_name: str,
     for db_row in result.get("rows") or []:
         if not isinstance(db_row, dict):
             continue
-        db_channel = str(db_row.get("channel") or "").strip()
-        if db_channel:
-            encoded_channel = _parse_int_value(db_channel)
-            if encoded_channel is None:
-                continue
-            bus_id = encoded_channel - 0x80000000 if encoded_channel >= 0x80000000 else encoded_channel
-            slot = bus_id + 1
-            if slot < 1 or slot > 5:
-                skipped_oem_ids.append(bus_id)
-                continue
-
-            # config_new.db is the maximum topology. When the full probe has
-            # enumerated supported buses, intersect the DB rows with that
-            # probe result so unsupported OEM channels are not emitted.
-            if probe_buses:
-                db_report_name = str(db_row.get("report_name") or "").strip().upper()
-                is_supported = (
-                    db_report_name in probe_bus_names
-                    if db_report_name
-                    else bus_id in probe_bus_ids
-                )
-                if not is_supported:
-                    skipped_oem_ids.append(bus_id)
-                    continue
-
-            row = dict(db_row)
-            # INI keys are slots; the tuple keeps the encoded SUSI bus ID.
-            # Reusing Channel1 for every DB row creates invalid duplicate keys.
-            row["item_name"] = f"Channel{slot}"
-            row["i2c_channel_source"] = "DB"
-            rows.append(row)
+        # Channel values come only from config_new.db; the probe never
+        # composes a channel, it may only remove unsupported DB rows.
+        encoded_channel = _parse_int_value(str(db_row.get("channel") or "").strip())
+        if encoded_channel is None:
+            continue
+        bus_id = encoded_channel - 0x80000000 if encoded_channel >= 0x80000000 else encoded_channel
+        slot = bus_id + 1
+        if slot < 1 or slot > 5:
+            skipped_oem_ids.append(bus_id)
             continue
 
-        for bus in oem_buses:
-            bus_id = bus["id"]
-            slot = bus_id + 2
-            if slot > 5:
+        # config_new.db is the maximum topology. When the full probe has
+        # enumerated supported buses, intersect the DB rows with that
+        # probe result so unsupported OEM channels are not emitted.
+        if probe_buses:
+            db_report_name = str(db_row.get("report_name") or "").strip().upper()
+            is_supported = (
+                db_report_name in probe_bus_names
+                if db_report_name
+                else bus_id in probe_bus_ids
+            )
+            if not is_supported:
                 skipped_oem_ids.append(bus_id)
                 continue
-            row = dict(db_row)
-            row["item_name"] = f"Channel{slot}"
-            row["channel"] = f"0x{0x80000000 + bus_id:08X}"
-            row["i2c_channel_source"] = "FULL_PROBE_I2C_ID"
-            row["probe_i2c_name"] = bus["name"]
-            rows.append(row)
+
+        row = dict(db_row)
+        # INI keys are slots; the tuple keeps the encoded SUSI bus ID.
+        # Reusing Channel1 for every DB row creates invalid duplicate keys.
+        row["item_name"] = f"Channel{slot}"
+        row["i2c_channel_source"] = "DB"
+        rows.append(row)
 
     result["rows"] = rows
     result["row_count"] = len(rows)
-    result["i2c_probe_oem_ids"] = [bus["id"] for bus in oem_buses]
     result["i2c_skipped_oem_ids"] = sorted(set(skipped_oem_ids))
     if rows:
         result["status"] = "FOUND"
-        result["reason"] = "I2C fields composed from config_new.db and full probe OEM IDs"
+        result["reason"] = "I2C rows from config_new.db filtered by full probe supported buses"
     else:
-        result["status"] = "PENDING_I2C_PROBE"
-        result["reason"] = "I2C DB row has no channel and full probe has no usable OEM ID"
+        result["status"] = "SECTION_EMPTY"
+        result["reason"] = "no config_new.db I2C row remains after full probe filtering"
     return result
 
 
@@ -2814,12 +2994,17 @@ def _load_fan_name_hints_from_bios_cache(cache_path: Path) -> dict:
         out["by_idx"][1] = "Carrier Board FAN"
 
     if not out["by_key"]:
-        if re.search(r"\bCPU\s*FAN\b", u):
-            out["by_key"]["FCPU"] = "CPU Fan"
-            out["by_idx"][0] = "CPU Fan"
-        if re.search(r"\bSYSTEM\s*FAN\b|\bSYS\s*FAN\b", u):
-            out["by_key"]["FSYS"] = "System Fan"
-            out["by_idx"][1] = "System Fan"
+        # Keep the label exactly as the BIOS shows it (e.g. "CPU FAN Speed"):
+        # the fan word plus up to two following words, stopping at values/delimiters.
+        label_tail = r"\d*(?:[ \t]+(?!RPM\b)[A-Za-z]+){0,2}"
+        cpu = re.search(r"\bCPU\s*FAN" + label_tail, text, re.IGNORECASE)
+        if cpu:
+            out["by_key"]["FCPU"] = cpu.group(0).strip()
+            out["by_idx"][0] = cpu.group(0).strip()
+        sys_fan = re.search(r"\b(?:SYSTEM|SYS)\s*FAN" + label_tail, text, re.IGNORECASE)
+        if sys_fan:
+            out["by_key"]["FSYS"] = sys_fan.group(0).strip()
+            out["by_idx"][1] = sys_fan.group(0).strip()
 
     return out
 
@@ -3018,13 +3203,16 @@ def _is_nct61xxd_fan_chip(chip_name: str) -> bool:
 
 def _fan_db_row_key(row: dict) -> str:
     rn = str(row.get("report_name") or "").upper().strip()
-    if "FAN_CPU" in rn:
-        return "FCPU"
-    if "FAN_SYSTEM" in rn:
-        return "FSYS"
-    m = re.search(r"FAN_OEM(\d+)", rn)
-    if m:
-        return f"FOEM{int(m.group(1))}"
+    m = re.search(r"HWM_FAN_([A-Z0-9]+)$", rn)
+    if not m:
+        return ""
+    suffix = m.group(1)
+    fixed = {"CPU": "FCPU", "SYSTEM": "FSYS", "CPU2": "FCPU2"}
+    if suffix in fixed:
+        return fixed[suffix]
+    m_oem = re.match(r"^OEM(\d+)$", suffix)
+    if m_oem:
+        return f"FOEM{int(m_oem.group(1))}"
     return ""
 
 
@@ -3162,8 +3350,42 @@ def _ensure_gpio_vision_images(project_dir: Path, project_name: str) -> list[Pat
     return merged
 
 
-def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: str | None = None) -> Path | None:
+def _parse_gpio_function_label(function_label: str) -> tuple[int, int] | None:
+    """Decode a chip GPIO function label into (group, bit).
+
+    GPxy -> (x, y); GPIOxy -> (x, y) where the group digit may be hex
+    (GPIO34 -> 3,4; GPIOB0 -> 11,0; GPIOA5 -> 10,5).
+    """
+    label = str(function_label or "").upper()
+    m_gp = re.search(r"\bGP\s*([0-9])\s*([0-9])\b", label)
+    if m_gp:
+        return int(m_gp.group(1)), int(m_gp.group(2))
+    m_gpio = re.search(r"\bGPIO\s*([0-9A-F])\s*([0-9])\b", label)
+    if m_gpio:
+        return int(m_gpio.group(1), 16), int(m_gpio.group(2))
+    return None
+
+
+def _gpio_target_signal_pattern(chip_name: str | None) -> tuple[str, re.Pattern[str] | None]:
+    """Chip-aware external signal scope for GPIO circuit tracing (R-016)."""
+    chip_u = str(chip_name or "").upper()
+    if chip_u.startswith(("NCT6126D", "NCT6116D", "NCT6106D", "NCT6776D")):
+        return "SIO_GPIO*", re.compile(r"^SIO_GPIO\d+$", re.IGNORECASE)
+    if chip_u.startswith(("NCT6694B", "EIO-300")):
+        # All EC ports (P1, P2, P3, ...); never P1-only.
+        return "EC_P*_GPIO*", re.compile(r"^EC_P\d+_GPIO\d+$", re.IGNORECASE)
+    if chip_u.startswith("EIO-211"):
+        return "EC_GP*", re.compile(r"^EC_GP\d+$", re.IGNORECASE)
+    return "(依圖面證據決定，需先收斂唯一 target_signal_set)", None
+
+
+def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: str | None = None,
+                              prompts_dir: Path | None = None) -> Path | None:
     if not _chip_requires_circuit_evidence(chip_name):
+        return None
+
+    rules = _load_prompt_rules(GPIO_TRACE_PROMPT, prompts_dir)
+    if rules["issue"]:
         return None
 
     out_path = project_dir / f"{project_name}-gpio-trace.json"
@@ -3172,49 +3394,18 @@ def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: s
         return None
 
     chip_u = str(chip_name or "").upper()
-    target_signal_hint = "(依圖面證據決定，需先收斂唯一 target_signal_set)"
-    target_signal_re: re.Pattern[str] | None = None
-    if chip_u.startswith(("NCT6126D", "NCT6116D", "NCT6106D", "NCT6776D")):
-        target_signal_hint = "SIO_GPIO*"
-        target_signal_re = re.compile(r"^SIO_GPIO\d+$", re.IGNORECASE)
-    elif chip_u.startswith("NCT6694B"):
-        # NCT6694B GPIO tracing scope lock: only EC_P1_GPIOn signals.
-        target_signal_hint = "EC_P1_GPIOn"
-        target_signal_re = re.compile(r"^EC_P1_GPIO\d+$", re.IGNORECASE)
-    elif chip_u.startswith("EIO-300"):
-        target_signal_hint = "EC_P*_GPIO*"
-        target_signal_re = re.compile(r"^EC_P\d+_GPIO\d+$", re.IGNORECASE)
-    elif chip_u.startswith("EIO-211"):
-        target_signal_hint = "EC_GP*"
-        target_signal_re = re.compile(r"^EC_GP\d+$", re.IGNORECASE)
+    target_signal_hint, target_signal_re = _gpio_target_signal_pattern(chip_name)
 
     merged_items: list[dict] = []
     ambiguous = 0
 
     for img in images:
-        prompt = (
-            "你是電路圖 GPIO 追線分析器。"
-            "請使用 vision_analyze 分析這張圖，僅依可見線路與文字，不可猜測。"
-            "輸出必須是單一 JSON 物件，不要 markdown："
-            "{\"items\":[{\"report_name\":\"GPIO00\",\"signal\":\"EC_P1_GPIO0\",\"function_label\":\"GPIOB0\",\"group\":1,\"bit\":0,\"package_pin\":\"F1\",\"status\":\"CONFIRMED|AMBIGUOUS\",\"evidence\":\"...\",\"name\":\"\"}],\"notes\":\"...\"}。"
-            "規則：1) 必須是實際 wire trace；2) 無法確定就用 AMBIGUOUS；3) 僅輸出 target_signal_set 內訊號，其餘 OUT_OF_SCOPE 不輸出；4) 不要輸出 FAN/BEEP。"
-            f" 本案 chip={chip_u or 'UNKNOWN'}，預設 target_signal_set 命名提示={target_signal_hint}。"
-            f" 圖片路徑：{img}"
-        )
-        try:
-            proc = subprocess.run(
-                ["hermes", "-z", prompt, "-t", "vision"],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-        except Exception:
+        prompt = _build_gpio_trace_prompt(rules["text"], chip_u, target_signal_hint, img)
+        out = _run_vision_analyze(img, prompt)
+        if not out:
             continue
 
-        if proc.returncode != 0:
-            continue
-
-        obj = _extract_first_json_block(proc.stdout)
+        obj = _extract_first_json_block(out)
         if not isinstance(obj, dict):
             continue
 
@@ -3238,22 +3429,14 @@ def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: s
             group = _parse_int_value(it.get("group"))
             bit = _parse_int_value(it.get("bit"))
 
-            # Deterministic fallback: parse GPxy or GPIOxy style function labels.
-            m_gp = re.search(r"\bGP\s*([0-9])\s*([0-9])\b", function_label.upper())
-            m_gpio = re.search(r"\bGPIO\s*([0-9]{2})\b", function_label.upper())
-            if m_gp:
-                gp_group = int(m_gp.group(1))
-                gp_bit = int(m_gp.group(2))
-                group = gp_group
-                bit = gp_bit
-                if not str(it.get("report_name") or "").strip():
-                    it["report_name"] = f"GPIO{gp_group}{gp_bit}"
-            elif m_gpio:
-                gpio_num = int(m_gpio.group(1))
-                gp_group = gpio_num // 10
-                gp_bit = gpio_num % 10
-                group = gp_group
-                bit = gp_bit
+            # Deterministic override: group/bit come from the chip function
+            # label (GPxy / GPIOxy, hex group allowed), not from the AI value.
+            parsed = _parse_gpio_function_label(function_label)
+            if parsed:
+                group, bit = parsed
+                is_gp_label = re.search(r"\bGP\s*[0-9]\s*[0-9]\b", function_label.upper())
+                if is_gp_label and not str(it.get("report_name") or "").strip():
+                    it["report_name"] = f"GPIO{group}{bit}"
 
             item = {
                 "report_name": str(it.get("report_name") or "").strip().upper(),
@@ -3293,7 +3476,7 @@ def _auto_generate_gpio_trace(project_dir: Path, project_name: str, chip_name: s
         "topology_status": topology_status,
         "items": items_out,
         "meta": {
-            "source": "hermes_vision_analyze",
+            "source": "agent_vision_cli",
             "images_analyzed": [str(p.name) for p in images],
             "image_count": len(images),
             "ambiguous_count": ambiguous,
@@ -3464,26 +3647,17 @@ def _normalize_gpio_trace_result(raw: dict | None) -> dict | None:
     }
 
 
-def _canonical_gpio_key(report_name: str, signal: str, group: int | None, bit: int | None, idx: int) -> str:
-    rn = str(report_name or "").strip().upper()
+def _gpio_signal_order(signal: str) -> tuple:
+    """Sort key for traced GPIO signals: EC_P<port>_GPIO<n> by (port, n), SIO_GPIO<n> by n."""
     sig = str(signal or "").strip().upper()
-
-    m_sig = re.match(r"^SIO_GPIO(\d+)$", sig)
-    if m_sig:
-        return f"GPIO{int(m_sig.group(1)):02d}"
-
-    m_rn_sio = re.match(r"^SIO_GPIO(\d+)$", rn)
-    if m_rn_sio:
-        return f"GPIO{int(m_rn_sio.group(1)):02d}"
-
-    m_rn_gpio = re.match(r"^GPIO(\d+)$", rn)
-    if m_rn_gpio:
-        return f"GPIO{int(m_rn_gpio.group(1)):02d}"
-
-    if isinstance(group, int) and isinstance(bit, int):
-        return f"GPIO{group}{bit}"
-
-    return rn or f"GPIO{idx:02d}"
+    m_ec = re.match(r"^EC_P(\d+)_GPIO(\d+)$", sig)
+    if m_ec:
+        return (0, int(m_ec.group(1)), int(m_ec.group(2)), sig)
+    m_sio = re.match(r"^SIO_GPIO(\d+)$", sig)
+    if m_sio:
+        return (0, 0, int(m_sio.group(1)), sig)
+    m_num = re.search(r"(\d+)$", sig)
+    return (1, 0, int(m_num.group(1)) if m_num else 10**9, sig)
 
 
 def _trace_item_quality(it: dict) -> int:
@@ -3651,38 +3825,27 @@ def _build_gpio_query_result(db_path: Path, product_name: str, chip_name: str,
         decision["gpio_trace_confirmed_count"] = len(confirmed)
 
         if confirmed:
-            best_by_key: dict[str, dict] = {}
+            # INI keys are always GPIO00, GPIO01, ... assigned by the code in
+            # traced signal order (EC_P1_GPIO0..7, EC_P2_GPIO0..7, ...; SIO_GPIOn by n).
+            # The AI's report_name / chip function label never decides the key;
+            # group/bit come from the traced function label.
+            best_by_signal: dict[str, dict] = {}
             for idx, it in enumerate(confirmed):
-                group = _parse_int_value(it.get("group"))
-                bit = _parse_int_value(it.get("bit"))
-                report_name = str(it.get("report_name") or "").strip()
-                signal_name = str(it.get("signal") or "").strip()
-                function_label = str(it.get("function_label") or "").strip()
-
-                # Keep GPIO key in fixed GPIO00/GPIO01... form from trace report_name/signal.
-                # Do not override key by alternate pin mux label (e.g., SPIP1_*/GPIO73).
-                key = _canonical_gpio_key(
-                    report_name,
-                    signal_name,
-                    group,
-                    bit,
-                    idx,
-                )
-                prev = best_by_key.get(key)
+                signal_name = str(it.get("signal") or "").strip().upper()
+                if not signal_name:
+                    signal_name = f"__UNNAMED_{idx}"
+                prev = best_by_signal.get(signal_name)
                 if prev is None or _trace_item_quality(it) > _trace_item_quality(prev):
-                    best_by_key[key] = it
-
-            def _gpio_item_sort_key(k: str) -> int:
-                m = re.search(r"(\d+)$", str(k or ""))
-                return int(m.group(1)) if m else 10**9
+                    best_by_signal[signal_name] = it
 
             out_rows: list[dict] = []
-            for idx, (item_key, it) in enumerate(sorted(best_by_key.items(), key=lambda kv: _gpio_item_sort_key(str(kv[0])))):
+            ordered = sorted(best_by_signal.items(), key=lambda kv: _gpio_signal_order(kv[0]))
+            for idx, (_signal, it) in enumerate(ordered):
                 group = _parse_int_value(it.get("group"))
                 bit = _parse_int_value(it.get("bit"))
                 disp_name = str(it.get("name") or "").strip()
                 out_rows.append({
-                    "item_name": item_key,
+                    "item_name": f"GPIO{idx:02d}",
                     "channel": defaults["base_addr"],
                     "io_port": defaults["io_port"],
                     "option": defaults["options"],
@@ -3837,7 +4000,7 @@ def _build_hwm_fan_query_result(db_path: Path, product_name: str, chip_name: str
                         probe_keys.append(k)
 
     by_key = fan_pairing.get("by_key") if isinstance(fan_pairing, dict) else None
-    if not probe_keys and isinstance(by_key, dict):
+    if not probe_keys and isinstance(by_key, dict) and is_ec is not True:
         probe_keys = sorted([str(k).strip().upper() for k in by_key.keys() if str(k).strip()], key=_fan_key_sort_value)
 
     # NON-EC/SIO fallback: when probe fan items are unsupported/missing,
@@ -3846,6 +4009,25 @@ def _build_hwm_fan_query_result(db_path: Path, product_name: str, chip_name: str
     if not probe_keys and is_ec is False:
         probe_keys = _fan_keys_from_hints(fan_name_hints)
         from_bios_hints = bool(probe_keys)
+
+    # EC route (EIO-300/NCT6694B compound included): config_new.db rows are the
+    # base, the full probe keeps only [OK] fans, BIOS hints fill the Name.
+    # Schematic fan pairing is never used here.
+    if is_ec is True:
+        rows = _build_hwm_fan_rows_from_db_keys(
+            db_path=db_path,
+            product_name=product_name,
+            chip_name=chip_name,
+            fan_keys=probe_keys,
+            fan_name_hints=fan_name_hints,
+        )
+        result["rows"] = rows
+        result["row_count"] = len(rows)
+        result["source"] = "EC_DB_ROWS_FILTERED_BY_PROBE"
+        result["status"] = "FOUND" if rows else "SECTION_EMPTY"
+        if not rows:
+            result["error"] = "NO_DB_HWM_FAN_ROWS_FOR_PROBE_OK_FANS"
+        return result
 
     if not probe_keys:
         result["status"] = "SECTION_EMPTY"
@@ -3953,6 +4135,11 @@ def _build_hwm_fan_control_query_result(db_path: Path, fan_result: dict, fan_pai
         decision["reason"] = "HWM.Fan rows empty"
         return result, decision
 
+    if is_ec is True:
+        # EC route: Fan.Control mirrors the DB-based HWM.Fan rows one-to-one;
+        # schematic fan pairing applies to SIO (NCT61xxD) boards only.
+        fan_pairing = None
+        decision["route"] = "FAN_EC_DB_MIRROR"
     pairing_status = (fan_pairing.get("status") if isinstance(fan_pairing, dict) else "") or ""
     by_key = fan_pairing.get("by_key") if isinstance(fan_pairing, dict) else None
     decision["pairing_status"] = pairing_status if pairing_status else None
@@ -4018,7 +4205,8 @@ def _build_hwm_fan_control_query_result(db_path: Path, fan_result: dict, fan_pai
         out_rows.append({
             "item_name": key,
             "channel": channel,
-            "io_port": fan_tpl["io_port"],
+            "io_port": (str(fr.get("io_port")) if is_ec is True and str(fr.get("io_port") or "").strip()
+                        else fan_tpl["io_port"]),
             "option": "0x20000000",
             "disp_name": (fr.get("disp_name") if isinstance(fr.get("disp_name"), str) and fr.get("disp_name").strip() else _resolve_fan_disp_name(key, control_idx if isinstance(control_idx, int) else pos, fan_name_hints)),
         })
@@ -4027,7 +4215,11 @@ def _build_hwm_fan_control_query_result(db_path: Path, fan_result: dict, fan_pai
     result["row_count"] = len(out_rows)
     result["status"] = "FOUND" if out_rows else "SECTION_EMPTY"
     decision["overridden_count"] = overridden
-    decision["reason"] = "Built HWM.Fan.Control from resolved fan keys (probe/pairing/BIOS hints) + AI pairing"
+    decision["reason"] = (
+        "EC route: HWM.Fan.Control mirrors DB-based HWM.Fan rows one-to-one"
+        if is_ec is True
+        else "Built HWM.Fan.Control from resolved fan keys (probe/pairing/BIOS hints) + AI pairing"
+    )
     return result, decision
 
 
@@ -4237,8 +4429,10 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
 
     proj_dir = out_ini_path.parent
     name = out_ini_path.stem.replace("-pre", "")
+    # prompts/*.md files that could not be used: {prompt file: issue}.
+    prompt_issues: dict[str, str] = {}
     bios_cache_path = _build_bios_image_cache(proj_dir, name, chip_name=chip_name)
-    bios_cache_path = _vision_populate_bios_cache(bios_cache_path)
+    bios_cache_path = _vision_populate_bios_cache(bios_cache_path, prompt_issues=prompt_issues)
     _write_project_temperature_name_hints(proj_dir, name, bios_cache_path)
     _write_project_fan_name_hints(proj_dir, name, bios_cache_path)
     fan_name_hints = _load_project_fan_name_hints(proj_dir, name, bios_cache_path)
@@ -4259,11 +4453,29 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
     gpio_trace = None
     gpio_trace_chip_name = _resolve_gpio_trace_chip_name(chip_name)
     if _chip_requires_circuit_evidence(gpio_trace_chip_name):
+        # An existing trace (for example written by the Hermes agent before
+        # generation) is used as-is; the prompt file is needed only when the
+        # code itself has to run the AI trace.
         gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
         if _should_regen_gpio_trace(proj_dir, gpio_trace_chip_name, gpio_trace_raw):
-            _auto_generate_gpio_trace(proj_dir, name, chip_name=gpio_trace_chip_name)
-            gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
-        gpio_trace = _normalize_gpio_trace_result(gpio_trace_raw)
+            gpio_rules = _load_prompt_rules(GPIO_TRACE_PROMPT)
+            if gpio_rules["issue"]:
+                prompt_issues[GPIO_TRACE_PROMPT] = gpio_rules["issue"]
+                print(f"WARNING: {gpio_rules['issue']}; GPIO circuit trace skipped", file=sys.stderr)
+                gpio_trace_raw = None
+            else:
+                _auto_generate_gpio_trace(proj_dir, name, chip_name=gpio_trace_chip_name)
+                gpio_trace_raw = _load_gpio_trace_result(proj_dir, name)
+        if GPIO_TRACE_PROMPT not in prompt_issues:
+            gpio_trace = _normalize_gpio_trace_result(gpio_trace_raw)
+
+    # Sections that depend on an unusable prompt file are skipped and reported.
+    section_prompt_issues: dict[str, str] = {}
+    if BIOS_READING_PROMPT in prompt_issues:
+        for gated in BIOS_GATED_SECTIONS:
+            section_prompt_issues[gated] = prompt_issues[BIOS_READING_PROMPT]
+    if GPIO_TRACE_PROMPT in prompt_issues:
+        section_prompt_issues["GPIO"] = prompt_issues[GPIO_TRACE_PROMPT]
 
     latest_fan_rows: list[dict] = []
     latest_fan_result: dict | None = None
@@ -4272,6 +4484,24 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
         route = "EC" if is_ec is True else ("NON_EC" if is_ec is False else "UNKNOWN_EC")
         fan_meta: dict = {}
         section_chip_name = _resolve_chip_name_for_section(chip_name, sec)
+
+        prompt_issue = section_prompt_issues.get(sec)
+        if prompt_issue:
+            stale_section_path = proj_dir / f"{name}_{sec}.ini"
+            if stale_section_path.exists():
+                stale_section_path.unlink()
+            matrix.append({
+                "section": sec,
+                "status": "SKIPPED_PROMPT_UNAVAILABLE",
+                "query_status": "NOT_QUERIED",
+                "row_count": 0,
+                "path": None,
+                "query_key": None,
+                "route": f"{route}+PROMPT_UNAVAILABLE",
+                "reason_code": prompt_issue.split(":", 1)[0],
+                "reason": f"AI analysis skipped because {prompt_issue}",
+            })
+            continue
 
         applicability = evaluate_section_applicability(sec, spec, bios_cache_path)
         if applicability.get("applicable") is False:
@@ -4285,9 +4515,9 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 "row_count": 0,
                 "path": None,
                 "query_key": None,
-                "route": f"{route}+SPEC_BIOS_APPLICABILITY",
+                "route": f"{route}+BIOS_HWM_APPLICABILITY",
                 "reason_code": applicability.get("reason_code"),
-                "reason": "Section disabled by explicit spec intent or absent from BIOS evidence",
+                "reason": "HWM section absent from completed BIOS Hardware Monitor evidence",
             })
             continue
 
@@ -4655,6 +4885,7 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 "voltage_alias_bridge": str(voltage_alias_bridge_path) if voltage_alias_bridge_path else None,
                 "fan_pairing_source": fan_pairing.get("source_path") if isinstance(fan_pairing, dict) else None,
                 "fan_pairing_status": fan_pairing.get("status") if isinstance(fan_pairing, dict) else None,
+                "prompt_issues": prompt_issues,
                 "sections": matrix,
             },
             ensure_ascii=False,

@@ -4,10 +4,11 @@
 角色：此檔即 diagram_filter_skill 的規則主檔（沿用既有檔名 `bios_circuit_image_analysis_rule.md`）。
 適用範圍：AIagent_susi 專案中，針對 BIOS 圖片與電路圖做候選過濾與 ini 內容裁切。
 
-補充（PNG 判讀 fallback）：
-- 預設先分析 `bios*.png` / `circuit*.png`。
-- 若 `circuit*.png` 因解析度或裁切造成 pin/網名對位不穩，允許追加分析同案電路圖 PDF（常見檔名：`circuit*.pdf`）。
-- PDF 主要用於補強「pin 編號 + 網名 + 功能名」對位證據；不可脫離圖證據做硬推。
+補充（圖資判讀）：
+- BIOS raster 以大小寫不敏感的 `bios*.png|jpg|jpeg` 納入 scoped analysis。
+- 電路圖 raster 以大小寫不敏感的 `circuit*.png|jpg|jpeg` 納入。
+- 何時看電路圖（使用者拍板）：SIO 晶片 `NCT61**D*`、`NCT6694B*` 的 GPIO 等資訊無法由 DB query 取得，必須分析電路圖；其他晶片只在既有證據不足時才分析。
+- `circuit*.pdf` 只在 `circuit*` 圖片證據不足（解析度/裁切上下文不夠）時追加；PDF 命中頁必須產生可覆核的高解析 focused crop，用於「pin 編號 + 網名 + 功能名」對位，不可脫離圖證據做硬推。
 
 ## 規則 R-001：AMD 平台不做 EPYC hard exception
 
@@ -24,50 +25,48 @@
 - 本調整僅移除 AMD EPYC hard exception。
 - 其他 SMBus gate（例如 spec gate、EC-related channel 規則）維持原流程。
 
-## 規則 R-002：BIOS 項目白名單過濾（Query 後裁切）
+## 規則 R-002：HWM BIOS 白名單與 section gate（Query 後裁切）
 
-### 觸發條件
-- 已完成 DB query，且某 section 的候選設定項目數量 > BIOS 圖中可辨識的同類監測項目數量。
+### 適用範圍
+- 只適用於會呈現在 BIOS Hardware Monitor / PC Health 類頁面的 `HWM.*`：`HWM.Voltage`、`HWM.Current`、`HWM.Temperature`、`HWM.Fan`、`HWM.Fan.Control`、`HWM.CaseOpen`。
+- `HWM.Fan.Control` 可由 BIOS 的 Fan / Smart Fan evidence 代表，不要求畫面另列一個同名 section。
+- SMBus、I2C、VGA、WDT、GPIO、StorageArea、ThermalProtect 等非 HWM section 本來就不以 BIOS Hardware Monitor 清單呈現，不得套用此 gate。
 
-### 判定邏輯
-- 以 BIOS 圖中實際可見的項目名稱建立白名單（label set）。
-- 對應 section 的候選 key/value 只保留「名稱可對齊 BIOS 白名單」的項目。
-- BIOS 圖未出現的項目，一律視為本輪不保留項目。
+### 判定邏輯（使用者決策 1B）
+- request/spec 的勾選可能誤勾、漏勾或註記 follow BIOS，因此 HWM section/item 的存在性以可用 BIOS 畫面為準，spec 只保留作 intent/衝突 trace，不得覆寫 BIOS 結果。
+- 以 BIOS 圖中實際可見的同類監測項目建立白名單（label set）。
+- `保留 = Query候選項目 ∩ BIOS白名單項目`。
+- BIOS 畫面未顯示任何該類 HWM item 時，不產生該 `HWM.*` section；同時移除 stale split/config artifacts，matrix 記錄 `SKIPPED_NOT_APPLICABLE` / `BIOS_EVIDENCE_NOT_FOUND`。
+- BIOS 有顯示該類項目時，只產生可對齊白名單的 rows；不可因 DB 有候選就補出 BIOS 未顯示的 HWM item。
+- BIOS 圖缺失、頁面不可讀或 scoped analysis 未完成時，標記 pending/ambiguous 並停止正式 HWM 輸出；不得以 spec/DB 猜測成正式 section。
 
-### 執行規則
-- `保留 = Query候選項目 ∩ BIOS白名單項目`
-- `刪除 = Query候選項目 - BIOS白名單項目`
-- 不因為 DB 有值就新增 BIOS 圖未出現的監測項目。
-
-### 範例（依提供 BIOS 圖）
-- BIOS 可見：`CPU Temperature`、`COM Module FAN`、`Carrier Board FAN`、`+12V`、`+5V`、`VBAT`
+### 範例
+- BIOS 可見：`CPU Temperature`、`COM Module FAN`、`Carrier Board FAN`、`+12V`、`+5V`、`VBAT`。
 - 若 query 在 `HWM.Voltage` 回傳 `+12V,+5V,+3.3V,VBAT`，則刪除 `+3.3V`，保留其餘三項。
+- 即使 spec 勾選 `HWM.Current`，若可用 BIOS Hardware Monitor 畫面沒有 Current/Ampere 項目，仍不產生 `[HWM.Current]`。
 
-### 注意事項
-- 本規則是「BIOS 圖驅動的裁切規則」，目的是降低考古候選過量帶來的誤配。
-- 若 BIOS 圖品質不足或 `vision_analyze` 無法穩定辨識，需標記 `AMBIGUOUS_BIOS_ITEMS`，交由人工覆核，不可默默保留全部。
-
-## 規則 R-003：BIOS 功能存在性 Gate（只做保留/降權，不做最終通道裁決）
+## 規則 R-003：HWM BIOS 功能存在性 Gate（不裁決 tuple）
 
 ### 觸發條件
-- 已取得 BIOS 設定頁截圖（Advanced/Chipset/PC Health 等）。
+- 已取得並完成 scoped analysis 的 BIOS Hardware Monitor / PC Health 頁面。
 - 已有 DB query 候選資料作為 input。
 
 ### 判定邏輯
-- 只要 BIOS 可見某功能的設定項，即判定該 section 為「存在候選」。
-- 若 BIOS 完全未出現某功能，不直接判死，但標記為「低優先候選」。
+- BIOS 可見某類 HWM 監測項，該 HWM section 才有產生資格。
+- BIOS 未顯示該類 HWM 監測項，該 section 不產生；不得降級為「低優先但仍輸出」。
+- 此 gate 只決定 HWM section/item 是否存在，不確認 channel/hwid/io_port/option tuple 正確性。
 
-### BIOS -> Section 對應（通用）
-- `I2C* Control` -> `I2C`
-- `SMBus* Control` -> `SMBus`
-- `Backlight*` -> `VGA.Backlight`
-- `Brightness* PWM*` -> `VGA.Brightness`
-- `Smart Fan*` -> `HWM.Fan.Control`
-- `PC Health / Hardware Monitor` 子頁 -> `HWM.*`（Voltage/Temperature/Fan）
+### BIOS -> Section 對應
+- Voltage rail labels -> `HWM.Voltage`
+- Temperature labels -> `HWM.Temperature`
+- Fan/RPM labels -> `HWM.Fan`
+- Fan / Smart Fan evidence -> `HWM.Fan.Control`
+- Current/Ampere labels -> `HWM.Current`
+- Case Open / Chassis Intrusion labels -> `HWM.CaseOpen`
 
 ### 注意事項
-- 本規則只確認「功能存在可能性」，不確認 channel/hwid/ioport 正確性。
-- 不可用此規則直接決定 Backlight1/2 數量（那是電路圖裁決層）。
+- 不得把本規則外推到非 HWM sections；例如 Backlight、I2C、SMBus 是否存在由各自 spec/probe/DB/電路圖規則裁決。
+- 不可用本規則推導任何 INI tuple 欄位。
 
 ## 規則 R-004：BIOS Label 到 INI Item 的軟映射（Soft Mapping）
 
@@ -81,19 +80,21 @@
 - `+12V` -> `V12`
 - `+5V` -> `V50`
 - `VBAT` -> `VBAT`
+- 讀 BIOS 圖時「只取即時讀值列、不取門檻設定」等規則：給模型的版本在 `prompts/bios_reading.md`（例：`CPU Temperature` 可用、`CPU Shutdown Temperature` 不可用）。
 
 ### 執行規則
 - 上述映射屬於「高機率」而非硬規則，必須保留可覆寫空間。
 - 若同案實測/驗證顯示對應不同，實測優先並回寫案內 mapping。
 
 ### 交付格式提醒
-- 產生 `-pre.ini` 階段通常不強填 display name。
-- display name 建議在 machine B 驗證後回填，避免先驗假設造成誤標。
+- 有可靠 BIOS/圖證據時，先持久化為 project-scoped hints artifact，再由 generator 在產生 split INI 與 `-pre.ini` 時 deterministic 套用 display name。
+- Machine-B 驗證不是 name backfill 的必要前置；不得直接手改生成後 INI。證據不足時才保留空白/候選並標記 ambiguity。
 
 ## 規則 R-005：BIOS 數值用途分層（Reference Only）
 
 ### 可做
 - BIOS 即時值（溫度/電壓/RPM）可作為後續驗證比對基準（容差比對）。
+- 讀圖時要一併記錄可見的即時值（V/mV、C、RPM）：給模型的規則在 `prompts/bios_reading.md`；程式解析後存入 `<PROJECT>-bios-image-cache.json` 的 `voltage_value_hints` / `temperature_value_hints` / `fan_value_hints`。
 
 ### 不可做
 - 不可用 BIOS 當下數值推導 ini channel 編碼。
@@ -140,13 +141,12 @@
 - 已有 `vision_analyze` 或人工讀值可得到明確字串，且可唯一判讀。
 
 ### 回填規則
-1. 單一值且高可讀性：
-  - 直接回填到輸出 ini 的 `[Information]`。
-2. 多張 BIOS 圖讀到同值：
-  - 視為一致，回填該值。
-3. 多張 BIOS 圖讀到不一致值：
+1. 來源優先序：full probe `BOARD_PLATFORM_REV_VAL` / `BOARD_BIOS_REVISION_STR` > BIOS 圖 fallback > project/spec fallback。
+2. probe 值存在時必須使用 probe，不得由 BIOS 圖覆寫。
+3. probe 缺值且 BIOS 圖單一值、高可讀性，或多張圖讀到同值時，才回填輸出 INI 的 `[Information]`。
+4. 多張 BIOS 圖讀到不一致值：
   - 不回填，標記 `AMBIGUOUS_INFO_HEADER`（含衝突欄位名）。
-4. 字串不完整或 `vision_analyze` 信心不足：
+5. 字串不完整或 `vision_analyze` 信心不足：
   - 不回填，標記 `AMBIGUOUS_INFO_HEADER`。
 
 ### 不可由 BIOS 圖推導的欄位
@@ -159,26 +159,28 @@
 - R-008 僅負責 `[Information]` header 補值，不參與 section/item 候選過濾。
 - 不可用 `PlatformVersion` / `BIOSVersion` 直接刪除或新增 `HWM/SMBus/I2C/VGA` 項目。
 
-## 規則 R-009：spec.json 與 BIOS 衝突時的優先序（後處理裁決）
+## 規則 R-009：spec.json 與 BIOS 的後處理優先序
 
 ### 適用情境
 - 本流程以「DB query 候選」作為 input，進入 BIOS/圖面後處理時，`spec.json` 與 BIOS 圖判讀結果出現衝突。
 
 ### 裁決原則
-1. **BIOS 優先（最高優先）**
-  - 若 BIOS 可清楚讀到項目存在性或名稱（含 `+5V` / `+5VSB` 這類可明確區分字串），以 BIOS 為準。
-2. **spec.json 次優先**
-  - 僅在 BIOS 無法清楚判讀、或該項在 BIOS 圖未出現時，才採用 spec.json。
-3. **DB 候選為基底**
-  - DB query 結果僅提供候選集合，需經 BIOS/spec 後處理裁切，不可直接視為最終輸出。
+1. **HWM section/item：BIOS 優先（使用者決策 1B）**
+  - `HWM.Voltage/Current/Temperature/Fan/Fan.Control/CaseOpen` 的存在性與 item 白名單由完成分析的可用 BIOS Hardware Monitor evidence 決定。
+  - spec 即使明確 true、false、空 list 或非空 list，都只作 intent/衝突 trace；不得強迫新增 BIOS 未顯示的 HWM section/item，也不得阻止 BIOS 已顯示的 HWM section/item。
+2. **非 HWM section：不得用 BIOS 缺席裁決**
+  - SMBus、I2C、VGA、WDT、GPIO、StorageArea、ThermalProtect 等依各自 spec/probe/DB/電路圖 gate；BIOS Hardware Monitor 畫面未出現它們是正常現象。
+3. **DB 候選為基底，不是存在性真相**
+  - DB row 只提供可套用的 tuple 候選；HWM 仍需經 BIOS 白名單裁切，非 HWM 則依其專屬規則裁切。
+4. **BIOS 不推導 tuple**
+  - BIOS 可決定 HWM section/item 與 Name/alias，但不得自行推導 channel/hwid/io_port/option。
 
 ### 衝突處理
-- `spec.json` 與 BIOS 互斥時：
-  - 採 BIOS 判讀結果。
-  - 記錄衝突標記：`SPEC_BIOS_CONFLICT_BIOS_WINS`（含欄位名與兩邊值）。
+- HWM 的 spec 與 BIOS 互斥時：依 BIOS 結果產生/剔除，並記錄 `SPEC_BIOS_HWM_CONFLICT_BIOS_WINS` 與兩邊 evidence。
+- 非 HWM 的 spec 與 BIOS 互斥時：不得套用此 HWM 優先規則，回到該 section 專屬 gate。
 
 ### 邊界與限制
-- R-009 的「BIOS 優先」僅適用於本規則已允許的層級（功能存在性、名稱/alias 對應、displayname 回填）。
+- BIOS 圖缺失、不可讀或尚未完成 scoped analysis 時，不得把「無 evidence」誤寫成「BIOS 明確未顯示」；應標記 pending/ambiguous，且不產生正式 HWM section。
 - 不得據此跳過電路圖/實測層去硬推 channel/hwid/ioport。
 
 ## 規則 R-010：spec.json 中「舉例語意」內容一律不作為裁決依據
@@ -212,29 +214,30 @@
 - 使用者可能以多種自然語言表達「舉例」，判讀時採語意優先，不侷限固定字串。
 - 若無法確定是否為舉例語意，標記 `SPEC_TEXT_AMBIGUOUS`，避免誤採信。
 
-## 規則 R-011：HWM.Current / HWM.CaseOpen 的 BIOS 缺席即剔除（特例）
+## 規則 R-011：HWM.Current / HWM.CaseOpen BIOS gate
 
 ### 適用情境
 - DB query 已回傳 `HWM.Current` 或 `HWM.CaseOpen` 候選。
-- 進入 BIOS 圖後處理階段。
+- 已完成可用 BIOS Hardware Monitor / PC Health 畫面分析。
 
 ### 裁決原則
-- 由於 `HWM.Current` 與 `HWM.CaseOpen` 在本流程中缺乏可行驗證路徑，採保守剔除策略：
-  - 若 BIOS 圖未顯示對應項目，則從後續輸出 ini 移除該 section 候選資訊。
+- DB tuple、generic `hardware_monitor=true` 或 spec 勾選都不足以單獨啟用這兩個 subsection。
+- BIOS 顯示 Current/Ampere 項目才產生 `HWM.Current`；BIOS 顯示 Case Open/Chassis Intrusion 項目才產生 `HWM.CaseOpen`。
+- BIOS 有對應項目時，即使 spec 漏勾或空 list，仍可由 BIOS evidence 啟用。
+- BIOS 沒有對應項目時，即使 spec 已勾選，仍標記 `SKIPPED_NOT_APPLICABLE`，移除 stale split/config artifacts，且不進 validation manifest/fallback。
 
 ### 對應項目線索（BIOS）
 - `HWM.Current`：Current / Ampere / A 等電流監控項。
 - `HWM.CaseOpen`：Case Open / Chassis Intrusion / Chassis Open Warning 類項目。
 
 ### 執行動作
-1. BIOS 有對應項目：可保留候選（仍屬低信心，待後續能力補證）。
-2. BIOS 無對應項目：
-   - 移除 `HWM.Current` 候選輸出。
-   - 移除 `HWM.CaseOpen` 候選輸出。
-   - 記錄標記：`FILTERED_BY_BIOS_NO_CURRENT_CASEOPEN_EVIDENCE`。
+1. 先讀 completed BIOS evidence，再用 spec 只記錄 intent/衝突。
+2. BIOS evidence 成立才查詢/產生正式 section。
+3. applicability 不成立時，先前錯誤生成造成的 API failure 不得觸發 route fallback。
 
 ### 邊界
-- 本規則僅為 `HWM.Current` / `HWM.CaseOpen` 特例，不外推至其他 section。
+- 本規則是 R-002/R-009 的 Current/CaseOpen 明確化；其他 HWM sections 同樣由 BIOS gate，但使用各自 label/evidence parser。
+- 非 HWM sections 不套用本規則。
 
 ## 規則 R-012：Block Diagram 可用證據範圍與處理動作
 
@@ -266,7 +269,9 @@
 - R-012 僅負責第一層候選保留/降權與風險標記。
 - 最終裁決仍由 BIOS（R-003/R-009）與電路圖 net-level 證據（R-007）處理。
 
-## 規則 R-013：AIMB + NCT6126D 的 V5SB->3.3V 特例改名規則（需電路圖強證據）
+## 規則 R-013：AIMB + NCT6126D 的 V5SB 實際量測 +3.3V 特例（需電路圖強證據）
+
+> **適用範圍：只適用 SIO（`NCT61**D*`）。** EC 與 EIO-300 / `NCT6694B*` 複合晶片的 HWM.Voltage 走 DB 路線，不看分壓圖（orchestrator 9.1）。
 
 ### 背景
 - `ProductChip = (AIMB, NCT6126D)` 時，DB 的 `HWM.Voltage` 常態候選通常包含 `V5SB`，這在多數 AIMB 平台是正確設計。
@@ -284,27 +289,29 @@
 - 必須可在 net-level 圖面同時建立以下關聯：
   1. `VIN0/ATX_5VSB` pin 對應到某輸入網（例：`SIO_+V3.3IN`）
   2. 該輸入網經分壓/連線來源可追溯到 `+V3.3`（或 `3V3`）
-- 僅有 block diagram、僅有 BIOS 名稱、或僅有口述描述，皆不足以觸發本改名。
+- 僅有 block diagram、僅有 BIOS 名稱、或僅有口述描述，皆不足以觸發本 key rename 特例。
+- 強證據需持久化為 structured route hint，例如 `voltage_route_hints[{source_item: V5SB, actual_rail: +3.3V, evidence_level: NET_LEVEL_CONFIRMED}]`，讓 Python 可 deterministic 驗證；不可只靠自由文字臨時改 INI。
 
-### 執行動作（命中特例時）
-1. 不刪除 DB 的 `V5SB` 這筆候選（保留底層 mapping 連續性）。
-2. 在 alias/display-name 回填階段，將該筆以 `V33` 語意輸出：
-   - item 名稱由 `V5SB` 改為 `V33`
-   - 將 BIOS 擷取到的 `+3.3V`（或等價別名）填入該 item 的 alias/display name。
-3. 記錄可追溯標記：
+### 執行動作（命中特例時，使用者決策 2B）
+1. 若 DB 只有 `V5SB` mapping，保留原 tuple/channel，但將正式輸出 INI key/item identity 由 `V5SB` 改為 `V33`。
+2. 將 BIOS 擷取到的 `+3.3V`（或等價別名）填入 `V33` 的 Name/alias。
+3. 若 DB 同一 channel 已同時存在 `V33` 與 `V5SB` duplicate rows，保留既有 `V33` row、刪除同 channel 的 `V5SB` row，避免輸出 duplicate key。
+4. alias bridge 記錄 `item_name_override=V33` 與可追溯標記：
    - `AIMB_NCT6126D_V5SB_RENAMED_TO_V33_BY_SCHEMATIC`
 
 ### 未命中特例時（預設路徑）
 - 若缺少電路圖、或電路圖無法證明 `VIN0 -> 3.3V`：
-  - 不改名
+  - 不改 key 或 Name/alias
   - 不刪除 `V5SB`
   - 維持 DB 常態輸出（`V5SB`）
 
 ### 風險控管
 - 本規則僅限 `(AIMB, NCT6126D)`，不外推到其他 ProductChip。
-- 若 BIOS 顯示 `+3.3V` 但沒有電路圖強證據，僅標記：`BIOS_DB_LABEL_MISMATCH_PENDING_SCHEMATIC`，避免誤改名。
+- 若 BIOS 顯示 `+3.3V` 但沒有 structured net-level 電路圖強證據，僅標記：`BIOS_DB_LABEL_MISMATCH_PENDING_SCHEMATIC`，不得改 key/alias。
 
 ## 規則 R-014：AIMB + NCT6106D（SuperIO，非 EC）之 HWM.Voltage 三路分壓重建（AIMB-205）
+
+> **適用範圍：只適用 SIO（`NCT61**D*`）。** EC 與 EIO-300 / `NCT6694B*` 複合晶片的 HWM.Voltage 走 DB 路線，不看分壓圖（orchestrator 9.1）。
 
 ### 背景
 - 本規則屬 **SuperIO（非 EC）** 案例。
@@ -351,6 +358,8 @@
   - 標記 `HWM_VOLTAGE_DIVIDER_EVIDENCE_INSUFFICIENT`
 
 ## 規則 R-015：AIMB + NCT6126D（SuperIO，非 EC）之 HWM.Voltage 三路去重與 alias 回填
+
+> **適用範圍：只適用 SIO（`NCT61**D*`）。** EC 與 EIO-300 / `NCT6694B*` 複合晶片的 HWM.Voltage 走 DB 路線，不看分壓圖（orchestrator 9.1）。
 
 ### 目的
 - 處理 `HWM.Voltage` 候選中「同一分壓 channel 被多個 item 佔用」的情況，
@@ -400,20 +409,20 @@
 1. 有證據才收斂
 - 能從 BIOS/圖面明確判讀出的訊號，才用於候選保留/過濾/降權。
 
-2. 看不到不等於不存在
-- 圖面未出現或無法判讀的項目，不做硬刪除；僅代表該區塊過濾效果有限。
-- 需標記 `AMBIGUOUS_BIOS_ITEMS`（或等價狀態）供後續人工/實測補證。
-- 例外：`HWM.Current` / `HWM.CaseOpen` 依 R-011 可在 BIOS 缺席時直接剔除。
+2. BIOS 缺席的語意依 section 類型分流
+- 對已完成且可讀的 BIOS Hardware Monitor 頁面，某類 `HWM.*` item 未顯示即不產生該 HWM section/item（R-002/R-009，決策 1B）。
+- 對非 HWM sections，BIOS 未出現是正常現象，不可由缺席硬刪；回到該 section 的 spec/probe/DB/電路圖規則。
+- BIOS 圖缺失、不可讀或 analysis 未完成時，標記 pending/ambiguous，不得把缺證據冒充為明確缺席，也不得正式產生 HWM section。
 
 3. 分層裁決
-- BIOS 圖：功能存在性與項目白名單（第一層）。
+- BIOS 圖：HWM section/item 存在性與名稱白名單（第一層）。
 - 電路圖/實測：路由、通道數、channel/hwid/io_port 最終裁決（第二層）。
 
 4. 保守優先
-- 在證據不足情況下，寧可暫留候選進後續驗證，也不要提早誤殺。
+- HWM 證據不足時不產生正式 section，保留 pending 狀態；非 HWM 證據不足時依其專屬規則保留候選或 pending，不跨層猜測。
 
 ## 備註
-- 目前先落地分析規則七條（R-001~R-007），後續可逐條擴充（R-008...）。
+- 目前已落地分析規則十九條（R-001~R-019）；後續新增規則時延續編號。
 - 建議在最終報告中記錄：
   - 觸發證據（BIOS 圖哪一張、擷取到的 CPU 字串/項目列表）
   - 實際執行結果（是否刪除 SMBus section、各 section 刪除哪些非 BIOS 項目）
@@ -421,62 +430,16 @@
 
 ## 規則 R-016：電路圖 net 追線優先於文字位置對齊
 
-### 目的
-- 避免因 signal label 與鄰近 pin/function label 在垂直方向接近，誤把訊號配到相鄰 GPIO。
-- 只適用於本次任務指定的目標 GPIO signal；包括 `EC_P*_GPIO*`、`SIO_GPIO*`、`EC_GP*` 的命名提示，不代表要把所有接到 `GP*` pin 的 signal 都納入。
-- `EC_P1_GPIO4` 僅是本規則的錯判示例，不是唯一或特殊的分析對象；`EC_P2_GPIO*`、`EC_P3_GPIO*` 等其他 port 也必須套用相同流程。
+> **適用範圍：SIO（`NCT61**D*`，起點 `SIO_GPIO*`）與 EIO-300 / `NCT6694B*` 複合晶片（起點 `EC_P*_GPIO*`）的 `[GPIO]`。** 其他 EC 的 GPIO 走 DB 路線，不追線（orchestrator 9.1）。
 
-### 常見適用 chip（經驗提示，非硬限制）
-- R-016 常見於 `NUVOTON_NCT6694B` / `EIO-300` 類案例（外部 signal 常見 `EC_P*_GPIO*` 命名）。
-- 但本規則不綁定型號；只要任務是 `signal -> pin -> function label` 的 net-level 追線，都必須套用。
+> **給模型看的判斷規則在 `prompts/gpio_trace.md`**（程式 `_auto_generate_gpio_trace` 執行時載入；要改追線規則請改那份檔案）。
+> 各晶片的起點訊號（`NCT6694B*`/`EIO-300*` → `EC_P*_GPIO*`、`NCT61**D*`/`NCT6776D*` → `SIO_GPIO*`、`EIO-211*` → `EC_GP*`）由程式 `_gpio_target_signal_pattern` 決定。
 
-### 判定優先序
-1. 實際 electrical wire 的連續路徑（水平線、垂直線、摺線、轉折）。
-2. junction、T-connection、pin endpoint 與 connector/net label 的連接關係。
-3. chip pin number 與該 pin 旁的 GPIO function label。
-4. signal label 的文字位置、字串相似度與上下排列順序，僅作候選定位，不得單獨裁決。
-
-### 分析範圍 Gate（先篩選，再追線）
-- 先依使用者指定的 signal pattern 建立 `target_signal_set`；只有在此集合中的 signal 才能進入後續 wire trace 與 mapping 輸出。
-- 使用者只說「分析 GPIO」而未指定 pattern 時，才依 chip-aware naming hint 選定預設 pattern；不可把多個 pattern 或所有含 `GPIO`/`GP*` 的 signal 聯集納入。
-- AIMB 的 `NCT6126D*`、`NCT6116D*`、`NCT6106D*`、`NCT6776D*` 預設目標為 `SIO_GPIO*`；本次分析只輸出 `SIO_GPIO* -> GP* function label`。這是預設搜尋入口，不是唯一合法命名。
-- `SIO_GPIO*`、`EC_GPIO*`、`EC_P*_GPIO*`、`EC_GP*` 都是合法的 GPIO external-signal pattern；實際採用哪一個，依使用者指定、chip hint 或圖面中與目標 chip 相連的命名證據決定。
-- 預設 pattern 找不到時，才搜尋上述替代 pattern；若只有一個替代 pattern 能與目標 chip 的 GPIO wire 形成一致集合，將它選為 `target_signal_set` 並記錄實際採用的 pattern。若有多個可能 pattern，標記 `GPIO_SIGNAL_SCOPE_AMBIGUOUS`，不可把它們聯集納入。
-- 其他 signal 即使實際接到 `GP*` pin，也屬 `OUT_OF_SCOPE`，不可納入本次 GPIO mapping；例如 `FAN_SPEED2`、`FAN2_PWM`、`SIO_ERR_BEEP`、`SIO_LED*`、`SIO_PORT80_SEL`。
-- 若使用者明確指定其他 signal pattern，使用者指定值優先於 chip-aware naming hint；若 scope 仍無法唯一決定，標記 `GPIO_SIGNAL_SCOPE_AMBIGUOUS`，不得擴大成全部 GPIO signal。
-
-### Chip-aware signal naming hint（搜尋入口，非 mapping 規則）
-- 依候選 chip identity 優先使用下列字串縮小 GPIO 搜尋範圍：
-  - `NCT6694B*` / `EIO-300*` -> `EC_P*_GPIO*`
-  - `NCT6126D*` / `NCT6116D*` / `NCT6106D*` / `NCT6776D*` -> `SIO_GPIO*`
-  - `EIO-211*` -> `EC_GP*`
-- 上述只是外部 signal 的命名提示；命中後仍必須依 R-016 追蹤實際 wire、pin endpoint 與 chip function label。
-- `SIO_GPIO*`、`EC_P*_GPIO*`、`EC_GP*` 都是外部 net label 候選，不可由 suffix/index 直接推導 `GPxx` function、package pin 或 mapping 順序。
-- 同一張圖可能有多顆 NCT/SIO/EC，命名提示不能單獨決定 GPIO owner；仍須依 R-018 判定實際功能來源。
-- 若候選 chip 使用其他 net 命名，或命名提示未命中，仍可搜尋 `GPIO`、`EC_GPIO`、`SIO_GPIO`、`EC_GP`、`GP*`、connector net 與 chip function label 作為候選定位；搜尋結果不能未經 scope 確認就加入 `target_signal_set`。
-
-### 必做追線流程
-1. 先完成分析範圍 Gate，建立並列出完整 `target_signal_set`。
-2. 若來源為電路圖 PDF，先用目標 signal pattern/關鍵字定位命中頁面與區域，再對每個命中區域做足以清楚辨識 wire、junction、pin number、function label 的高解析裁切；禁止直接以低解析整頁圖進行最終 mapping。
-3. 高解析裁切與頁碼/關鍵字索引必須保存在專案目錄供覆核，不可只放 `/tmp`；整頁 render 只能作定位，不能取代 focused crop。
-4. 對 `target_signal_set` 中的每一條 signal，從 signal label 或 BI/BO/IN/OUT 箭頭的實際 wire endpoint 開始。
-5. 沿 wire 逐段追蹤；遇到轉折時依 wire 的新方向繼續，不以文字所在的水平列代替連線。
-6. 遇到 junction 才視為分支；單純交叉但沒有 junction 的線不可視為相連。
-7. 追到 chip pin 後，記錄 pin number，再讀取該 pin 對應的完整 function label。
-8. 只對 `target_signal_set` 輸出一對一 mapping 表：`signal -> chip pin -> GPIO function label`；每一條目標 signal 都必須有結果或 ambiguity 標記，`OUT_OF_SCOPE` signal 不得出現在表內。
-9. 若 signal label 與 pin label 不在同一水平線，必須優先採用摺線後的實際 endpoint，並標記 `MAPPED_BY_WIRE_TRACE`。
-
-### 證據與錯誤防護
-- 只依連續 electrical wire、junction、net label 與 pin endpoint 判定；顏色、文字距離、上下排列與 OCR 座標不能單獨作為連線證據。
-- review/annotation 只有在依結構確認未連到 pin、junction 或 net endpoint 時才排除；不可依固定顏色判定。
-- X/NC 只有在附著於同一個 pin 或 wire endpoint，且 wire 在該處終止時，才能判定未連接；附近其他 pin 或 branch 的 X/NC 不影響 trace。
-- revision/review 文字只作背景資訊，不得改寫目前 wire trace；若它本身是直接接在線上的 net label，才可納入追線。
-- wire 被裁切、endpoint 不清，或無法區分 wire 與 annotation 時，標記 `GPIO_NET_TRACE_AMBIGUOUS`；若涉及 X/NC 衝突，加註 `reason=X_NC_MARKER_CONFLICT`，不得硬猜。
-
-### 完整性要求
-- 先列出 `target_signal_set` 的數量與完整清單。
-- 每條目標 signal 都必須有 mapping；若 pin 無法確認，列出並標記 `GPIO_NET_TRACE_AMBIGUOUS`。
-- `OUT_OF_SCOPE` signal 不得加入 mapping 表。
+### 重點摘要（給人看）
+- 只追目標 pattern 的外部訊號，先列出完整 `target_signal_set`；其他訊號一律 `OUT_OF_SCOPE`。
+- 沿實際 wire 追到晶片腳，答案是腳旁的 GPIO function label；文字位置、上下排列不是連線證據。
+- 讀 PDF 電路圖：先用關鍵字找出所有命中頁與區域，對每個區域做「看得清楚字」的高解析放大裁切再判讀；整頁圖只能用來定位，字太小時不可據以判定。裁切圖存在專案目錄。（Fan 配對、電壓分壓等其他電路圖分析同樣適用。）
+- 看不清楚就先放大重裁；放大後仍看不清楚才標 AMBIGUOUS，不猜。
 
 ### 驗證案例：ARK-1251
 - `EC_P1_GPIO4` 的文字位置接近 `ESPI_ALERT#/GPIOB3`，但實際 wire 先水平延伸、再向下摺線，最後接到 `F1`。
@@ -485,6 +448,8 @@
 - 錯誤 mapping `EC_P1_GPIO4 -> GPIOB3` 是由文字 Y 座標對齊造成，違反本規則的追線優先序。
 
 ## 規則 R-017：清楚 GPIO 圖面的 physical pin map 與 SUSI logical GPIO 分層
+
+> **適用範圍：SIO（`NCT61**D*`，起點 `SIO_GPIO*`）與 EIO-300 / `NCT6694B*` 複合晶片（起點 `EC_P*_GPIO*`）的 `[GPIO]`。** 其他 EC 的 GPIO 走 DB 路線，不追線（orchestrator 9.1）。
 
 ### 目的
 - 當電路圖直接顯示 GPIO group/port/pin function 與外部 net 的清楚接線時，建立可追溯的 physical pin mapping。
@@ -502,10 +467,7 @@
 1. 主要輸出先建立 signal 到 GPIO function label 的 mapping：
   - `external signal/net -> chip GPIO function label`
   - 只處理 R-016 `分析範圍 Gate` 通過的 `target_signal_set`；`OUT_OF_SCOPE` signal 不得進入 mapping 表。
-2. 若 function label 可拆成 group/port/pin，必須正規化並作為主要結果：
-  - `GPIO34` 或 `GP34` -> `group 3, pin 4`
-  - `GPIO71` 或 `GP71` -> `group 7, pin 1`
-  - 這只是 label 正規化；signal 是否真的接到該 function，仍依 R-016 追線判定。
+2. function label 正規化成 group/pin（含十六進位 group，例：`GPIOB0` → 11,0）：給模型的規則在 `prompts/gpio_trace.md`，程式另以 `_parse_gpio_function_label` 解析並覆蓋。group/pin 只能由 function label 解出，不可由外部訊號後綴推導。
 3. chip package pin number（例如 `L6`、`M6`、`A12`）只作追線證據/除錯欄位，不是主要 GPIO mapping 結果；若圖面可讀，才附加記錄。
 4. 再輸出 SUSI logical mapping（若 form/JSON 有 GPI/GPO 項目）：
   - `logical GPI0/GPO0 -> normalized group/pin`（只有在 wire/order/文件證據支持時才能建立）
@@ -523,6 +485,7 @@
 - 若 form/JSON 只有 `index`、`direction`、`location`，但沒有 physical pin，標記 `LOGICAL_GPIO_WITHOUT_PHYSICAL_PIN_MAP`。
 - 若電路圖提供 physical map，應保留原始 logical 欄位，並新增 physical 欄位；不可因圖面結果覆寫原始需求資料。
 - 若 logical index 與 physical pin 的一對一順序無明確證據，標記 `LOGICAL_PHYSICAL_GPIO_MAPPING_AMBIGUOUS`，不得默認 index 順序相同。
+- 例外（使用者規則）：`NCT6694B*` 與 SIO `NCT61**D*` 的電路圖路線，INI key 一律依訊號順序編為 `GPIO00`、`GPIO01`…（由程式編號，見 orchestrator 10.4），不需另外的 logical 對照，也不因需求表只列部分項目而停止。
 
 ## 規則 R-018：功能來源 chip 必須由 net-level 證據確認
 
@@ -571,12 +534,14 @@
 
 ## 規則 R-019：FAN IN/OUT 配對判讀（先分析再判定）
 
+> **適用範圍：只適用 SIO（`NCT61**D*`）。** EC 與 EIO-300 / `NCT6694B*` 複合晶片不做 Fan 配對、不產生 `fan-pairing.json`；它們的 Fan / Fan.Control 由 DB + probe + BIOS 產生（orchestrator 9.1、10.7）。
+
 ### 目的
 - 為 `[HWM.Fan]` / `[HWM.Fan.Control]` 提供可機器化的配對結果。
 - 僅處理「可由圖證確認」的配對，不做 naming 猜測。
 
 ### 分析範圍
-- 優先：`circuit*.png`。
+- 優先：`circuit*.png|jpg|jpeg`。
 - 證據不足時：追加 `circuit*.pdf`（尤其 fan control 頁）做交叉確認。
 - 命名提示可包含：`FAN_SPEED*`、`FAN_TACH*`（IN）與 `*_PWM`（OUT），但最終必須回到 net-level 連線判定。
 
@@ -585,6 +550,7 @@
 2. 再找 OUT 路徑：`*_PWM` -> `*FANOUT*` 或等價 fan control 輸出鏈。
 3. 以同一路徑/同一控制群組建立 IN/OUT pairing。
 4. 全部配對完成後才判定是否 one-to-one；不可前置假設 one-to-one。
+5. 一對多（多個風扇共用同一組 PWM 控制）時，會另外提供 Fan Control 電路圖；從該圖判斷哪幾個風扇共用同一個控制來源，共用者的 `control_idx_candidate` 相同。
 
 ### 訊號採信範圍（FAN）
 - `[HWM.Fan]` 主訊號僅採 `*FAN_TACH*` / `*FAN_SPEED*`（IN 端證據）。
@@ -594,6 +560,7 @@
 ### 輸出契約
 - 必輸出：`fanin_label`、`fanin_signal`、`fanout_signal`、`fanin_idx_candidate`、`control_idx_candidate`。
 - `fanin_idx_candidate` 的語意順序可用：`CPU -> 0`、`SYS -> 1`、`AUX0 -> 2`、`AUX1 -> 3`（僅在圖證支持時）。
+- idx 是 SUSI 的 fan 順序，**不是**晶片腳的功能編號：圖上的 `TA4`、`PWM4`、`FANIN2` 這類數字不可直接當成 idx。
 - `control_idx_candidate` 依實際 PWM 控制來源網分組，不得由 connector 數量直接推定。
 - 檔名/頁碼/截圖座標屬於選配除錯欄位；平常流程非必填。
 

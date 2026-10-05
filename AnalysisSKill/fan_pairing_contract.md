@@ -1,5 +1,8 @@
 # HWM.Fan / HWM.Fan.Control 最小 JSON 契約
 
+> **本檔只描述 `fan-pairing.json` 的格式。** 何時需要、怎麼判斷一對一或一對多，見 `bios_circuit_image_analysis_rule.md` R-019 與 `orchestrator_skill.md` 10.7。
+> **只有 SIO（`NCT61**D*`）需要這個檔。** EC 與 EIO-300 / `NCT6694B*` 複合晶片不產生；就算存在，程式也會忽略。
+
 目的
 - 給 vision 分析「直接回傳可落地」的最小 JSON。
 - `build_fan_pairing.py` 會把各種輸入形狀正規化成這個最小格式。

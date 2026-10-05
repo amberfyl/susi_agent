@@ -102,8 +102,41 @@ class MachineBI2CContractTests(unittest.TestCase):
             [row["report_name"] for row in result["rows"]],
             ["I2C_EXTERNAL", "I2C_OEM0"],
         )
-        self.assertEqual(result["i2c_probe_oem_ids"], [0])
         self.assertEqual(result["i2c_skipped_oem_ids"], [2, 3])
+
+    def test_generator_never_composes_i2c_channels_from_probe(self):
+        # Values come only from DB rows; the probe may only remove rows.
+        db_result = {
+            "status": "FOUND",
+            "rows": [{"channel": "", "hardware_id": "0x12345678"}],
+        }
+        probe_spec = {
+            "i2c_buses": [
+                {"name": "I2C_OEM0", "id": 0, "probe_id": 1},
+                {"name": "I2C_OEM1", "id": 1, "probe_id": 2},
+            ]
+        }
+        spec = {"features": {"i2c": True}}
+        with patch.object(generator, "query_section", return_value=db_result):
+            result = generator._build_i2c_query_result(
+                Path("unused.db"), "MIO", "EIO-211", probe_spec, spec
+            )
+
+        self.assertEqual(result["rows"], [])
+        self.assertEqual(result["status"], "SECTION_EMPTY")
+        self.assertNotIn("i2c_probe_oem_ids", result)
+
+    def test_generator_keeps_section_empty_when_db_has_no_i2c_rows(self):
+        db_result = {"status": "SECTION_EMPTY", "rows": [], "row_count": 0}
+        probe_spec = {"i2c_buses": [{"name": "I2C_OEM0", "id": 0, "probe_id": 1}]}
+        spec = {"features": {"i2c": True}}
+        with patch.object(generator, "query_section", return_value=db_result):
+            result = generator._build_i2c_query_result(
+                Path("unused.db"), "MIO", "EIO-211", probe_spec, spec
+            )
+
+        self.assertEqual(result["status"], "SECTION_EMPTY")
+        self.assertEqual(result["rows"], [])
 
     def test_runner_and_common_wrapper_cover_pure_software_checks(self):
         runner = RUNNER_PATH.read_text(encoding="utf-8")
