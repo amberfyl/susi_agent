@@ -133,7 +133,7 @@ def make_contract(root):
     )
 
 
-def section_plan(section, prefix, runner, config, *, dependencies=(), opt_ins=(), extra=()):
+def section_plan(section, prefix, runner, config, *, dependencies=(), opt_ins=(), enabled=(), extra=()):
     return {
         "sequence": 1,
         "section": section,
@@ -142,7 +142,7 @@ def section_plan(section, prefix, runner, config, *, dependencies=(), opt_ins=()
         "report_prefix": prefix,
         "section_dependencies": list(dependencies),
         "available_opt_in_switches": list(opt_ins),
-        "enabled_switches": [],
+        "enabled_switches": list(enabled),
         "extra_path_arguments": list(extra),
     }
 
@@ -180,9 +180,311 @@ class SummaryTests(unittest.TestCase):
 
             self.assertEqual(summary["status"], "SECTION_FAIL")
             text = contract.outputs.summary_text.read_text(encoding="utf-8")
-            self.assertIn("PARTIAL_FAIL 1/2 passed", text)
+            self.assertIn("Status: [SECTION_FAIL]  (exit code 1)", text)
+            self.assertIn("  [FAIL]  VGA.Backlight  PARTIAL_FAIL 1/2 passed", text)
             self.assertIn("passed=[Backlight1]", text)
             self.assertIn("failed=[Backlight2(0xFFFFFCFF)]", text)
+
+    def test_text_summary_lists_section_report_paths(self):
+        from run_machineB_full_validation import write_validation_summary
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            report = contract.outputs.reports_dir / "wdt_1.json"
+            write_validation_summary(
+                contract,
+                runtime_ini={"status": "PASS"},
+                reload_result={"status": "PASS"},
+                section_results=[{
+                    "section": "WDT",
+                    "execution_status": "COMPLETED",
+                    "verdict": "PASS",
+                    "reason": "ok",
+                    "local_report_path": str(report),
+                }],
+                rollback={"status": "PASS"},
+                errors=[],
+                warnings=[],
+            )
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("Details:", text)
+            self.assertIn("- WDT: reports/wdt_1.json", text)
+
+
+def layers(l1="PASS", l2="PASS", l3="PASS", l4="PASS", l5="PASS", l6="N_A"):
+    return {
+        "L1_configuration": l1,
+        "L2_capability": l2,
+        "L3_api": l3,
+        "L4_readback": l4,
+        "L5_functional": l5,
+        "L6_recovery": l6,
+    }
+
+
+class Phase1VerdictTests(unittest.TestCase):
+    def verdict(self, result, validation_layers):
+        from run_machineB_full_validation import _normalize_report_verdict
+
+        report = {"result": result, "validation_layers": validation_layers}
+        return _normalize_report_verdict(report)[0]
+
+    def test_sw_layers_pass_is_pass_even_without_fixture(self):
+        self.assertEqual(self.verdict("CONDITIONAL", layers(l5="CONDITIONAL")), "PASS")
+        self.assertEqual(self.verdict("CONDITIONAL", layers(l5="PENDING_FIXTURE")), "PASS")
+
+    def test_phase2_only_failure_does_not_fail_phase1(self):
+        self.assertEqual(self.verdict("FAIL_FUNCTIONAL", layers(l5="FAIL")), "PASS")
+        self.assertEqual(self.verdict("FAIL_FIXTURE", layers(l5="FAIL_FIXTURE")), "PASS")
+
+    def test_unexercised_api_path_is_conditional(self):
+        # WDT: readback not exercised; Fan.Control without -AllowControl.
+        self.assertEqual(self.verdict("CONDITIONAL", layers(l4="CONDITIONAL")), "CONDITIONAL")
+        self.assertEqual(
+            self.verdict("BLOCKED_SAFETY", layers(l2="NOT_REQUIRED", l3="PENDING", l4="PENDING")),
+            "CONDITIONAL",
+        )
+
+    def test_write_path_sections_count_functional_write_as_phase1(self):
+        from run_machineB_full_validation import _normalize_report_verdict
+
+        def verdict(section, result, validation_layers):
+            report = {"category": section, "result": result, "validation_layers": validation_layers}
+            return _normalize_report_verdict(report)[0]
+
+        for section in ("VGA.Backlight", "VGA.Brightness", "GPIO", "StorageArea"):
+            with self.subTest(section=section):
+                self.assertEqual(verdict(section, "PASS", layers(l5="PASS", l6="PASS")), "PASS")
+                self.assertEqual(verdict(section, "FAIL_FUNCTIONAL", layers(l5="FAIL", l6="PASS")), "FAIL")
+                self.assertEqual(verdict(section, "PASS", layers(l5="CONDITIONAL")), "CONDITIONAL")
+        # Fan.Control: RPM response needs a fan, so L5 stays phase 2.
+        self.assertEqual(
+            verdict("HWM.Fan.Control", "FAIL_FUNCTIONAL", layers(l5="FAIL", l6="PASS")), "PASS"
+        )
+
+    def test_sw_failure_or_failed_restore_is_fail(self):
+        self.assertEqual(self.verdict("FAIL_API", layers(l3="FAIL")), "FAIL")
+        self.assertEqual(self.verdict("FAIL_READBACK", layers(l6="FAIL")), "FAIL")
+        self.assertEqual(self.verdict("FAIL_API", layers()), "FAIL")
+
+    def test_summary_lists_phase2_recommendations(self):
+        from run_machineB_full_validation import write_validation_summary
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            summary = write_validation_summary(
+                contract,
+                runtime_ini={"status": "PASS"},
+                reload_result={"status": "PASS"},
+                section_results=[
+                    {"section": "HWM.Voltage", "execution_status": "COMPLETED", "verdict": "PASS",
+                     "reason": "read ok", "validation_layers": layers(l5="CONDITIONAL")},
+                    {"section": "WDT", "execution_status": "COMPLETED", "verdict": "CONDITIONAL",
+                     "reason": "start not run", "validation_layers": layers(l4="CONDITIONAL", l5="CONDITIONAL")},
+                    {"section": "VGA.Backlight", "execution_status": "COMPLETED", "verdict": "PASS",
+                     "reason": "toggle ok", "validation_layers": layers(l6="PASS")},
+                    {"section": "GPIO", "execution_status": "COMPLETED", "verdict": "FAIL",
+                     "reason": "read failed", "validation_layers": layers(l3="FAIL", l5="PENDING")},
+                ],
+                rollback={"status": "PASS"},
+                errors=[],
+                warnings=[],
+            )
+
+            sections = [entry["section"] for entry in summary["phase2_recommendations"]]
+            self.assertEqual(sections, ["HWM.Voltage", "WDT"])
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("Scope: Phase 1", text)
+            self.assertIn("Phase 2 recommendations (hardware / fixture / DQA):", text)
+            self.assertIn("- HWM.Voltage: Apply load stimulus", text)
+            self.assertIn("- WDT: Let the watchdog expire", text)
+
+
+class SectionReasonTests(unittest.TestCase):
+    def test_phase1_headline_and_phase2_observation_are_separated(self):
+        from run_machineB_full_validation import _section_reason, write_validation_summary
+
+        report = {
+            "reason": "RPM response too small on FCPU (delta=0, min=200).",
+            "sw_reason": "PWM set/readback/restore passed on FCPU (30/50/70%)",
+        }
+        headline, observation = _section_reason(report, "PASS")
+        self.assertEqual(headline, "PWM set/readback/restore passed on FCPU (30/50/70%)")
+        self.assertEqual(observation, "RPM response too small on FCPU (delta=0, min=200).")
+        # A failing section keeps the runner's own reason.
+        self.assertEqual(_section_reason(report, "FAIL"), (report["reason"], None))
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            write_validation_summary(
+                contract,
+                runtime_ini={"status": "PASS"},
+                reload_result={"status": "PASS"},
+                section_results=[{
+                    "section": "HWM.Fan.Control",
+                    "execution_status": "COMPLETED",
+                    "verdict": "PASS",
+                    "reason": headline,
+                    "phase2_observation": observation,
+                    "validation_layers": layers(l5="FAIL", l6="PASS"),
+                }],
+                rollback={"status": "PASS"},
+                errors=[],
+                warnings=[],
+            )
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("[PASS]  HWM.Fan.Control  PWM set/readback/restore passed", text)
+            self.assertIn(
+                "- HWM.Fan.Control: Attach fans and confirm RPM rises with PWM "
+                "(expected delta >= 200 RPM). Observed: RPM response too small",
+                text,
+            )
+
+
+class FallbackFinalSummaryTests(unittest.TestCase):
+    def _baseline(self, contract):
+        from run_machineB_full_validation import write_validation_summary
+
+        reports = contract.outputs.reports_dir
+        return write_validation_summary(
+            contract,
+            runtime_ini={"status": "PASS"},
+            reload_result={"status": "PASS"},
+            section_results=[
+                {
+                    "section": "SMBus",
+                    "execution_status": "COMPLETED",
+                    "verdict": "CONDITIONAL",
+                    "result": "CONDITIONAL_FIXTURE",
+                    "reason": "fixture not enabled",
+                    "local_report_path": str(reports / "smbus_1.json"),
+                },
+                {
+                    "section": "GPIO",
+                    "execution_status": "COMPLETED",
+                    "verdict": "FAIL",
+                    "result": "FAIL_API",
+                    "reason": "GPIO capability or initial read failed.",
+                    "local_report_path": str(reports / "gpio_1.json"),
+                },
+            ],
+            rollback={"status": "PASS"},
+            errors=[],
+            warnings=[],
+        )
+
+    def _convergence(self, contract, *, status, attempts):
+        run_root = contract.outputs.run_root
+        return {
+            "schema_version": "machineb.fallback_convergence.v1",
+            "status": status,
+            "sections": [{
+                "section": "GPIO",
+                "status": status,
+                "selected_route": "0x2E" if status == "CONVERGED" else None,
+                "attempts": attempts,
+            }],
+            "formal_convergence": {
+                "status": "APPLIED" if status == "CONVERGED" else "NO_CHANGE",
+                "override_path": str(Path(contract.inputs.full_ini).parent / "BOARD-config-overrides.json"),
+                "override": {"sections": {"GPIO": {"route_field": "IOPort/Address"}}},
+            },
+            "final_runtime_recovery": {"status": "PASS"},
+            "output_path": str(run_root / "fallback-convergence.json"),
+        }
+
+    def _attempt_report(self, contract, index, result, reason):
+        path = (
+            contract.outputs.run_root / "fallback" / "gpio"
+            / f"attempt-{index:03d}" / "reports" / f"gpio_{index}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"category": "GPIO", "result": result, "reason": reason}
+        path.write_text(json.dumps(payload), encoding="utf-8-sig")
+        return str(path)
+
+    def test_converged_section_replaces_baseline_result_in_final_summary(self):
+        from run_machineB_full_validation import finalize_summary_after_fallback
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            contract.inputs = SimpleNamespace(full_ini=Path(td) / "BOARD-pre.ini")
+            self._baseline(contract)
+            attempts = [
+                {"index": 1, "success": False, "route_value": "0",
+                 "report_path": self._attempt_report(contract, 1, "FAIL_API", "read failed")},
+                {"index": 2, "success": True, "route_value": "0x2E",
+                 "changed_keys": ["GPIO00", "GPIO01"],
+                 "report_path": self._attempt_report(contract, 2, "PASS", "GPIO read validation passed")},
+            ]
+            convergence = self._convergence(contract, status="CONVERGED", attempts=attempts)
+
+            summary = finalize_summary_after_fallback(contract, convergence)
+
+            self.assertEqual(summary["status"], "PASS")
+            self.assertEqual(summary["exit_code"], 0)
+            gpio = next(item for item in summary["sections"] if item["section"] == "GPIO")
+            self.assertEqual(gpio["verdict"], "PASS")
+            self.assertEqual(gpio["reason"], "GPIO read validation passed")
+            self.assertEqual(gpio["local_report_path"], attempts[1]["report_path"])
+            self.assertEqual(gpio["fallback"]["status"], "CONVERGED")
+            self.assertEqual(gpio["fallback"]["baseline_verdict"], "FAIL")
+            self.assertEqual(gpio["fallback"]["winning_attempt"], 2)
+            self.assertEqual(summary["fallback"]["status"], "CONVERGED")
+
+            baseline_json = contract.outputs.run_root / "BOARD-machineB-summary.baseline.json"
+            baseline = json.loads(baseline_json.read_text(encoding="utf-8"))
+            self.assertEqual(baseline["status"], "SECTION_FAIL")
+
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("Status: [PASS]", text)
+            self.assertIn("Result: 1 CONDITIONAL / 1 PASS", text)
+            self.assertRegex(text, r"\n  \[PASS\] +GPIO +GPIO read validation passed")
+            self.assertIn("fallback CONVERGED", text)
+            self.assertIn("(baseline was FAIL)", text)
+            self.assertIn("IOPort/Address=0x2E", text)
+            self.assertIn("- GPIO: fallback/gpio/attempt-002/reports/gpio_2.json", text)
+            self.assertIn("fallback-convergence.json", text)
+            self.assertIn("BOARD-machineB-summary.baseline.txt", text)
+
+            # Re-finalizing must merge onto the preserved baseline, not the merged summary.
+            again = finalize_summary_after_fallback(contract, convergence)
+            self.assertEqual(again["status"], "PASS")
+            baseline = json.loads(baseline_json.read_text(encoding="utf-8"))
+            self.assertEqual(baseline["status"], "SECTION_FAIL")
+
+    def test_exhausted_fallback_keeps_baseline_failure_and_records_attempts(self):
+        from run_machineB_full_validation import finalize_summary_after_fallback
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            contract.inputs = SimpleNamespace(full_ini=Path(td) / "BOARD-pre.ini")
+            self._baseline(contract)
+            attempts = [
+                {"index": 1, "success": False, "route_value": "0",
+                 "report_path": self._attempt_report(contract, 1, "FAIL_API", "read failed")},
+            ]
+            convergence = self._convergence(
+                contract, status="ALL_CANDIDATES_FAILED", attempts=attempts
+            )
+
+            summary = finalize_summary_after_fallback(contract, convergence)
+
+            self.assertEqual(summary["status"], "SECTION_FAIL")
+            gpio = next(item for item in summary["sections"] if item["section"] == "GPIO")
+            self.assertEqual(gpio["verdict"], "FAIL")
+            self.assertEqual(gpio["fallback"]["attempt_count"], 1)
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("fallback ALL_CANDIDATES_FAILED after 1 attempt(s)", text)
+
+    def test_missing_baseline_summary_returns_none(self):
+        from run_machineB_full_validation import finalize_summary_after_fallback
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            contract.inputs = SimpleNamespace(full_ini=Path(td) / "BOARD-pre.ini")
+            convergence = self._convergence(contract, status="CONVERGED", attempts=[])
+            self.assertIsNone(finalize_summary_after_fallback(contract, convergence))
 
 
 class RuntimeActivationTests(unittest.TestCase):
@@ -259,6 +561,32 @@ class RunnerAndReportTests(unittest.TestCase):
             self.assertEqual(fan_control_args["FanConfigPath"], r"C:\config\fan.json")
             self.assertEqual(fan_control_args["FanIniPath"], contract.target.runtime_ini)
             self.assertTrue(all(Path(r["local_report_path"]).is_file() for r in results))
+
+    def test_passes_explicitly_enabled_allow_control_to_fan_control_runner(self):
+        from run_machineB_full_validation import execute_validation_sections
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            transport = FakePipelineTransport()
+            plans = [
+                section_plan("HWM.Fan", "hwm_fan", r"C:\\scripts\\fan.ps1", r"C:\\config\\fan.json"),
+                section_plan(
+                    "HWM.Fan.Control",
+                    "hwm_fan_control",
+                    r"C:\\scripts\\fancontrol.ps1",
+                    r"C:\\config\\fancontrol.json",
+                    dependencies=("HWM.Fan",),
+                    opt_ins=("AllowControl",),
+                    enabled=("AllowControl",),
+                    extra=("FanConfigPath", "FanIniPath"),
+                ),
+            ]
+
+            execute_validation_sections(contract, {"sections": plans}, transport)
+
+            invocations = [call for call in transport.calls if call[0] == "runner"]
+            self.assertIn("AllowControl", invocations[1][2])
+            self.assertTrue(invocations[1][2]["AllowControl"])
 
     def test_fan_sw_failure_blocks_control_but_independent_section_continues(self):
         from run_machineB_full_validation import execute_validation_sections

@@ -120,7 +120,7 @@ class ExecutionManifestTests(unittest.TestCase):
         )
         self.assertEqual(caught.exception.section, "HWM.Fan.Control")
 
-    def test_manifest_safety_policy_disables_every_opt_in_switch(self):
+    def test_manifest_enables_reversible_writes_and_keeps_fixture_switches_off(self):
         from run_machineB_full_validation import SECTION_REGISTRY, build_execution_manifest
 
         contract = self._build_contract(
@@ -128,24 +128,21 @@ class ExecutionManifestTests(unittest.TestCase):
         )
 
         manifest = build_execution_manifest(contract)
-        expected = sorted(
-            {
-                switch
-                for entry in SECTION_REGISTRY
-                for switch in entry.opt_in_switches
-            }
-        )
 
-        self.assertEqual(manifest["safety_policy"]["default"], "disabled")
-        self.assertEqual(manifest["safety_policy"]["enabled_opt_in_switches"], [])
+        policy = manifest["safety_policy"]
+        self.assertEqual(policy["default"], "phase1_reversible_writes_enabled")
         self.assertEqual(
-            manifest["safety_policy"]["disabled_opt_in_switches"], expected
+            policy["enabled_opt_in_switches"],
+            ["AllowControl", "EnableFunctionalTest", "EnableSetConfigTest", "EnableWriteTest"],
         )
-        self.assertTrue(
-            all(not section["enabled_switches"] for section in manifest["sections"])
+        self.assertEqual(
+            policy["disabled_opt_in_switches"], ["EnableFixtureTest", "EnableStimulus"]
         )
+        by_section = {section["section"]: section for section in manifest["sections"]}
+        self.assertEqual(by_section["SMBus"]["enabled_switches"], [])
+        self.assertEqual(by_section["HWM.Fan"]["enabled_switches"], [])
+        self.assertEqual(by_section["HWM.Fan.Control"]["enabled_switches"], ["AllowControl"])
         self.assertFalse(contract.outputs.run_root.exists())
-
 
 if __name__ == "__main__":
     unittest.main()

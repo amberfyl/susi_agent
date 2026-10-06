@@ -96,9 +96,6 @@ try {
     $initialized = $true
     $report.init_status = Get-StatusName $init
 
-    $report.validation_layers.L2_capability = 'PASS'
-    $report.validation_layers.L3_api = 'PASS'
-    $report.validation_layers.L4_readback = 'CONDITIONAL'
     $report.validation_layers.L5_functional = 'CONDITIONAL'
 
     $nondestructive = Get-ConfigValue -Config $config -Name 'nondestructive_check' -Default ([ordered]@{})
@@ -182,10 +179,143 @@ try {
             $report.checks.read_stability = 'PENDING'
             $report.checks.control_effect = 'NOT_RUN'
         } else {
+            # Phase 1 write path without reboot: Start with the maximum reset time
+            # and no pre-event, read the settings back, Trigger once, then Stop
+            # immediately. Stop is always attempted in finally and retried.
+            $startStop = [ordered]@{}
+            $failures = @()
+            $notExercised = @()
+            $stopFailures = @()
+            foreach ($ch in $required) {
+                $match = [regex]::Match([string]$ch, '^WDT(\d+)$', 'IgnoreCase')
+                if (-not $match.Success) { throw "Cannot map $ch to a SUSI watchdog id." }
+                $wdogId = [UInt32]([int]$match.Groups[1].Value - 1)
+                $test = [ordered]@{
+                    wdog_id = $wdogId; caps = [ordered]@{}; original = [ordered]@{}; start = $null
+                    readback = [ordered]@{}; trigger_status = $null; stop_status = $null
+                    stop_attempts = 0; stopped = $false; result = 'NOT_RUN'
+                }
+                $startStop[$ch] = $test
+
+                $capItems = [ordered]@{
+                    support_flags = 0x00000000; delay_max = 0x00000001; delay_min = 0x00000002
+                    event_max = 0x00000003; event_min = 0x00000004; reset_max = 0x00000005
+                    reset_min = 0x00000006; unit_min = 0x0000000F
+                    delay_time = 0x00010001; event_time = 0x00010002; reset_time = 0x00010003; event_type = 0x00010004
+                }
+                $capsOk = $true
+                foreach ($name in @($capItems.Keys)) {
+                    [UInt32]$value = 0
+                    $status = [NativeSusi]::SusiWDogGetCaps($wdogId, [UInt32]$capItems[$name], [ref]$value)
+                    Add-ApiCall -report $report -name ("SusiWDogGetCaps:{0}:{1}" -f $ch, $name) -status $status -value $value
+                    $target = if ($name -in @('delay_time', 'event_time', 'reset_time', 'event_type')) { $test.original } else { $test.caps }
+                    $target[$name] = if (Is-Success $status) { $value } else { $null }
+                    if ($name -in @('support_flags', 'reset_max') -and -not (Is-Success $status)) { $capsOk = $false }
+                }
+                if (-not $capsOk -or -not $test.caps.reset_max) {
+                    $test.result = 'FAIL_CAPS'
+                    $failures += "${ch}:GetCaps"
+                    continue
+                }
+
+                $resetTime = [UInt32]$test.caps.reset_max
+                # Use a value different from the current setting so the readback proves
+                # the write; one unit below maximum is still far from any reset.
+                $unit = if ($test.caps.unit_min) { [UInt32]$test.caps.unit_min } else { [UInt32]1 }
+                if ($null -ne $test.original.reset_time -and [UInt32]$test.original.reset_time -eq $resetTime -and $resetTime -gt (2 * $unit)) {
+                    $resetTime = $resetTime - $unit
+                }
+                $delayTime = if ($test.caps.delay_min) { [UInt32]$test.caps.delay_min } else { [UInt32]0 }
+                $eventTime = if ($test.caps.event_min) { [UInt32]$test.caps.event_min } else { [UInt32]0 }
+                $eventType = [UInt32]0  # SUSI_WDT_EVENT_TYPE_NONE
+                $test.start = [ordered]@{ delay_time = $delayTime; event_time = $eventTime; reset_time = $resetTime; event_type = $eventType }
+
+                $started = $false
+                try {
+                    $startStatus = [NativeSusi]::SusiWDogStart($wdogId, $delayTime, $eventTime, $resetTime, $eventType)
+                    Add-ApiCall -report $report -name "SusiWDogStart:$ch" -status $startStatus -value $test.start
+                    $test.start.status = Get-StatusName $startStatus
+                    if ($startStatus -eq [Convert]::ToUInt32('FFFFFEFA', 16)) {
+                        # SUSI_STATUS_RUNNING: someone else owns the watchdog; do not touch it.
+                        $test.result = 'ALREADY_RUNNING_NOT_MODIFIED'
+                        $notExercised += $ch
+                        continue
+                    }
+                    if (-not (Is-Success $startStatus)) {
+                        $test.result = 'FAIL_START'
+                        $failures += "${ch}:Start"
+                        continue
+                    }
+                    $started = $true
+
+                    foreach ($name in @('reset_time', 'event_type')) {
+                        [UInt32]$value = 0
+                        $status = [NativeSusi]::SusiWDogGetCaps($wdogId, [UInt32]$capItems[$name], [ref]$value)
+                        Add-ApiCall -report $report -name ("SusiWDogGetCaps:{0}:{1}:readback" -f $ch, $name) -status $status -value $value
+                        $test.readback[$name] = if (Is-Success $status) { $value } else { $null }
+                    }
+                    $resetMatches = ($null -ne $test.readback.reset_time) -and ([UInt32]$test.readback.reset_time -eq $resetTime)
+
+                    $triggerStatus = [NativeSusi]::SusiWDogTrigger($wdogId)
+                    Add-ApiCall -report $report -name "SusiWDogTrigger:$ch" -status $triggerStatus
+                    $test.trigger_status = Get-StatusName $triggerStatus
+
+                    if (-not (Is-Success $triggerStatus)) {
+                        $test.result = 'FAIL_TRIGGER'
+                        $failures += "${ch}:Trigger"
+                    } elseif (-not $resetMatches) {
+                        $test.result = 'FAIL_READBACK'
+                        $failures += "${ch}:ResetTimeReadback"
+                    } else {
+                        $test.result = 'PASS'
+                    }
+                } finally {
+                    if ($started) {
+                        for ($attempt = 1; $attempt -le 3 -and -not $test.stopped; $attempt++) {
+                            $stopStatus = [NativeSusi]::SusiWDogStop($wdogId)
+                            Add-ApiCall -report $report -name ("SusiWDogStop:{0}:attempt{1}" -f $ch, $attempt) -status $stopStatus
+                            $test.stop_attempts = $attempt
+                            $test.stop_status = Get-StatusName $stopStatus
+                            $test.stopped = Is-Success $stopStatus
+                        }
+                        if (-not $test.stopped) {
+                            $test.result = 'FAIL_STOP'
+                            $stopFailures += ('{0} (target may reset after {1} ms)' -f $ch, $resetTime)
+                        }
+                    }
+                }
+            }
+            $report.metrics.start_stop_test = $startStop
+
+            if ($stopFailures.Count -gt 0) {
+                $report.result = 'FAIL_API'
+                $report.reason = 'WARNING: WDT could not be stopped: ' + ($stopFailures -join ', ')
+                $report.validation_layers.L2_capability = 'PASS'
+                $report.validation_layers.L3_api = 'FAIL'
+                $report.validation_layers.L4_readback = 'FAIL'
+                $report.validation_layers.L6_recovery = 'FAIL'
+                $report.checks.recovery = 'FAIL'
+            } elseif ($failures.Count -gt 0) {
+                $report.result = 'FAIL_API'
+                $report.reason = 'WDT start/readback/trigger/stop failed: ' + ($failures -join ', ')
+                $report.validation_layers.L2_capability = if (@($failures | Where-Object { $_ -like '*:GetCaps' }).Count -gt 0) { 'FAIL' } else { 'PASS' }
+                $report.validation_layers.L3_api = 'FAIL'
+                $report.validation_layers.L4_readback = 'FAIL'
+            } elseif ($notExercised.Count -gt 0) {
+                $report.result = 'CONDITIONAL'
+                $report.reason = 'WDT already running (owned by another program); left untouched: ' + ($notExercised -join ', ')
+                $report.validation_layers.L2_capability = 'PASS'
+                $report.validation_layers.L3_api = 'CONDITIONAL'
+                $report.validation_layers.L4_readback = 'CONDITIONAL'
+            } else {
+                $report.result = 'PASS'
+                $report.reason = ('WDT start/readback/trigger/stop passed (reset time ' + (@($startStop.Values | ForEach-Object { $_.start.reset_time }) -join ',') + '); watchdog stopped, no reset triggered.')
+                $report.validation_layers.L2_capability = 'PASS'
+                $report.validation_layers.L3_api = 'PASS'
+                $report.validation_layers.L4_readback = 'PASS'
+            }
             $report.checks.read_stability = 'PASS'
             $report.checks.control_effect = 'CONDITIONAL'
-            $report.reason = 'Non-destructive policy validated (parameter/range gate + API probe). Start/refresh/stop functional flow requires dedicated WDT harness.'
-            $report.result = 'CONDITIONAL'
         }
     }
 
@@ -214,14 +344,13 @@ try {
         $destructiveSkipped = $true
     }
 
-    if ($destructiveSkipped) {
-        $report.validation_layers.L6_recovery = 'N_A'
-        $report.checks.recovery = 'NOT_REQUIRED'
+    if ($destructiveSkipped -and $report.validation_layers.L6_recovery -ne 'FAIL') {
+        # Recovery (Stop) only applies to watchdogs this runner actually started.
+        $stoppedAny = $report.metrics.Contains('start_stop_test') -and @($report.metrics.start_stop_test.Values | Where-Object { $_.stopped }).Count -gt 0
+        $report.validation_layers.L6_recovery = if ($stoppedAny) { 'PASS' } else { 'N_A' }
+        $report.checks.recovery = if ($stoppedAny) { 'PASS' } else { 'NOT_REQUIRED' }
 
-        if ($report.result -eq 'PASS') {
-            $skipSemantic = [string](Get-ConfigValue -Config $semantics -Name 'nonreboot_cases_pass_but_destructive_skipped' -Default 'CONDITIONAL')
-            $report.result = if ([string]::IsNullOrWhiteSpace($skipSemantic)) { 'CONDITIONAL' } else { $skipSemantic }
-        }
+
     }
 
 } catch {

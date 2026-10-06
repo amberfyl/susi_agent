@@ -91,7 +91,7 @@ try {
             $entry.functional.attempted = $true
             $setStatus = [NativeSusi]::SusiVgaSetBacklightEnable($id, $toggleTo)
             Add-ApiCall -report $report -name ("VgaSetBacklightEnable:{0}:toggle" -f $ch) -status $setStatus -value $toggleTo
-            $verifyState = if ($setStatus -eq 0 -and $verify) { Get-BacklightState $id } else { [ordered]@{ status=[UInt32]0xFFFFFFFF; status_name='NOT_RUN'; value=$null } }
+            $verifyState = if ($setStatus -eq 0 -and $verify) { Get-BacklightState $id } else { [ordered]@{ status=[Convert]::ToUInt32('FFFFFFFF', 16); status_name='NOT_RUN'; value=$null } }
             if ($setStatus -eq 0 -and $verify) {
                 Add-ApiCall -report $report -name ("VgaGetBacklightEnable:{0}:verify" -f $ch) -status $verifyState.status -value $verifyState.value
             }

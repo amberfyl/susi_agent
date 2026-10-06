@@ -20,7 +20,7 @@ function New-SmbusFixtureStep {
         [bool]$AllowUnsupported = $false
     )
 
-    $statusAccepted = (Is-Success $Status) -or ($AllowUnsupported -and $Status -eq [UInt32]0xFFFFFCFF)
+    $statusAccepted = (Is-Success $Status) -or ($AllowUnsupported -and $Status -eq [Convert]::ToUInt32('FFFFFCFF', 16))
     $passed = $statusAccepted -and $Compare
     return [ordered]@{
         name = $Name
@@ -106,7 +106,7 @@ function Invoke-LegacySmbusFixtureTest {
 
         $status = [NativeSusi]::SusiSMBI2CWriteBlock($BusId, $Address, $cmd, $writeBlock, [UInt32]$writeBlock.Length)
         Add-ApiCall -report $Report -name 'SusiSMBI2CWriteBlock:fixture' -status $status
-        $i2cUnsupported = ($status -eq [UInt32]0xFFFFFCFF)
+        $i2cUnsupported = ($status -eq [Convert]::ToUInt32('FFFFFCFF', 16))
         [void]$steps.Add((New-SmbusFixtureStep -Name 'I2CWriteBlock(00..09)' -Status $status -Expected 'SUCCESS or UNSUPPORTED' -Actual (Get-StatusName $status) -Compare $true -AllowUnsupported $true))
 
         if (-not $i2cUnsupported) {
@@ -374,11 +374,36 @@ try {
                         addresses = @('0xAC (7-bit 0x56)', '0xAE (7-bit 0x57)', '0x4A (7-bit 0x25)')
                     }
                     $report.validation_layers.L5_functional = 'CONDITIONAL'
-                    $report.result = 'CONDITIONAL'
+
+                    # Phase 1 read path: read-only ReceiveByte scan on every supported bus.
+                    # Never writes, so devices such as SPD EEPROMs are not modified.
+                    $busScan = [ordered]@{}
+                    $respondingBuses = @()
+                    for ($busId = 0; $busId -le 4; $busId++) {
+                        if ((([UInt32]$first) -band ([UInt32](1 -shl $busId))) -eq 0) { continue }
+                        $found = @()
+                        for ($address = 0x10; $address -le 0xEE; $address += 2) {
+                            [byte]$data = 0
+                            $readStatus = [NativeSusi]::SusiSMBReceiveByte([UInt32]$busId, [byte]$address, [ref]$data)
+                            if (Is-Success $readStatus) { $found += ('0x{0:X2}' -f $address) }
+                        }
+                        Add-ApiCall -report $report -name ('SusiSMBReceiveByte:bus{0}:scan' -f $busId) -status ([UInt32]0) -value ($found -join ',')
+                        $busScan[('Bus{0}' -f $busId)] = $found
+                        if ($found.Count -gt 0) { $respondingBuses += ('Bus{0}({1})' -f $busId, ($found -join ',')) }
+                    }
+                    $report.metrics.read_scan = $busScan
+
                     if ($unsupported.Count -gt 0) {
+                        $report.result = 'CONDITIONAL'
                         $report.reason = ('BLOCKED_REFERENCE: capability mask does not expose channel(s): ' + ($unsupported -join ', '))
+                        $report.validation_layers.L4_readback = 'CONDITIONAL'
+                    } elseif ($respondingBuses.Count -gt 0) {
+                        $report.result = 'PASS'
+                        $report.reason = 'SMBus API path verified by read-only ReceiveByte: ' + ($respondingBuses -join '; ')
                     } else {
-                        $report.reason = 'BLOCKED_FIXTURE: rerun with -EnableFixtureTest after connecting the approved legacy QA fixture'
+                        $report.result = 'CONDITIONAL'
+                        $report.reason = 'No SMBus device responded to read-only scan; bus path not exercised.'
+                        $report.validation_layers.L4_readback = 'CONDITIONAL'
                     }
                 }
             }

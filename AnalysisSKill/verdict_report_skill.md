@@ -20,13 +20,18 @@
    | L5_functional | 實體功能（需 fixture/刺激） | DQA（此階段不作完成條件） |
    | L6_recovery | 功能測試後復原 | DQA（此階段不作完成條件） |
 
-2. `sw_verdict`：L1–L4 任一 `FAIL*` → `FAIL_SW`（exit code 1），否則 `PASS_SW`（exit code 0）。
-3. `dqa_verdict`（`N_A_DQA` / `PENDING_DQA` / `PASS_DQA` / `FAIL_DQA`）保留在報告中供參考；`CONDITIONAL`、`PENDING_DQA` 不影響 SW 結論，也不視為失敗。
-4. `--all` 預設不開任何控制/fixture/寫入開關，以下狀態代表「刻意沒跑實體測試」，不是失敗，SW 結論仍看 `sw_verdict`：
-   - `result=CONDITIONAL`：API 讀取完成，但沒有實體刺激/fixture（所有 runner 都可能出現）。
-   - `result=BLOCKED_SAFETY`：`HWM.Fan.Control` 未帶 `-AllowControl`，控制測試未執行。
-   - `reason` 含 `BLOCKED_FIXTURE`（SMBus）或 `L5_functional=PENDING_FIXTURE`（I2C）：未帶 fixture 開關，傳輸測試未執行。
-5. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
+2. **第一階段 = SW API 讀寫通道是否通**（使用者 2026-10-05 拍板）：有 Set API 的功能一律做「讀原值 → Set → 讀回比對 → 還原原值」；只有讀取 API 的功能（HWM.Voltage、HWM.Temperature：SDK 無 Set）讀到有效值即可。
+3. section 判定（程式：`run_machineB_full_validation.py` 的 `_normalize_report_verdict`）：
+   - `PASS`：L1–L4 全部實際通過（`PASS`/`N_A`/`NOT_REQUIRED`）。缺治具、缺刺激、DQA 未做（L5）**不影響**；`FAIL_FIXTURE`/`FAIL_FUNCTIONAL` 也不影響。
+   - 例外：`VGA.Backlight`、`VGA.Brightness`、`GPIO`、`StorageArea` 的 L5 就是「寫入 → 讀回 → 還原」本身，算第一階段：L5 失敗判 `FAIL`，L5 沒跑判 `CONDITIONAL`。
+   - `FAIL`：L1–L4 任一 `FAIL*`、L6 還原失敗、或其他 `FAIL_*` result。
+   - `CONDITIONAL`：L1–L4 有 `PENDING`/`CONDITIONAL`，表示 API 通道**沒有被實際走過**（例：WDT 未執行 Start；SMBus 掃描無任何裝置回應；I2C 不支援 SetFrequency 且無裝置回應）。
+   - `sw_verdict`（`Apply-VerdictPolicy`）同理：全部通過才是 `PASS_SW`，有未執行的層為 `PENDING_SW`。
+4. 寫入值一律選「與原值不同、但無害」的值，讀回才有意義：ThermalProtect 只改觸發溫度（caps 範圍內；原本有保護動作時只往上調，調不了就不改並判 `CONDITIONAL`），SourceId/EventType 不動；WDT reset time 等於原值時改用最大值減一個單位。
+5. 預設開啟的寫入測試（皆會還原）：`HWM.Fan.Control -AllowControl`、`ThermalProtect -EnableSetConfigTest`、`VGA.Backlight`/`VGA.Brightness`/`GPIO -EnableFunctionalTest`、`StorageArea -EnableWriteTest`。I2C 做頻率 Set→讀回→還原；SMBus 做唯讀 ReceiveByte 掃描（**不寫入**，避免寫壞 SPD）。WDT 做 Start（reset time 用硬體最大值、event type=NONE）→ 讀回 reset time → Trigger → 立即 Stop（`finally` 內最多重試 3 次），不等逾時、不重開機；Start 回 `SUSI_STATUS_RUNNING` 表示 WDT 已被其他程式使用，完全不動並判 `CONDITIONAL`；Stop 失敗判 `FAIL` 並警告目標機可能重開。
+   預設不開：`SMBus -EnableFixtureTest`（需治具）、`HWM.Fan -EnableStimulus`（需刺激源）。
+6. 治具、硬體刺激、DQA 相關的待辦，一律寫在 summary 的「Phase 2 recommendations」段落，不降低第一階段判定。
+7. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
 
 ## 4. 結果判讀規則
 1. **report JSON 為準**：section 結論看 report JSON；process exit code 只當診斷證據。

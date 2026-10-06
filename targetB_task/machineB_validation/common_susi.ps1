@@ -115,6 +115,24 @@ public static class NativeSusi
     public static extern UInt32 SusiI2CGetFrequency(UInt32 Id, out UInt32 pFreq);
 
     [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiI2CSetFrequency(UInt32 Id, UInt32 Freq);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiI2CProbeDevice(UInt32 Id, UInt32 Addr);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiWDogGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiWDogStart(UInt32 Id, UInt32 DelayTime, UInt32 EventTime, UInt32 ResetTime, UInt32 EventType);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiWDogStop(UInt32 Id);
+
+    [DllImport("Susi4.dll")]
+    public static extern UInt32 SusiWDogTrigger(UInt32 Id);
+
+    [DllImport("Susi4.dll")]
     public static extern UInt32 SusiFanControlGetCaps(UInt32 Id, UInt32 ItemId, out UInt32 pValue);
 
     [DllImport("Susi4.dll")]
@@ -588,8 +606,11 @@ function Apply-VerdictPolicy {
         [string](Get-ConfigValue -Config $layers -Name 'L4_readback' -Default 'PENDING')
     )
 
+    # Phase 1 SW verdict: every SW layer must have actually passed. PENDING or
+    # CONDITIONAL means the API path was not exercised, so it is not a pass.
     $swFail = @($swLayers | Where-Object { $_ -like 'FAIL*' }).Count -gt 0
-    $swVerdict = if ($swFail) { 'FAIL_SW' } else { 'PASS_SW' }
+    $swDone = @($swLayers | Where-Object { $_ -notin @('PASS', 'N_A', 'NOT_REQUIRED') }).Count -eq 0
+    $swVerdict = if ($swFail) { 'FAIL_SW' } elseif ($swDone) { 'PASS_SW' } else { 'PENDING_SW' }
     $dqaVerdict = Resolve-DqaVerdictFromLayers -Layers $layers
     $exitCode = if ($swVerdict -eq 'FAIL_SW') { 1 } else { 0 }
 
@@ -599,6 +620,7 @@ function Apply-VerdictPolicy {
     $Report.exit_code_policy = [ordered]@{
         fail_sw = 1
         pass_sw = 0
+        pending_sw = 0
     }
 
     return [ordered]@{

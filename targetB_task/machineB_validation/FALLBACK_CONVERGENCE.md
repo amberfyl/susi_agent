@@ -65,6 +65,11 @@ The plan's project, run ID, full-INI SHA-256, baseline summary SHA-256, per-sect
 
 ## Evidence outputs
 
+- `<PROJECT>-machineB-summary.json/.txt` is rewritten as the final report: converged
+  sections take the winning attempt's verdict and report, other planned sections keep
+  the baseline verdict with a fallback note, and the text ends with a Details list of
+  every evidence file. This is the only file a reader needs to open first.
+- `<PROJECT>-machineB-summary.baseline.json/.txt`: the pre-fallback summary, preserved once
 - `validation_runs/<run-id>/fallback/<section>/attempt-NNN/candidate-full.ini`
 - per-attempt targeted reports under the same attempt directory
 - `fallback-effective-full.ini`

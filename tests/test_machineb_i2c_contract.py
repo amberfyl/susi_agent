@@ -138,7 +138,7 @@ class MachineBI2CContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "SECTION_EMPTY")
         self.assertEqual(result["rows"], [])
 
-    def test_runner_and_common_wrapper_cover_pure_software_checks(self):
+    def test_runner_exercises_frequency_set_readback_restore_without_data_writes(self):
         runner = RUNNER_PATH.read_text(encoding="utf-8")
         common = COMMON_PATH.read_text(encoding="utf-8")
 
@@ -146,12 +146,15 @@ class MachineBI2CContractTests(unittest.TestCase):
         self.assertIn("SusiI2CGetFrequency", runner)
         self.assertIn("Apply-VerdictPolicy", runner)
         self.assertIn("PENDING_FIXTURE", runner)
-        self.assertNotIn("SusiI2CSetFrequency", runner)
+        self.assertIn("SusiI2CSetFrequency", runner)
+        self.assertIn(":restore", runner)
+        self.assertIn("SusiI2CProbeDevice", runner)
         self.assertNotIn("SusiI2CWriteTransfer", runner)
         self.assertNotIn("SusiI2CWriteReadCombine", runner)
         self.assertIn("SusiI2CGetCaps", common)
         self.assertIn("SusiI2CGetFrequency", common)
-
+        self.assertIn("SusiI2CSetFrequency", common)
+        self.assertIn("SusiI2CProbeDevice", common)
 
 if __name__ == "__main__":
     unittest.main()

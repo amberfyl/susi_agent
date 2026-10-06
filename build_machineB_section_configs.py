@@ -99,7 +99,7 @@ DEFAULTS = {
     },
     "control": {
         "control_check": {
-            "enabled": False,
+            "enabled": True,
             "sequence_pwm": [30, 50, 70],
             "settle_time_sec": 10,
             "set_get_tolerance": 2,

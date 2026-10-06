@@ -404,6 +404,8 @@ try {
 
             if ($report.result -eq 'PENDING') {
                 $report.validation_layers.L4_readback = 'PASS'
+                # Phase 1 headline; RPM response (L5) is reported separately as phase 2.
+                $report.sw_reason = ('PWM set/readback/restore passed on {0} ({1}%)' -f ($required -join ', '), ($sequence -join '/'))
                 if (-not $rpmReady) {
                     $report.checks.read_stability = 'CONDITIONAL'
                     $report.checks.control_effect = 'CONDITIONAL'

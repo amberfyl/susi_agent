@@ -69,7 +69,7 @@ try {
             $entry.functional.attempted=$true
             $setStatus=[NativeSusi]::SusiVgaSetBacklightBrightness($id,$testValue)
             Add-ApiCall -report $report -name ("VgaSetBacklightBrightness:{0}:test" -f $ch) -status $setStatus -value $testValue
-            $verifyState=if ($setStatus -eq 0 -and $verify) { Get-BrightnessState $id } else { [ordered]@{ status=[UInt32]0xFFFFFFFF; status_name='NOT_RUN'; value=$null } }
+            $verifyState=if ($setStatus -eq 0 -and $verify) { Get-BrightnessState $id } else { [ordered]@{ status=[Convert]::ToUInt32('FFFFFFFF', 16); status_name='NOT_RUN'; value=$null } }
             if ($setStatus -eq 0 -and $verify) { Add-ApiCall -report $report -name ("VgaGetBacklightBrightness:{0}:verify" -f $ch) -status $verifyState.status -value $verifyState.value }
             $setOk=($setStatus -eq 0 -and ((-not $verify) -or ($verifyState.status -eq 0 -and $verifyState.value -eq $testValue)))
             if (-not $setOk) { $functionalFailures += $ch }

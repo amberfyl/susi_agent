@@ -217,8 +217,9 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "thermalprotect",
         ExecutionTier.GATED_READ,
         8,
-        "safety-sensitive configuration read with optional SetConfig",
+        "safety-sensitive configuration read with SetConfig/readback/restore",
         opt_in_switches=("EnableSetConfigTest",),
+        default_switches=("EnableSetConfigTest",),
     ),
     SectionRegistryEntry(
         "HWM.Fan",
@@ -240,6 +241,7 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "fan dependency, PWM control, RPM response, and recovery",
         section_dependencies=("HWM.Fan",),
         opt_in_switches=("AllowControl",),
+        default_switches=("AllowControl",),
         extra_path_arguments=("FanConfigPath", "FanIniPath"),
     ),
     SectionRegistryEntry(
@@ -249,8 +251,9 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "vga_backlight",
         ExecutionTier.REVERSIBLE_WRITE,
         11,
-        "optional reversible enable toggle",
+        "reversible enable toggle with restore",
         opt_in_switches=("EnableFunctionalTest",),
+        default_switches=("EnableFunctionalTest",),
     ),
     SectionRegistryEntry(
         "VGA.Brightness",
@@ -259,8 +262,9 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "vga_brightness",
         ExecutionTier.REVERSIBLE_WRITE,
         12,
-        "optional reversible brightness change",
+        "reversible brightness change with restore",
         opt_in_switches=("EnableFunctionalTest",),
+        default_switches=("EnableFunctionalTest",),
     ),
     SectionRegistryEntry(
         "GPIO",
@@ -269,8 +273,9 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "gpio",
         ExecutionTier.REVERSIBLE_WRITE,
         13,
-        "optional direction/level writes with state restoration",
+        "direction/level writes with state restoration",
         opt_in_switches=("EnableFunctionalTest",),
+        default_switches=("EnableFunctionalTest",),
     ),
     SectionRegistryEntry(
         "StorageArea",
@@ -279,8 +284,9 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "storage",
         ExecutionTier.REVERSIBLE_WRITE,
         14,
-        "optional persistence write with original-byte restoration",
+        "persistence write with original-byte restoration",
         opt_in_switches=("EnableWriteTest",),
+        default_switches=("EnableWriteTest",),
     ),
 )
 
@@ -930,11 +936,15 @@ def build_execution_manifest(contract: PostIniContract) -> dict[str, Any]:
             }
         )
 
+    enabled_switches = sorted(
+        {switch for entry in SECTION_REGISTRY for switch in entry.default_switches}
+    )
     disabled_switches = sorted(
         {
             switch
             for entry in SECTION_REGISTRY
             for switch in entry.opt_in_switches
+            if switch not in entry.default_switches
         }
     )
     contract_payload = contract.to_dict()
@@ -948,8 +958,8 @@ def build_execution_manifest(contract: PostIniContract) -> dict[str, Any]:
         "target": contract_payload["target"],
         "sections": sections,
         "safety_policy": {
-            "default": "disabled",
-            "enabled_opt_in_switches": [],
+            "default": "phase1_reversible_writes_enabled",
+            "enabled_opt_in_switches": enabled_switches,
             "disabled_opt_in_switches": disabled_switches,
         },
     }
@@ -1204,12 +1214,58 @@ def _remote_config_path(contract: PostIniContract, section_plan: Mapping[str, An
     return str(PureWindowsPath(config_dir) / Path(configured).name) if config_dir else configured
 
 
+_SW_LAYERS = ("L1_configuration", "L2_capability", "L3_api", "L4_readback")
+_LAYER_DONE = frozenset({"PASS", "N_A", "NOT_REQUIRED"})
+# Failures that belong to phase 2 (fixture / functional / DQA) and do not
+# affect the phase 1 SW API verdict.
+_PHASE2_ONLY_FAILURES = ("FAIL_FIXTURE", "FAIL_FUNCTIONAL", "FAIL_DQA")
+# Sections whose L5 "functional" step is the reversible set/readback itself, so
+# it belongs to phase 1: a write failure fails, a write not run is CONDITIONAL.
+_WRITE_PATH_SECTIONS = frozenset({"VGA.Backlight", "VGA.Brightness", "GPIO", "StorageArea"})
+
+PHASE2_RECOMMENDATIONS: Mapping[str, str] = MappingProxyType({
+    "HWM.Voltage": "Apply load stimulus and confirm each rail reading tracks the change.",
+    "HWM.Temperature": "Apply thermal stimulus and confirm readings change accordingly.",
+    "HWM.Fan": "Attach fans and confirm RPM follows HWM.Fan.Control PWM changes.",
+    "HWM.Fan.Control": "Attach fans and confirm RPM rises with PWM (expected delta >= 200 RPM).",
+    "HWM.CaseOpen": "Open/close the chassis intrusion switch and confirm the state changes.",
+    "HWM.Current": "Apply load and confirm current readings track the change.",
+    "I2C": "Connect the approved fixture (0xAC/0xAE) and validate write/read transactions.",
+    "SMBus": "Connect the legacy QA fixture and rerun with -EnableFixtureTest for write/read compare.",
+    "WDT": "Let the watchdog expire under a recovery harness and confirm the target resets (reboots the target).",
+    "ThermalProtect": "Validate SHUTDOWN/THROTTLE event triggering under thermal stimulus.",
+})
+
+
 def _normalize_report_verdict(report: Mapping[str, Any]) -> tuple[str, str | None, str | None]:
+    """Phase 1 verdict: PASS when every SW API layer (L1-L4) actually passed.
+
+    Fixture, stimulus and DQA gaps (L5) do not lower the verdict; they are
+    reported as phase 2 recommendations instead. A failed restore (L6) fails.
+    """
+
     result = str(report.get("result", "ERROR_REPORT_RESULT_MISSING"))
     sw_verdict = report.get("sw_verdict")
     dqa_verdict = report.get("dqa_verdict")
     upper = result.upper()
-    if str(sw_verdict).upper() == "FAIL_SW" or upper.startswith("FAIL"):
+    layers = report.get("validation_layers")
+    if isinstance(layers, Mapping) and all(name in layers for name in _SW_LAYERS):
+        sw_states = [str(layers[name]).upper() for name in _SW_LAYERS]
+        if str(report.get("category")) in _WRITE_PATH_SECTIONS:
+            sw_states.append(str(layers.get("L5_functional", "")).upper())
+        recovery = str(layers.get("L6_recovery", "")).upper()
+        if any(state.startswith("FAIL") for state in sw_states) or recovery.startswith("FAIL"):
+            verdict = "FAIL"
+        elif upper.startswith("FAIL") and (
+            not upper.startswith(_PHASE2_ONLY_FAILURES)
+            or str(report.get("category")) in _WRITE_PATH_SECTIONS
+        ):
+            verdict = "FAIL"
+        elif all(state in _LAYER_DONE for state in sw_states):
+            verdict = "PASS"
+        else:
+            verdict = "CONDITIONAL"
+    elif str(sw_verdict).upper() == "FAIL_SW" or upper.startswith("FAIL"):
         verdict = "FAIL"
     elif upper.startswith(("CONDITIONAL", "PENDING", "BLOCKED", "N_A")):
         verdict = "CONDITIONAL"
@@ -1218,6 +1274,49 @@ def _normalize_report_verdict(report: Mapping[str, Any]) -> tuple[str, str | Non
     else:
         verdict = "ERROR"
     return verdict, str(sw_verdict) if sw_verdict is not None else None, str(dqa_verdict) if dqa_verdict is not None else None
+
+
+def _section_reason(report: Mapping[str, Any], verdict: str) -> tuple[str, str | None]:
+    """Return (headline reason, phase 2 observation).
+
+    A runner may report ``sw_reason`` for the phase 1 result; when the section
+    passes phase 1 that becomes the headline and the runner's own reason (e.g. a
+    fan RPM finding) is kept as the phase 2 observation.
+    """
+
+    reason = str(report.get("reason", ""))
+    sw_reason = str(report.get("sw_reason") or "").strip()
+    if verdict == "PASS" and sw_reason and sw_reason != reason:
+        return sw_reason, reason
+    return reason, None
+
+
+def _phase2_recommendation(item: Mapping[str, Any]) -> str | None:
+    """Hardware/fixture/DQA follow-up for a section whose phase 1 did not fail."""
+
+    if item.get("verdict") not in {"PASS", "CONDITIONAL"}:
+        return None
+    if str(item.get("section")) in _WRITE_PATH_SECTIONS:
+        return None
+    layers = item.get("validation_layers")
+    functional = ""
+    open_layers = False
+    if isinstance(layers, Mapping):
+        functional = str(layers.get("L5_functional", "")).upper()
+        open_layers = any(
+            str(layers.get(name, "")).upper() not in _LAYER_DONE
+            for name in ("L5_functional", "L6_recovery")
+            if name in layers
+        )
+    if item.get("verdict") != "CONDITIONAL" and not open_layers:
+        return None
+    text = PHASE2_RECOMMENDATIONS.get(str(item.get("section"))) or str(item.get("reason", "")).strip()
+    observation = str(item.get("phase2_observation") or "").strip()
+    if observation:
+        text = f"{text} Observed: {observation}"
+    elif functional.startswith("FAIL"):
+        text = f"{text} Observed: {str(item.get('reason', '')).strip()}"
+    return text or None
 
 
 def execute_validation_sections(
@@ -1278,7 +1377,13 @@ def execute_validation_sections(
             "IniPath": contract.target.runtime_ini,
             "OutDir": report_dir,
         }
-        # Safety gates remain absent unless a future explicit CLI policy adds them.
+        enabled_switches = {
+            str(value)
+            for value in section_plan.get("enabled_switches", [])
+            if str(value) in set(section_plan.get("available_opt_in_switches", []))
+        }
+        for switch in enabled_switches:
+            arguments[switch] = True
         if section == "HWM.Fan.Control":
             if not fan_config_path:
                 blocked = {
@@ -1379,8 +1484,10 @@ def execute_validation_sections(
             "execution_status": "COMPLETED",
             "verdict": verdict,
             "result": report.get("result"),
-            "reason": str(report.get("reason", "")),
+            "reason": _section_reason(report, verdict)[0],
+            "phase2_observation": _section_reason(report, verdict)[1],
             "channel_summary": report.get("channel_summary"),
+            "validation_layers": report.get("validation_layers"),
             "sw_verdict": sw_verdict,
             "dqa_verdict": dqa_verdict,
             "runner_exit_code": command["exit_code"],
@@ -1853,6 +1960,7 @@ def write_validation_summary(
     errors: list[Any],
     warnings: list[Any],
     started_at: str | None = None,
+    fallback: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """P9/P10: write deterministic machine-readable and text summaries."""
 
@@ -1882,20 +1990,45 @@ def write_validation_summary(
         "warnings": list(warnings),
         "errors": list(errors),
     }
+    phase2 = [
+        {"section": item.get("section"), "recommendation": note}
+        for item in section_results
+        for note in [_phase2_recommendation(item)]
+        if note
+    ]
+    summary["phase2_recommendations"] = phase2
+    if fallback is not None:
+        summary["fallback"] = dict(fallback)
     contract.outputs.run_root.mkdir(parents=True, exist_ok=True)
     temporary = contract.outputs.summary_json.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(contract.outputs.summary_json)
+    verdict_counts: dict[str, int] = {}
+    for item in section_results:
+        tag = str(item.get("verdict"))
+        verdict_counts[tag] = verdict_counts.get(tag, 0) + 1
+    counts = " / ".join(
+        f"{verdict_counts[tag]} {tag}"
+        for tag in sorted(verdict_counts, key=lambda tag: _VERDICT_ORDER.get(tag, len(_VERDICT_ORDER)))
+    )
     lines = [
         f"Project: {contract.project}",
         f"Run ID: {contract.run_id}",
-        f"Status: {status}",
-        f"Exit code: {exit_code}",
+        f"Status: [{status}]  (exit code {exit_code})",
+        "Scope: Phase 1 - SW API read/write path (set, read back, restore)",
+        f"Result: {counts or 'no sections'}",
         "",
         "Sections:",
     ]
+    tag_width = max((len(str(item.get("verdict"))) + 2 for item in section_results), default=0)
+    name_width = max((len(str(item.get("section"))) for item in section_results), default=0)
+    indent = " " * (2 + tag_width + 2 + name_width + 2)
     for item in section_results:
-        prefix = f"- {item.get('section')}: {item.get('execution_status')} / {item.get('verdict')}"
+        tag = f"[{item.get('verdict')}]"
+        detail = str(item.get("reason", "")).strip()
+        execution_status = item.get("execution_status")
+        if execution_status != "COMPLETED":
+            detail = f"(execution {execution_status}) {detail}".strip()
         channel_summary = item.get("channel_summary")
         if isinstance(channel_summary, Mapping):
             total = int(channel_summary.get("total", 0))
@@ -1911,16 +2044,186 @@ def write_validation_summary(
                     else str(value)
                     for value in channel_summary.get("failed_channels", [])
                 )
-                lines.append(
-                    f"{prefix} — PARTIAL_FAIL {passed}/{total} passed; "
+                detail = (
+                    f"PARTIAL_FAIL {passed}/{total} passed; "
                     f"passed=[{passed_names}]; failed=[{failed_names}]"
                 )
-                continue
-        reason = str(item.get("reason", "")).strip()
-        lines.append(f"{prefix} — {reason}" if reason else prefix)
-    lines.extend(["", f"Rollback: {rollback.get('status')}"])
+        lines.append(
+            f"  {tag:<{tag_width}}  {str(item.get('section')):<{name_width}}  {detail}".rstrip()
+        )
+        note = _fallback_note(item.get("fallback"))
+        if note:
+            lines.append(f"{indent}{note}")
+    lines.extend(["", f"Rollback: [{rollback.get('status')}]"])
+    run_root = contract.outputs.run_root
+    if fallback is not None:
+        lines.extend([
+            "",
+            f"Fallback: [{fallback.get('status')}]",
+            f"Fallback runtime recovery: [{fallback.get('final_runtime_recovery')}]",
+        ])
+        if fallback.get("error"):
+            lines.append(f"Fallback error: {fallback.get('error')}")
+    if phase2:
+        lines.extend(["", "Phase 2 recommendations (hardware / fixture / DQA):"])
+        lines.extend(f"- {entry['section']}: {entry['recommendation']}" for entry in phase2)
+    lines.extend(["", "Details:", "Section reports:"])
+    for item in section_results:
+        report_path = item.get("local_report_path")
+        if report_path:
+            lines.append(f"- {item.get('section')}: {_display_path(report_path, run_root)}")
+    lines.append(f"Manifest: {_display_path(contract.outputs.manifest, run_root)}")
+    if fallback is not None:
+        for label, key in (
+            ("Fallback attempts and evidence", "convergence_path"),
+            ("Pre-fallback summary", "baseline_summary_path"),
+            ("Final full INI", "final_full_ini"),
+            ("Project route overrides", "override_path"),
+        ):
+            if fallback.get(key):
+                lines.append(f"{label}: {_display_path(fallback[key], run_root)}")
     contract.outputs.summary_text.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return summary
+
+
+_VERDICT_ORDER = {"FAIL": 0, "ERROR": 1, "CONDITIONAL": 2, "PASS": 3}
+
+
+def _display_path(path: Any, run_root: Path) -> str:
+    candidate = Path(str(path))
+    try:
+        return candidate.relative_to(run_root).as_posix()
+    except ValueError:
+        return str(candidate)
+
+
+def _fallback_note(fallback: Any) -> str:
+    if not isinstance(fallback, Mapping):
+        return ""
+    status = fallback.get("status")
+    count = fallback.get("attempt_count", 0)
+    if status == "CONVERGED":
+        route = f"{fallback.get('route_field') or 'route'}={fallback.get('selected_route')}"
+        return (
+            f"fallback CONVERGED on attempt {fallback.get('winning_attempt')}/{count}, "
+            f"{route} (baseline was {fallback.get('baseline_verdict')})"
+        )
+    return f"fallback {status} after {count} attempt(s)"
+
+
+def finalize_summary_after_fallback(
+    contract: PostIniContract,
+    convergence: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Rewrite the run summary so it reflects fallback results as the final verdict.
+
+    The pre-fallback summary is preserved once as ``*.baseline.json/.txt`` and is
+    always the merge source, so re-finalizing is idempotent.
+    """
+
+    outputs = contract.outputs
+    baseline_json = outputs.summary_json.with_name(
+        outputs.summary_json.name.replace(".json", ".baseline.json")
+    )
+    baseline_text = outputs.summary_text.with_name(
+        outputs.summary_text.name.replace(".txt", ".baseline.txt")
+    )
+    if not baseline_json.is_file():
+        if not outputs.summary_json.is_file():
+            return None
+        baseline_json.write_bytes(outputs.summary_json.read_bytes())
+        if outputs.summary_text.is_file():
+            baseline_text.write_bytes(outputs.summary_text.read_bytes())
+    baseline = json.loads(baseline_json.read_text(encoding="utf-8"))
+
+    formal = convergence.get("formal_convergence")
+    formal = formal if isinstance(formal, Mapping) else {}
+    override = formal.get("override")
+    override_sections = override.get("sections") if isinstance(override, Mapping) else None
+    override_sections = override_sections if isinstance(override_sections, Mapping) else {}
+    by_section = {
+        str(item.get("section")): item
+        for item in convergence.get("sections", [])
+        if isinstance(item, Mapping)
+    }
+
+    sections: list[dict[str, Any]] = []
+    for original in baseline.get("sections", []):
+        item = dict(original)
+        converged = by_section.get(str(item.get("section")))
+        if converged is not None:
+            attempts = [a for a in converged.get("attempts", []) if isinstance(a, Mapping)]
+            note: dict[str, Any] = {
+                "status": converged.get("status"),
+                "attempt_count": len(attempts),
+                "baseline_verdict": item.get("verdict"),
+                "baseline_result": item.get("result"),
+                "baseline_report_path": item.get("local_report_path"),
+            }
+            winner = next((a for a in reversed(attempts) if a.get("success")), None)
+            if converged.get("status") == "CONVERGED" and winner is not None:
+                section_override = override_sections.get(str(item.get("section")))
+                note.update({
+                    "selected_route": converged.get("selected_route"),
+                    "route_field": section_override.get("route_field")
+                    if isinstance(section_override, Mapping) else None,
+                    "winning_attempt": winner.get("index"),
+                    "changed_keys": list(winner.get("changed_keys", [])),
+                })
+                report_path = str(winner.get("report_path") or "")
+                try:
+                    report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
+                    verdict, sw_verdict, dqa_verdict = _normalize_report_verdict(report)
+                    item.update({
+                        "verdict": verdict,
+                        "result": report.get("result"),
+                        "reason": _section_reason(report, verdict)[0],
+                        "phase2_observation": _section_reason(report, verdict)[1],
+                        "channel_summary": report.get("channel_summary"),
+                        "validation_layers": report.get("validation_layers"),
+                        "sw_verdict": sw_verdict,
+                        "dqa_verdict": dqa_verdict,
+                    })
+                except Exception as exc:
+                    item.update({
+                        "verdict": "ERROR",
+                        "reason": f"fallback report unreadable: {exc}",
+                    })
+                item["local_report_path"] = report_path
+                item.pop("remote_report_path", None)
+            item["fallback"] = note
+        sections.append(item)
+
+    errors = list(baseline.get("errors", []))
+    if convergence.get("status") == "ORCHESTRATOR_ERROR":
+        errors.append({
+            "phase": "FALLBACK",
+            "message": str(convergence.get("error") or "fallback orchestration failed"),
+            "details": {},
+        })
+    recovery = convergence.get("final_runtime_recovery")
+    fallback_summary = {
+        "status": convergence.get("status"),
+        "final_runtime_recovery": recovery.get("status") if isinstance(recovery, Mapping) else None,
+        "error": convergence.get("error"),
+        "convergence_path": convergence.get("output_path"),
+        "baseline_summary_path": str(baseline_text if baseline_text.is_file() else baseline_json),
+        "final_full_ini": str(contract.inputs.full_ini),
+        "override_path": formal.get("override_path") if formal.get("status") == "APPLIED" else None,
+        "sections": sorted(by_section),
+    }
+    timestamps = baseline.get("timestamps")
+    return write_validation_summary(
+        contract,
+        runtime_ini=baseline.get("runtime_ini", {}),
+        reload_result=baseline.get("reload", {}),
+        section_results=sections,
+        rollback=baseline.get("rollback", {}),
+        errors=errors,
+        warnings=list(baseline.get("warnings", [])),
+        started_at=timestamps.get("started_at") if isinstance(timestamps, Mapping) else None,
+        fallback=fallback_summary,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2022,9 +2325,14 @@ def main(argv: list[str] | None = None) -> int:
                 fallback_plan,
                 runner_timeout_seconds=args.runner_timeout_seconds,
             )
-            output_path = Path(str(convergence["output_path"]))
-            status = str(convergence.get("status") or "ORCHESTRATOR_ERROR")
-            exit_code = 0 if status in {"CONVERGED", "NO_ACTION"} else (2 if status == "ORCHESTRATOR_ERROR" else 1)
+            final_summary = finalize_summary_after_fallback(contract, convergence)
+            if final_summary is not None:
+                output_path = contract.outputs.summary_json
+                exit_code = int(final_summary["exit_code"])
+            else:
+                output_path = Path(str(convergence["output_path"]))
+                status = str(convergence.get("status") or "ORCHESTRATOR_ERROR")
+                exit_code = 0 if status in {"CONVERGED", "NO_ACTION"} else (2 if status == "ORCHESTRATOR_ERROR" else 1)
         else:
             summary = run_activated_validation(
                 contract,

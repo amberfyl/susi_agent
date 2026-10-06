@@ -179,7 +179,7 @@ try {
             [UInt32]$maximumBlockLength = 0
             $capsStatus = [NativeSusi]::SusiI2CGetCaps($apiId, $capsItemId, [ref]$maximumBlockLength)
             Add-ApiCall -report $report -name "SusiI2CGetCaps:$channel" -status $capsStatus -value $maximumBlockLength
-            $capsAccepted = (Is-Success $capsStatus) -or ((-not $requireCaps) -and $capsStatus -eq [UInt32]0xFFFFFCFF)
+            $capsAccepted = (Is-Success $capsStatus) -or ((-not $requireCaps) -and $capsStatus -eq [Convert]::ToUInt32('FFFFFCFF', 16))
             $meta.caps = [ordered]@{
                 item_id = ('0x{0:X8}' -f $capsItemId)
                 status = Get-StatusName $capsStatus
@@ -192,7 +192,7 @@ try {
             [UInt32]$frequencyKHz = 0
             $frequencyStatus = [NativeSusi]::SusiI2CGetFrequency($apiId, [ref]$frequencyKHz)
             Add-ApiCall -report $report -name "SusiI2CGetFrequency:$channel" -status $frequencyStatus -value $frequencyKHz
-            $frequencyAccepted = (Is-Success $frequencyStatus) -or ((-not $requireFrequency) -and $frequencyStatus -eq [UInt32]0xFFFFFCFF)
+            $frequencyAccepted = (Is-Success $frequencyStatus) -or ((-not $requireFrequency) -and $frequencyStatus -eq [Convert]::ToUInt32('FFFFFCFF', 16))
             $frequencyInRange = (-not (Is-Success $frequencyStatus)) -or ($frequencyKHz -ge $minKHz -and $frequencyKHz -le $maxKHz)
             $meta.frequency = [ordered]@{
                 status = Get-StatusName $frequencyStatus
@@ -215,14 +215,117 @@ try {
             $report.validation_layers.L3_api = 'PASS'
             $report.validation_layers.L4_readback = 'FAIL'
         } else {
-            $report.result = 'CONDITIONAL'
-            $report.reason = 'Pure software I2C validation passed; 0xAC/0xAE transaction validation requires an approved fixture.'
+            # Phase 1 write path: change the bus frequency, read it back, restore it.
+            # Falls back to a device probe scan when SetFrequency is unsupported.
+            $setCfg = Get-ConfigValue -Config $config -Name 'frequency_set_check' -Default ([ordered]@{})
+            $alternateKHz = [UInt32](Get-ConfigValue -Config $setCfg -Name 'alternate_khz' 100)
+            $fallbackKHz = [UInt32](Get-ConfigValue -Config $setCfg -Name 'fallback_khz' 400)
+            $unsupportedStatus = [Convert]::ToUInt32('FFFFFCFF', 16)
+            $setTests = [ordered]@{}
+            $setFailures = @()
+            $restoreFailures = @()
+            $verified = @()
+            $unverified = @()
+            foreach ($channel in $required) {
+                $meta = $channelMetrics[$channel]
+                $apiId = [UInt32]$meta.i2c_api_id_value
+                $test = [ordered]@{
+                    original_khz = $null; target_khz = $null; set_status = $null; readback_khz = $null
+                    restore_status = $null; restored_khz = $null; probe_devices = @(); result = 'NOT_RUN'
+                }
+                $setTests[$channel] = $test
+
+                if ($null -ne $meta.frequency.khz) {
+                    $originalKHz = [UInt32]$meta.frequency.khz
+                    $targetKHz = if ($originalKHz -ne $alternateKHz) { $alternateKHz } else { $fallbackKHz }
+                    $test.original_khz = $originalKHz
+                    $test.target_khz = $targetKHz
+                    $setStatus = [NativeSusi]::SusiI2CSetFrequency($apiId, $targetKHz)
+                    Add-ApiCall -report $report -name "SusiI2CSetFrequency:$channel" -status $setStatus -value $targetKHz
+                    $test.set_status = Get-StatusName $setStatus
+                    if (Is-Success $setStatus) {
+                        [UInt32]$readKHz = 0
+                        $readStatus = [NativeSusi]::SusiI2CGetFrequency($apiId, [ref]$readKHz)
+                        Add-ApiCall -report $report -name "SusiI2CGetFrequency:${channel}:readback" -status $readStatus -value $readKHz
+                        if (Is-Success $readStatus) { $test.readback_khz = $readKHz }
+
+                        $restoreStatus = [NativeSusi]::SusiI2CSetFrequency($apiId, $originalKHz)
+                        Add-ApiCall -report $report -name "SusiI2CSetFrequency:${channel}:restore" -status $restoreStatus -value $originalKHz
+                        [UInt32]$restoredKHz = 0
+                        $restoredStatus = [NativeSusi]::SusiI2CGetFrequency($apiId, [ref]$restoredKHz)
+                        Add-ApiCall -report $report -name "SusiI2CGetFrequency:${channel}:restored" -status $restoredStatus -value $restoredKHz
+                        $test.restore_status = Get-StatusName $restoreStatus
+                        if (Is-Success $restoredStatus) { $test.restored_khz = $restoredKHz }
+
+                        $restored = (Is-Success $restoreStatus) -and (Is-Success $restoredStatus) -and ($restoredKHz -eq $originalKHz)
+                        $changed = (Is-Success $readStatus) -and ($readKHz -ne $originalKHz)
+                        if (-not $restored) {
+                            $test.result = 'FAIL_RESTORE'
+                            $restoreFailures += $channel
+                        } elseif (-not $changed) {
+                            $test.result = 'FAIL_READBACK'
+                            $setFailures += "${channel}:FrequencyReadback"
+                        } else {
+                            $test.result = 'PASS'
+                            $verified += ('{0}({1}->{2}->{3} kHz)' -f $channel, $originalKHz, $readKHz, $restoredKHz)
+                        }
+                        continue
+                    }
+                    if ($setStatus -ne $unsupportedStatus) {
+                        $test.result = 'FAIL_SET'
+                        $setFailures += "${channel}:SetFrequency"
+                        continue
+                    }
+                }
+
+                # SetFrequency unsupported (or no frequency): probe 7-bit addresses 0x08..0x77.
+                $found = @()
+                for ($address = 0x08; $address -le 0x77; $address++) {
+                    $probeStatus = [NativeSusi]::SusiI2CProbeDevice($apiId, [UInt32]($address -shl 1))
+                    if (Is-Success $probeStatus) { $found += ('0x{0:X2}' -f $address) }
+                }
+                Add-ApiCall -report $report -name "SusiI2CProbeDevice:${channel}:scan" -status ([UInt32]0) -value ($found -join ',')
+                $test.probe_devices = $found
+                if ($found.Count -gt 0) {
+                    $test.result = 'PASS_PROBE'
+                    $verified += ('{0}(device ACK at {1})' -f $channel, ($found -join ','))
+                } else {
+                    $test.result = 'NO_DEVICE_RESPONDED'
+                    $unverified += $channel
+                }
+            }
+            $report.metrics.frequency_set_test = $setTests
+
             $report.validation_layers.L3_api = 'PASS'
-            $report.validation_layers.L4_readback = 'PASS'
             $report.validation_layers.L5_functional = 'PENDING_FIXTURE'
-            $report.validation_layers.L6_recovery = 'N_A'
+            if ($restoreFailures.Count -gt 0) {
+                $report.result = 'FAIL_READBACK'
+                $report.reason = 'I2C frequency could not be restored on: ' + ($restoreFailures -join ', ')
+                $report.validation_layers.L4_readback = 'FAIL'
+                $report.validation_layers.L6_recovery = 'FAIL'
+                $report.checks.recovery = 'FAIL'
+            } elseif ($setFailures.Count -gt 0) {
+                $report.result = 'FAIL_READBACK'
+                $report.reason = 'I2C frequency set/readback failed: ' + ($setFailures -join ', ')
+                $report.validation_layers.L4_readback = 'FAIL'
+                $report.validation_layers.L6_recovery = 'PASS'
+                $report.checks.recovery = 'PASS'
+            } elseif ($unverified.Count -gt 0) {
+                $report.result = 'CONDITIONAL'
+                $report.reason = 'SetFrequency unsupported and no device responded on: ' + ($unverified -join ', ') + '; bus path not exercised.'
+                $report.validation_layers.L4_readback = 'CONDITIONAL'
+                $report.validation_layers.L6_recovery = 'N_A'
+                $report.checks.recovery = 'NOT_REQUIRED'
+            } else {
+                $report.result = 'PASS'
+                $report.reason = 'I2C API path verified: ' + ($verified -join '; ')
+                $report.validation_layers.L4_readback = 'PASS'
+                # Recovery applies only when a frequency was actually changed.
+                $changedAny = @($setTests.Values | Where-Object { $_.result -eq 'PASS' }).Count -gt 0
+                $report.validation_layers.L6_recovery = if ($changedAny) { 'PASS' } else { 'N_A' }
+                $report.checks.recovery = if ($changedAny) { 'PASS' } else { 'NOT_REQUIRED' }
+            }
             $report.checks.read_stability = 'PASS'
-            $report.checks.recovery = 'NOT_REQUIRED'
         }
     }
 

@@ -79,7 +79,8 @@ class MachineBFullValidationRegistryTests(unittest.TestCase):
                 for switch in entry.opt_in_switches:
                     self.assertIn(f"[switch]${switch}", runner_text)
                 self.assertEqual(entry.script_dependencies, ("common_susi.ps1",))
-                self.assertEqual(entry.default_switches, ())
+                for switch in entry.default_switches:
+                    self.assertIn(switch, entry.opt_in_switches)
 
     def test_dangerous_or_fixture_operations_are_explicit_opt_in(self):
         from run_machineB_full_validation import SECTION_REGISTRY_BY_NAME

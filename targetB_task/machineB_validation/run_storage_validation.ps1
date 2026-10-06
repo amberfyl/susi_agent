@@ -156,6 +156,7 @@ try {
         $report.validation_layers.L5_functional = if ($writeFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
         $report.validation_layers.L6_recovery = if ($writeFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
         if ($writeFailures.Count -gt 0) { $report.result = 'FAIL_FUNCTIONAL'; $report.reason = 'StorageArea write/verify/restore failed.' }
+        elseif ($report.result -eq 'PASS') { $report.reason = 'StorageArea write/verify/restore passed.' }
     }
     $report.checks.read_stability = if ($report.result -like 'FAIL*') { 'FAIL' } else { 'PASS' }
     $report.checks.control_effect = 'NOT_RUN'
