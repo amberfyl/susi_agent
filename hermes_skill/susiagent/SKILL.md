@@ -32,6 +32,11 @@ Always read the current files; never rely on remembered summaries. When sources 
 
 - `--limit` may be added to `--validate` or `--all`: the validation is read-only (see 3.9).
 - `--user` defaults to `susiaa`. The host must be given in the current invocation; never infer it from context or an unrelated SSH alias.
+- Target syntax: `susiaa@<IP>` in the command means `--user susiaa --host <IP>`. The user usually gives two IPs for the same Machine-B:
+  - **SSH IP** (office LAN, DHCP, e.g. `172.22.12.*` / `172.22.13.*`): the primary path.
+  - **Direct-link static IP** (`192.168.100.10–50`, this host is `192.168.100.1`): the fallback.
+  Both change when the test disk moves to another platform, so use only the IPs given in the current invocation.
+- Transport: **SSH first, WinRM only as fallback.** Probe fetch (3.2) uses `--mode auto`, which tries SSH on every given IP, then WinRM on the direct-link IP. Validation (3.9) is SSH-only.
 - `--all`, `--validate` and `--limit` belong to this skill; never pass them to `susi_gen.py`.
 - `--all` / `--validate` authorize the phase 1 validation lifecycle: staging, backup, one full-INI deploy, one reload, the runners with their reversible write tests (set → read back → restore), report collection, rollback, one recovery reload. They never enable fixture (`EnableFixtureTest`) or stimulus (`EnableStimulus`) switches.
 - `--validate` preflight (stop and report if any fails): `<PROJECT>-pre.ini` and `<PROJECT>-section-matrix.json` exist, `section-matrix.project` equals `<PROJECT>`, and no section is blocked. Report the INI's last-modified time so the user can see which INI is being tested. Do not re-run 3.2–3.8; the section JSON is rebuilt from the matrix by the validator itself.
@@ -48,11 +53,12 @@ Always use `<REPO>/.venv/bin/python`. Pass absolute, project-local paths for eve
 ### 3.2 Fetch the probe report (skip in local-probe mode, see 5.1)
 ```
 <REPO>/.venv/bin/python <REPO>/fetch_probe.py --mode auto --ssh-user susiaa --project <PROJECT> \
+  --host <SSH_IP> [--hosts <DIRECT_LINK_IP>] \
   --remote-bat "C:/Users/susiaa/Desktop/suto/V7/run_susi_full_probe.bat" \
   --remote-report "C:/Users/susiaa/Desktop/suto/V7/susi_full_probe_report.txt" \
   --dir <REPO>/CASES/<PROJECT> --output-name <PROJECT>_susi_board_probe_report.txt
 ```
-- Add `--host <HOST>` when the user names a host. Add `--probe-kind spd_idx` (output `<PROJECT>_susi_spd_idx_probe_report.txt`) for AMD platforms.
+- `auto` order: SSH on `<SSH_IP>`, then SSH on `<DIRECT_LINK_IP>`, then WinRM on `<DIRECT_LINK_IP>`. WinRM is never tried on an IP outside `192.168.100.10–50` and never guessed from a default pool. Use `--mode winrm --host <DIRECT_LINK_IP>` only when the user explicitly asks for WinRM. Add `--probe-kind spd_idx` (output `<PROJECT>_susi_spd_idx_probe_report.txt`) for AMD platforms.
 - If fetching fails, report the exact error and stop. Connection problems: see the runbook index (section 6).
 
 ### 3.3 Extract and understand the request form
@@ -75,7 +81,7 @@ Always use `<REPO>/.venv/bin/python`. Pass absolute, project-local paths for eve
 - Use `circuit*.pdf` only when `circuit*` images are insufficient.
 
 ### 3.5 Analyze images and write the intermediate JSON (agent work)
-Write each artifact into the project directory before running generation (3.6). The generator uses existing artifacts as-is. For the BIOS cache and the GPIO trace only, a missing or incomplete artifact makes the generator analyze the images itself (fallback via `SUSI_VISION_CMD`, section 7); that fallback is a one-shot analysis and weaker than yours, so do not rely on it.
+Write each artifact into the project directory before running generation (3.6). The generator uses existing artifacts as-is. For the BIOS cache and the GPIO trace only, a missing or incomplete artifact makes the generator analyze the images itself (fallback via the agent CLI, section 7); that fallback is a one-shot analysis and weaker than yours, so do not rely on it.
 
 For every schematic analysis allowed by 3.4: locate the hits by keyword first, then judge only from focused high-resolution crops where the text is clearly readable. A full-page render is for navigation only. Save crops in the project directory (see `prompts/gpio_trace.md`, "Reading PDF schematics and small text").
 
@@ -115,6 +121,7 @@ For every schematic analysis allowed by 3.4: locate the hits by keyword first, t
 <REPO>/.venv/bin/python <REPO>/run_machineB_full_validation.py --project <PROJECT> --repo-root <REPO> \
   --run-id <UNIQUE_RUN_ID> --execute --host <MACHINE_B_HOST> --user <USER> [--no-write-tests]
 ```
+- `<MACHINE_B_HOST>` is the SSH IP. Validation has no WinRM path. If SSH to that IP fails, report it and ask before retrying over SSH on the direct-link IP; never switch IPs silently in the middle of a run.
 - Add `--no-write-tests` only when the user gave `--limit`. Then no set/write/control switch reaches any runner; sections with a Set API that were not exercised report `CONDITIONAL`, and the summary's Scope line says `READ-ONLY`.
 - Use a new unique run ID each time; never delete or reuse an existing run directory.
 - Never run this when generation is blocked or artifacts belong to another project.
@@ -157,7 +164,6 @@ Files in `~/.hermes/skills/software-development/susiagent/references/`. Use them
 | Situation | Runbook |
 |---|---|
 | WSL cannot reach Machine-B but Windows can | `wsl-windows-powershell-ssh-bridge.md` |
-| `fetch_probe.py --mode auto` crashes with `UnicodeDecodeError` | `winrm-unicodedecode-explicit-ssh-fallback.md` |
 | Multiple hosts / WinRM-first failover / backing up before editing fetch code | `winrm-auto-failover-and-backup-guard.md` |
 | SSH host-key conflict, or the user asks to first check existing SSH setup | `ssh-readonly-inventory-before-hostkey-remediation.md` |
 | Machine-B rebooted or blue-screened after a run | `susi-target-crash-triage.md` |
@@ -169,10 +175,11 @@ Files in `~/.hermes/skills/software-development/susiagent/references/`. Use them
 
 ## 7. Fixed defaults
 - Python: `<REPO>/.venv/bin/python` (never system `python3`).
-- Probe host pool (auto order): `192.168.100.16`, `192.168.100.15`, `172.22.12.77`; SSH user `susiaa`.
+- Machine-B IPs: none are fixed. The same test disk moves between platforms and each NIC gets a different IP, so `fetch_probe.py` requires `--host`; always use the IPs from the current invocation. SSH user `susiaa`.
+- WinRM: fallback only, on user-named static IPs in `192.168.100.10–50`; this host is `192.168.100.1`. SSH is also open on the direct-link IP.
 - Remote full probe: `C:/Users/susiaa/Desktop/suto/V7/run_susi_full_probe.bat` → `susi_full_probe_report.txt`.
 - Remote AMD SPD probe: `C:/Users/susiaa/Desktop/suto/V7/run_susi_spd_idx_probe.bat` → `susi_spd_idx_probe_report.txt`.
-- Fallback vision command used by the generator when an artifact is missing: env `SUSI_VISION_CMD` (default `hermes -z {prompt} -t vision`; `{prompt}` = prompt text, `{image}` = image path).
+- LLM calls made by the program (PDF extract, request-form understanding, vision fallback) all go through `agent_llm.py`, which runs the agent CLI from env `SUSI_AGENT_CMD` (legacy `SUSI_VISION_CMD`; default `hermes -z {prompt} -t vision`; `{prompt}` = prompt text, `{image}` = first image path). Provider, model and credentials are whatever Hermes is currently configured with; the program never sets them, and `LLM_*` env vars are not read.
 - User communication: concise Traditional Chinese, result first. Target-machine console/report text stays English ASCII.
 
 ## 8. Where new knowledge goes (do not scatter notes)
