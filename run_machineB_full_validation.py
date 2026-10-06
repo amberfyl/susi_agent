@@ -33,6 +33,7 @@ from machineb_fallback import (
     FallbackAttemptCandidate,
     apply_project_route_overrides,
     execute_fallback_plan,
+    gpio_capability_coverage,
     load_and_validate_fallback_plan,
     load_candidate_registry,
     persist_project_route_overrides,
@@ -1290,6 +1291,85 @@ def _normalize_report_verdict(report: Mapping[str, Any]) -> tuple[str, str | Non
     return verdict, str(sw_verdict) if sw_verdict is not None else None, str(dqa_verdict) if dqa_verdict is not None else None
 
 
+def _gpio_suspect_pins(contract: Any, report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """GPIO keys whose bit is missing from the capability mask, with trace evidence.
+
+    A partial mask means the route is right but these pins' traced group/bit is
+    probably wrong (often the adjacent pin); they are reported, never changed.
+    """
+
+    coverage = gpio_capability_coverage(report)
+    if not any(item["missing"] for item in coverage.values()):
+        return []
+    inputs = getattr(contract, "inputs", None)
+    project = getattr(contract, "project", "")
+    try:
+        config = json.loads(
+            (Path(inputs.config_dir) / f"{project}_gpio.json").read_text(encoding="utf-8-sig")
+        )
+    except Exception:
+        config = {}
+    try:
+        trace = json.loads(
+            (Path(inputs.case_dir) / f"{project}-gpio-trace.json").read_text(encoding="utf-8")
+        )
+    except Exception:
+        trace = {}
+    banks = config.get("banks") if isinstance(config.get("banks"), dict) else {}
+    bank_names = {
+        meta.get("bank_number"): name for name, meta in banks.items() if isinstance(meta, dict)
+    }
+    trace_by_key = {
+        str(item.get("report_name")): item
+        for item in (trace.get("items") or [])
+        if isinstance(item, dict)
+    }
+    pins: list[dict[str, Any]] = []
+    channels = config.get("channels") if isinstance(config.get("channels"), dict) else {}
+    for key, channel in channels.items():
+        if not isinstance(channel, dict):
+            continue
+        bank = bank_names.get(channel.get("bank"))
+        bank_coverage = coverage.get(str(bank))
+        try:
+            bitmask = int(str(channel.get("bank_bitmask")), 0)
+        except ValueError:
+            continue
+        if not bank_coverage or not bank_coverage["missing"] & bitmask:
+            continue
+        traced = trace_by_key.get(str(key), {})
+        pins.append({
+            "key": key,
+            "bank": bank,
+            "bit": bitmask.bit_length() - 1,
+            "signal": traced.get("signal"),
+            "function_label": traced.get("function_label"),
+            "group": traced.get("group", channel.get("tuple_group")),
+            "pin": traced.get("bit", channel.get("tuple_pin")),
+            "package_pin": traced.get("package_pin"),
+        })
+    return pins
+
+
+def _gpio_partial_mask_reason(report: Mapping[str, Any], pins: list[dict[str, Any]]) -> str:
+    coverage = gpio_capability_coverage(report)
+    masks = "; ".join(
+        f"{bank} expected 0x{item['expected']:08X}, supported 0x{item['supported']:08X}"
+        for bank, item in coverage.items()
+        if item["missing"]
+    )
+    total = sum(bin(item["expected"]).count("1") for item in coverage.values())
+    described = "; ".join(
+        f"{pin['key']} = {pin.get('signal') or '?'} -> {pin.get('function_label') or '?'} "
+        f"(group {pin.get('group')}, bit {pin.get('pin')})"
+        for pin in pins
+    )
+    return (
+        f"Route OK, but {len(pins)} of {total} GPIO not supported by the capability mask "
+        f"({masks}): {described}. Check these schematic traces (often the adjacent pin)."
+    )
+
+
 def _section_reason(report: Mapping[str, Any], verdict: str) -> tuple[str, str | None]:
     """Return (headline reason, phase 2 observation).
 
@@ -1492,14 +1572,20 @@ def execute_validation_sections(
             warnings.append(
                 f"runner exit code {command['exit_code']} disagrees with report verdict {verdict}"
             )
+        gpio_pins = _gpio_suspect_pins(contract, report) if section == "GPIO" else []
         completed = {
             "sequence": section_plan.get("sequence"),
             "section": section,
             "execution_status": "COMPLETED",
             "verdict": verdict,
             "result": report.get("result"),
-            "reason": _section_reason(report, verdict)[0],
+            "reason": (
+                _gpio_partial_mask_reason(report, gpio_pins)
+                if gpio_pins
+                else _section_reason(report, verdict)[0]
+            ),
             "phase2_observation": _section_reason(report, verdict)[1],
+            "gpio_suspect_pins": gpio_pins,
             "channel_summary": report.get("channel_summary"),
             "validation_layers": report.get("validation_layers"),
             "sw_verdict": sw_verdict,
@@ -2199,10 +2285,19 @@ def finalize_summary_after_fallback(
                 try:
                     report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
                     verdict, sw_verdict, dqa_verdict = _normalize_report_verdict(report)
+                    gpio_pins = (
+                        _gpio_suspect_pins(contract, report)
+                        if str(item.get("section")) == "GPIO" else []
+                    )
                     item.update({
                         "verdict": verdict,
                         "result": report.get("result"),
-                        "reason": _section_reason(report, verdict)[0],
+                        "gpio_suspect_pins": gpio_pins,
+                        "reason": (
+                            _gpio_partial_mask_reason(report, gpio_pins)
+                            if gpio_pins
+                            else _section_reason(report, verdict)[0]
+                        ),
                         "phase2_observation": _section_reason(report, verdict)[1],
                         "channel_summary": report.get("channel_summary"),
                         "validation_layers": report.get("validation_layers"),

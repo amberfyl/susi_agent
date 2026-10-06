@@ -52,7 +52,7 @@
           "success_condition": {
             "enum": [
               "ANY_CHANNEL_API_SUCCEEDED",
-              "ALL_REQUIRED_GPIO_CAPS_AND_READS_PASSED"
+              "GPIO_CAPS_READS_OK_AND_MAJORITY_PINS_SUPPORTED"
             ]
           },
           "passed_channels": {"type": "array", "maxItems": 0},
@@ -73,7 +73,7 @@
             "then": {
               "properties": {
                 "trigger_code": {"const": "EXPECTED_GPIO_ROUTE_PROBES_ALL_FAILED"},
-                "success_condition": {"const": "ALL_REQUIRED_GPIO_CAPS_AND_READS_PASSED"}
+                "success_condition": {"const": "GPIO_CAPS_READS_OK_AND_MAJORITY_PINS_SUPPORTED"}
               }
             },
             "else": {

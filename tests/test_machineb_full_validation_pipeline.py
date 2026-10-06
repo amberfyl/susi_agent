@@ -362,6 +362,48 @@ class ReadOnlySummaryTests(unittest.TestCase):
             self.assertIn("Scope: Phase 1 - SW API READ-ONLY (write tests disabled by --no-write-tests)", text)
 
 
+class GpioSuspectPinTests(unittest.TestCase):
+    def test_missing_mask_bits_are_named_with_trace_evidence(self):
+        from run_machineB_full_validation import _gpio_partial_mask_reason, _gpio_suspect_pins
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_dir = root / "config"
+            config_dir.mkdir()
+            channels = {
+                f"GPIO{i:02d}": {"bank": 0, "bank_bitmask": f"0x{1 << i:08X}", "tuple_group": 0, "tuple_pin": i}
+                for i in range(16)
+            }
+            (config_dir / "BOARD_gpio.json").write_text(json.dumps({
+                "channels": channels,
+                "banks": {"Bank0": {"bank_number": 0, "expected_mask": "0x0000FFFF"}},
+            }), encoding="utf-8")
+            (root / "BOARD-gpio-trace.json").write_text(json.dumps({"items": [
+                {"report_name": "GPIO12", "signal": "EC_P2_GPIO4", "function_label": "GPIO57/KBRST#", "group": 5, "bit": 7},
+                {"report_name": "GPIO14", "signal": "EC_P2_GPIO6", "function_label": "GPIO91", "group": 9, "bit": 1},
+            ]}), encoding="utf-8")
+            contract = SimpleNamespace(project="BOARD", inputs=SimpleNamespace(config_dir=config_dir, case_dir=root))
+            report = {"metrics": {"banks": {"Bank0": {
+                "expected_mask": "0x0000FFFF", "input_support": "0x0000AFFF", "output_support": "0x0000AFFF",
+            }}}}
+
+            pins = _gpio_suspect_pins(contract, report)
+
+            self.assertEqual([p["key"] for p in pins], ["GPIO12", "GPIO14"])
+            self.assertEqual((pins[0]["signal"], pins[0]["group"], pins[0]["pin"]), ("EC_P2_GPIO4", 5, 7))
+            reason = _gpio_partial_mask_reason(report, pins)
+            self.assertIn("Route OK, but 2 of 16 GPIO not supported", reason)
+            self.assertIn("GPIO12 = EC_P2_GPIO4 -> GPIO57/KBRST# (group 5, bit 7)", reason)
+
+    def test_full_mask_has_no_suspects(self):
+        from run_machineB_full_validation import _gpio_suspect_pins
+
+        report = {"metrics": {"banks": {"Bank0": {
+            "expected_mask": "0x0000FFFF", "input_support": "0x0000FFFF", "output_support": "0x0000FFFF",
+        }}}}
+        self.assertEqual(_gpio_suspect_pins(SimpleNamespace(project="X", inputs=None), report), [])
+
+
 class FallbackFinalSummaryTests(unittest.TestCase):
     def _baseline(self, contract):
         from run_machineB_full_validation import write_validation_summary

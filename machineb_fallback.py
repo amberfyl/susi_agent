@@ -16,7 +16,10 @@ FALLBACK_REGISTRY_SCHEMA_VERSION = "machineb.fallback_candidate_registry.v1"
 FALLBACK_PLAN_SCHEMA_VERSION = "machineb.fallback_plan.v1"
 PROJECT_OVERRIDE_SCHEMA_VERSION = "machineb.project_route_overrides.v1"
 GPIO_TRIGGER_CODE = "EXPECTED_GPIO_ROUTE_PROBES_ALL_FAILED"
-GPIO_SUCCESS_CONDITION = "ALL_REQUIRED_GPIO_CAPS_AND_READS_PASSED"
+# A GPIO route candidate is correct when GetCaps/GetDirection/GetLevel succeed
+# on every bank and more than half of the expected pins are supported. Missing
+# pins are a pin-trace problem reported per GPIO, not a wrong route.
+GPIO_SUCCESS_CONDITION = "GPIO_CAPS_READS_OK_AND_MAJORITY_PINS_SUPPORTED"
 DEFAULT_TRIGGER_CODE = "EXPECTED_SECTION_ALL_CHANNEL_API_FAILED"
 DEFAULT_SUCCESS_CONDITION = "ANY_CHANNEL_API_SUCCEEDED"
 
@@ -278,6 +281,38 @@ def _gpio_route_probe_outcomes(
     return "ALL_FAILED", (), tuple(failed)
 
 
+def _hex_or_none(value: object) -> int | None:
+    try:
+        return int(str(value).strip(), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def gpio_capability_coverage(report: Mapping[str, object]) -> dict[str, dict[str, int]]:
+    """Per bank: expected mask, mask supported for both input and output, missing."""
+
+    metrics = report.get("metrics")
+    banks = metrics.get("banks") if isinstance(metrics, dict) else None
+    coverage: dict[str, dict[str, int]] = {}
+    if not isinstance(banks, dict):
+        return coverage
+    for bank, raw in banks.items():
+        if not isinstance(raw, dict):
+            continue
+        expected = _hex_or_none(raw.get("expected_mask"))
+        inputs = _hex_or_none(raw.get("input_support"))
+        outputs = _hex_or_none(raw.get("output_support"))
+        if expected is None or inputs is None or outputs is None:
+            continue
+        supported = expected & inputs & outputs
+        coverage[str(bank)] = {
+            "expected": expected,
+            "supported": supported,
+            "missing": expected & ~supported,
+        }
+    return coverage
+
+
 def _gpio_candidate_succeeded(report: Mapping[str, object]) -> bool:
     metrics = report.get("metrics")
     banks = metrics.get("banks") if isinstance(metrics, dict) else None
@@ -290,10 +325,9 @@ def _gpio_candidate_succeeded(report: Mapping[str, object]) -> bool:
         if isinstance(call, dict):
             statuses[str(call.get("name") or "")] = call.get("status_code")
 
+    coverage = gpio_capability_coverage(report)
     for bank, raw_metrics in banks.items():
-        if not isinstance(raw_metrics, dict):
-            return False
-        if raw_metrics.get("caps_ok") is not True or raw_metrics.get("reads_ok") is not True:
+        if not isinstance(raw_metrics, dict) or raw_metrics.get("reads_ok") is not True:
             return False
         required = (
             f"GPIO GetCaps input:{bank}",
@@ -305,6 +339,13 @@ def _gpio_candidate_succeeded(report: Mapping[str, object]) -> bool:
             name not in statuses or not _status_code_succeeded(statuses[name])
             for name in required
         ):
+            return False
+        bank_coverage = coverage.get(str(bank))
+        if bank_coverage is None:
+            return False
+        expected_pins = bin(bank_coverage["expected"]).count("1")
+        supported_pins = bin(bank_coverage["supported"]).count("1")
+        if expected_pins == 0 or supported_pins * 2 <= expected_pins:
             return False
     return True
 

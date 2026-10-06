@@ -203,7 +203,7 @@ class FallbackPlanTests(unittest.TestCase):
 
         section = plan["sections"][0]
         self.assertEqual(section["trigger_code"], "EXPECTED_GPIO_ROUTE_PROBES_ALL_FAILED")
-        self.assertEqual(section["success_condition"], "ALL_REQUIRED_GPIO_CAPS_AND_READS_PASSED")
+        self.assertEqual(section["success_condition"], "GPIO_CAPS_READS_OK_AND_MAJORITY_PINS_SUPPORTED")
 
         import json
         import jsonschema

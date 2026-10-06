@@ -180,10 +180,10 @@ class FallbackExecutorCoreTests(unittest.TestCase):
             "status": "PLANNED",
             "route_candidates": ["0x42", "0x44"],
             "option_fallback_enabled": False,
-            "success_condition": "ALL_REQUIRED_GPIO_CAPS_AND_READS_PASSED",
+            "success_condition": "GPIO_CAPS_READS_OK_AND_MAJORITY_PINS_SUPPORTED",
         }
 
-    def _gpio_attempt_payload(self, candidate, *, caps_ok, reads_ok=True):
+    def _gpio_attempt_payload(self, candidate, *, caps_ok, reads_ok=True, supported="0x0000FFFF"):
         success = "0x00000000"
         failure = "0xFFFFFCFF"
         caps_status = success if caps_ok else failure
@@ -199,7 +199,13 @@ class FallbackExecutorCoreTests(unittest.TestCase):
                     {"name": "GPIO GetDirection:Bank0", "status_code": reads_status},
                     {"name": "GPIO GetLevel:Bank0", "status_code": reads_status},
                 ],
-                "metrics": {"banks": {"Bank0": {"caps_ok": caps_ok, "reads_ok": reads_ok}}},
+                "metrics": {"banks": {"Bank0": {
+                    "caps_ok": caps_ok and supported == "0x0000FFFF",
+                    "reads_ok": reads_ok,
+                    "expected_mask": "0x0000FFFF",
+                    "input_support": supported if caps_ok else "0x00000000",
+                    "output_support": supported if caps_ok else "0x00000000",
+                }}},
             },
             "report_path": f"{candidate.route_value}.json",
             "report_sha256": "a" * 64,
@@ -218,6 +224,33 @@ class FallbackExecutorCoreTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "ALL_CANDIDATES_FAILED")
         self.assertTrue(all(not attempt["success"] for attempt in result["attempts"]))
+
+    def test_gpio_partial_mask_with_majority_pins_converges_route(self):
+        from machineb_fallback import execute_section_fallback
+
+        result = execute_section_fallback(
+            baseline_ini_text=BASELINE_INI,
+            plan_section=self._gpio_plan_section(),
+            attempt_runner=lambda candidate: self._gpio_attempt_payload(
+                candidate, caps_ok=True, supported="0x0000AFFF"
+            ),
+        )
+
+        self.assertEqual(result["status"], "CONVERGED")
+        self.assertEqual(result["selected_route"], "0x42")
+
+    def test_gpio_half_or_fewer_pins_does_not_converge(self):
+        from machineb_fallback import execute_section_fallback
+
+        result = execute_section_fallback(
+            baseline_ini_text=BASELINE_INI,
+            plan_section=self._gpio_plan_section(),
+            attempt_runner=lambda candidate: self._gpio_attempt_payload(
+                candidate, caps_ok=True, supported="0x000000FF"
+            ),
+        )
+
+        self.assertEqual(result["status"], "ALL_CANDIDATES_FAILED")
 
     def test_gpio_first_candidate_with_caps_and_reads_passed_converges(self):
         from machineb_fallback import execute_section_fallback
@@ -257,7 +290,7 @@ class FallbackPlanExecutorTests(unittest.TestCase):
                     "status": "PLANNED",
                     "route_candidates": ["0x42"],
                     "option_fallback_enabled": False,
-                    "success_condition": "ALL_REQUIRED_GPIO_CAPS_AND_READS_PASSED",
+                    "success_condition": "GPIO_CAPS_READS_OK_AND_MAJORITY_PINS_SUPPORTED",
                 },
             ]
         }
@@ -275,7 +308,10 @@ class FallbackPlanExecutorTests(unittest.TestCase):
                         {"name": "GPIO GetDirection:Bank0", "status_code": "0x00000000"},
                         {"name": "GPIO GetLevel:Bank0", "status_code": "0x00000000"},
                     ],
-                    "metrics": {"banks": {"Bank0": {"caps_ok": True, "reads_ok": True}}},
+                    "metrics": {"banks": {"Bank0": {
+                        "caps_ok": True, "reads_ok": True, "expected_mask": "0x0000FFFF",
+                        "input_support": "0x0000FFFF", "output_support": "0x0000FFFF",
+                    }}},
                 }
             return {
                 "deploy": {"status": "PASS"},
@@ -314,7 +350,7 @@ class FallbackPlanExecutorTests(unittest.TestCase):
                     "status": "PLANNED",
                     "route_candidates": ["0x42"],
                     "option_fallback_enabled": False,
-                    "success_condition": "ALL_REQUIRED_GPIO_CAPS_AND_READS_PASSED",
+                    "success_condition": "GPIO_CAPS_READS_OK_AND_MAJORITY_PINS_SUPPORTED",
                 },
             ]
         }

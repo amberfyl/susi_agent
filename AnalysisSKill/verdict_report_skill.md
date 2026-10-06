@@ -44,6 +44,7 @@
 6. **GPIO 能力遮罩只缺部分 bit**（例：要求 `0x0000FFFF`，回報 `0x00009FFF`）：
    - 代表 route 正確：channel、IOPort、option 都對，所以 GetCaps 成功、其他 bit 都支援。
    - 缺的 bit 對應的 `GPIOnn`（bit n = `GPIOnn`）**是 group/pin 錯了**，也就是電路圖追線錯誤，最常見是追到隔壁腳。
+   - fallback 時：GetCaps/讀取成功且支援腳位超過一半 → 該 IOPort 判定為正確路由，寫入最終 INI；缺的腳位讓 GPIO 判 `FAIL`，summary 逐支列出（程式自動產生，`gpio_suspect_pins`）。
    - 處理方式：**在報告中指出可疑腳位即可，不自動重新截圖追線**。每支列出：`GPIOnn`、外部訊號（例：`EC_P2_GPIO5`）、目前的 function label 與 group/pin，並註明「可能追錯腳（常見為隔壁腳），請人工確認」。
    - **禁止**：裁掉這些 GPIO、改 route／IOPort／option、判定為硬體不支援，或自行重新追線改值。
 7. **execution_status**：
