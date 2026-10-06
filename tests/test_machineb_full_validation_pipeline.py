@@ -362,46 +362,162 @@ class ReadOnlySummaryTests(unittest.TestCase):
             self.assertIn("Scope: Phase 1 - SW API READ-ONLY (write tests disabled by --no-write-tests)", text)
 
 
-class GpioSuspectPinTests(unittest.TestCase):
-    def test_missing_mask_bits_are_named_with_trace_evidence(self):
-        from run_machineB_full_validation import _gpio_partial_mask_reason, _gpio_suspect_pins
+def gpio_report(support, *, caps_status="0x00000000"):
+    return {
+        "category": "GPIO",
+        "result": "FAIL_API" if caps_status != "0x00000000" else "PASS",
+        "api_calls": [
+            {"name": "GPIO GetCaps input:Bank0", "status_code": caps_status},
+            {"name": "GPIO GetCaps output:Bank0", "status_code": caps_status},
+            {"name": "GPIO GetDirection:Bank0", "status_code": "0x00000000"},
+            {"name": "GPIO GetLevel:Bank0", "status_code": "0x00000000"},
+        ],
+        "metrics": {"banks": {"Bank0": {
+            "expected_mask": "0x0000FFFF", "input_support": support, "output_support": support,
+            "caps_ok": support == "0x0000FFFF", "reads_ok": True,
+        }}},
+    }
+
+
+class GpioOutcomeTests(unittest.TestCase):
+    def _contract(self, root):
+        config_dir = root / "config"
+        config_dir.mkdir()
+        channels = {
+            f"GPIO{i:02d}": {"bank": 0, "bank_bitmask": f"0x{1 << i:08X}", "tuple_group": 0, "tuple_pin": i}
+            for i in range(16)
+        }
+        (config_dir / "BOARD_gpio.json").write_text(json.dumps({
+            "channels": channels,
+            "banks": {"Bank0": {"bank_number": 0, "expected_mask": "0x0000FFFF"}},
+        }), encoding="utf-8")
+        (root / "BOARD-gpio-trace.json").write_text(json.dumps({"items": [
+            {"report_name": "GPIO12", "signal": "EC_P2_GPIO4", "function_label": "GPIO57/KBRST#", "group": 5, "bit": 7},
+            {"report_name": "GPIO14", "signal": "EC_P2_GPIO6", "function_label": "GPIO91", "group": 9, "bit": 1},
+        ]}), encoding="utf-8")
+        return SimpleNamespace(project="BOARD", inputs=SimpleNamespace(config_dir=config_dir, case_dir=root))
+
+    def test_partial_mask_is_fail_partial_and_names_missing_pins(self):
+        from run_machineB_full_validation import _gpio_outcome
 
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            config_dir = root / "config"
-            config_dir.mkdir()
-            channels = {
-                f"GPIO{i:02d}": {"bank": 0, "bank_bitmask": f"0x{1 << i:08X}", "tuple_group": 0, "tuple_pin": i}
-                for i in range(16)
-            }
-            (config_dir / "BOARD_gpio.json").write_text(json.dumps({
-                "channels": channels,
-                "banks": {"Bank0": {"bank_number": 0, "expected_mask": "0x0000FFFF"}},
-            }), encoding="utf-8")
-            (root / "BOARD-gpio-trace.json").write_text(json.dumps({"items": [
-                {"report_name": "GPIO12", "signal": "EC_P2_GPIO4", "function_label": "GPIO57/KBRST#", "group": 5, "bit": 7},
-                {"report_name": "GPIO14", "signal": "EC_P2_GPIO6", "function_label": "GPIO91", "group": 9, "bit": 1},
-            ]}), encoding="utf-8")
-            contract = SimpleNamespace(project="BOARD", inputs=SimpleNamespace(config_dir=config_dir, case_dir=root))
-            report = {"metrics": {"banks": {"Bank0": {
-                "expected_mask": "0x0000FFFF", "input_support": "0x0000AFFF", "output_support": "0x0000AFFF",
-            }}}}
+            contract = self._contract(Path(td))
+            verdict, reason, pins = _gpio_outcome(
+                contract, gpio_report("0x0000AFFF"), "PASS", "GPIO read validation passed"
+            )
 
-            pins = _gpio_suspect_pins(contract, report)
-
+            self.assertEqual(verdict, "FAIL")
             self.assertEqual([p["key"] for p in pins], ["GPIO12", "GPIO14"])
             self.assertEqual((pins[0]["signal"], pins[0]["group"], pins[0]["pin"]), ("EC_P2_GPIO4", 5, 7))
-            reason = _gpio_partial_mask_reason(report, pins)
-            self.assertIn("Route OK, but 2 of 16 GPIO not supported", reason)
+            self.assertTrue(reason.startswith("PARTIAL: 14 of 16 GPIO supported"))
             self.assertIn("GPIO12 = EC_P2_GPIO4 -> GPIO57/KBRST# (group 5, bit 7)", reason)
+            self.assertNotIn("Route OK", reason)
 
-    def test_full_mask_has_no_suspects(self):
-        from run_machineB_full_validation import _gpio_suspect_pins
+    def test_failed_getcaps_is_not_a_partial_mask_even_with_mask_bits(self):
+        # MIO-5854 run MIO-5854-20261006T064917Z: GetCaps returned 0xFFFFFCFF
+        # while the report still carried mask 0x000001E8.
+        from run_machineB_full_validation import _gpio_outcome
 
-        report = {"metrics": {"banks": {"Bank0": {
-            "expected_mask": "0x0000FFFF", "input_support": "0x0000FFFF", "output_support": "0x0000FFFF",
-        }}}}
-        self.assertEqual(_gpio_suspect_pins(SimpleNamespace(project="X", inputs=None), report), [])
+        with tempfile.TemporaryDirectory() as td:
+            contract = self._contract(Path(td))
+            verdict, reason, pins = _gpio_outcome(
+                contract, gpio_report("0x000001E8", caps_status="0xFFFFFCFF"), "FAIL", "x"
+            )
+
+            self.assertEqual(verdict, "FAIL")
+            self.assertEqual(pins, [])
+            self.assertIn("GetCaps failed on every bank", reason)
+            self.assertIn("GetCaps input:Bank0=0xFFFFFCFF", reason)
+            self.assertNotIn("Route OK", reason)
+            self.assertNotIn("PARTIAL", reason)
+
+    def test_full_mask_keeps_runner_verdict(self):
+        from run_machineB_full_validation import _gpio_outcome
+
+        verdict, reason, pins = _gpio_outcome(
+            SimpleNamespace(project="X", inputs=None), gpio_report("0x0000FFFF"), "PASS", "ok"
+        )
+        self.assertEqual((verdict, reason, pins), ("PASS", "ok", []))
+
+
+REGISTRY_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "targetB_task" / "machineB_validation" / "fallback_candidate_registry.json"
+)
+
+
+class FallbackPlanWriterTests(unittest.TestCase):
+    def _setup(self, td, *, eligible):
+        from run_machineB_full_validation import write_validation_summary
+
+        root = Path(td)
+        contract = make_contract(td)
+        full_ini = root / "BOARD-pre.ini"
+        full_ini.write_text(
+            "[GPIO]\nGPIO00=0x0000FFFD,0,0,0xA0000003,3,4,\nGPIO01=0x0000FFFD,0,0,0xA0000003,3,5,\n",
+            encoding="utf-8",
+        )
+        contract.inputs = SimpleNamespace(full_ini=full_ini, generated_sections=["GPIO"])
+        report = contract.outputs.reports_dir / "gpio_1.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(gpio_report("0x000001E8", caps_status="0xFFFFFCFF")), encoding="utf-8")
+        write_validation_summary(
+            contract,
+            runtime_ini={"status": "PASS"},
+            reload_result={"status": "PASS"},
+            section_results=[{
+                "section": "GPIO",
+                "execution_status": "COMPLETED",
+                "verdict": "FAIL",
+                "reason": "GetCaps failed on every bank",
+                "local_report_path": str(report),
+                "fallback_trigger": {
+                    "eligible": eligible,
+                    "code": "EXPECTED_GPIO_ROUTE_PROBES_ALL_FAILED" if eligible else "GPIO_ROUTE_PROBE_PARTIAL_SUCCESS_NO_FALLBACK",
+                    "reason": "r",
+                    "passed_channels": [] if eligible else ["Bank0"],
+                    "failed_channels": ["Bank0"] if eligible else [],
+                },
+            }],
+            rollback={"status": "PASS"},
+            errors=[],
+            warnings=[],
+        )
+        return contract, REGISTRY_PATH
+
+    def test_eligible_trigger_writes_a_plan_that_validates(self):
+        from machineb_fallback import load_and_validate_fallback_plan, load_candidate_registry
+        from run_machineB_full_validation import write_fallback_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            contract, registry = self._setup(td, eligible=True)
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("fallback trigger: ELIGIBLE EXPECTED_GPIO_ROUTE_PROBES_ALL_FAILED", text)
+
+            path = write_fallback_plan(contract, registry)
+
+            plan = load_and_validate_fallback_plan(
+                path,
+                expected_project="BOARD",
+                expected_run_id="run-1",
+                expected_full_ini=contract.inputs.full_ini,
+                registry=load_candidate_registry(registry),
+                applicable_sections={"GPIO"},
+            )
+            section = plan["sections"][0]
+            self.assertEqual(section["baseline_route"], "0")
+            self.assertNotIn("0", section["route_candidates"])
+            self.assertIn("0x2E", section["route_candidates"])
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("Fallback plan (GPIO): fallback-plan.json", text)
+
+    def test_ineligible_trigger_writes_no_plan(self):
+        from run_machineB_full_validation import write_fallback_plan
+
+        with tempfile.TemporaryDirectory() as td:
+            contract, registry = self._setup(td, eligible=False)
+            self.assertIsNone(write_fallback_plan(contract, registry))
+            self.assertFalse((contract.outputs.run_root / "fallback-plan.json").exists())
 
 
 class FallbackFinalSummaryTests(unittest.TestCase):
@@ -515,6 +631,38 @@ class FallbackFinalSummaryTests(unittest.TestCase):
             self.assertEqual(again["status"], "PASS")
             baseline = json.loads(baseline_json.read_text(encoding="utf-8"))
             self.assertEqual(baseline["status"], "SECTION_FAIL")
+
+    def test_partial_winner_converges_but_stays_fail_and_lists_attempts(self):
+        from run_machineB_full_validation import finalize_summary_after_fallback
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            contract.inputs = SimpleNamespace(
+                full_ini=Path(td) / "BOARD-pre.ini", config_dir=Path(td), case_dir=Path(td)
+            )
+            self._baseline(contract)
+            winner = contract.outputs.run_root / "fallback" / "gpio" / "attempt-002" / "reports" / "gpio_2.json"
+            winner.parent.mkdir(parents=True, exist_ok=True)
+            winner.write_text(json.dumps(gpio_report("0x00001FFF")), encoding="utf-8")
+            attempts = [
+                {"index": 1, "success": False, "route_value": "1", "gpio_caps_state": "ALL_FAILED",
+                 "gpio_supported_pins": 0, "gpio_expected_pins": 0,
+                 "report_path": self._attempt_report(contract, 1, "FAIL_API", "caps failed")},
+                {"index": 2, "success": True, "route_value": "0x2E", "gpio_caps_state": "PARTIAL_SUCCESS",
+                 "gpio_supported_pins": 13, "gpio_expected_pins": 16,
+                 "changed_keys": ["GPIO00"], "report_path": str(winner)},
+            ]
+
+            summary = finalize_summary_after_fallback(
+                contract, self._convergence(contract, status="CONVERGED", attempts=attempts)
+            )
+
+            gpio = next(item for item in summary["sections"] if item["section"] == "GPIO")
+            self.assertEqual(gpio["verdict"], "FAIL")
+            self.assertTrue(gpio["reason"].startswith("PARTIAL: 13 of 16 GPIO supported"))
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("IOPort/Address=0x2E written to the INI", text)
+            self.assertIn("tried: 1 GetCaps failed, 0x2E 13/16 pins", text)
 
     def test_exhausted_fallback_keeps_baseline_failure_and_records_attempts(self):
         from run_machineB_full_validation import finalize_summary_after_fallback

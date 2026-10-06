@@ -31,12 +31,16 @@ from typing import Any, Mapping
 from build_machineB_section_configs import BuildError, build_section_configs
 from machineb_fallback import (
     FallbackAttemptCandidate,
+    analyze_section_trigger,
     apply_project_route_overrides,
+    build_fallback_plan,
     execute_fallback_plan,
     gpio_capability_coverage,
+    gpio_pin_counts,
     load_and_validate_fallback_plan,
     load_candidate_registry,
     persist_project_route_overrides,
+    section_baseline_route,
 )
 
 
@@ -1351,23 +1355,44 @@ def _gpio_suspect_pins(contract: Any, report: Mapping[str, Any]) -> list[dict[st
     return pins
 
 
-def _gpio_partial_mask_reason(report: Mapping[str, Any], pins: list[dict[str, Any]]) -> str:
+def _gpio_outcome(
+    contract: Any, report: Mapping[str, Any], verdict: str, reason: str
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """GPIO verdict/reason/suspect pins: PASS only when every expected pin is supported.
+
+    GetCaps failing on every bank means the route is not proven (fallback
+    trigger). GetCaps succeeding with missing bits is PARTIAL and stays FAIL;
+    the missing pins are listed for human review.
+    """
+
+    counts = gpio_pin_counts(report)
+    if counts["gpio_caps_state"] == "ALL_FAILED":
+        statuses = {
+            str(call.get("name")): call.get("status_code")
+            for call in report.get("api_calls") or []
+            if isinstance(call, Mapping) and str(call.get("name", "")).startswith("GPIO GetCaps")
+        }
+        detail = ", ".join(f"{name.removeprefix('GPIO ')}={code}" for name, code in statuses.items())
+        return "FAIL", f"GetCaps failed on every bank ({detail}): GPIO route not proven", []
     coverage = gpio_capability_coverage(report)
+    if not any(item["missing"] for item in coverage.values()):
+        return verdict, reason, []
+    pins = _gpio_suspect_pins(contract, report)
     masks = "; ".join(
         f"{bank} expected 0x{item['expected']:08X}, supported 0x{item['supported']:08X}"
         for bank, item in coverage.items()
         if item["missing"]
     )
-    total = sum(bin(item["expected"]).count("1") for item in coverage.values())
     described = "; ".join(
         f"{pin['key']} = {pin.get('signal') or '?'} -> {pin.get('function_label') or '?'} "
         f"(group {pin.get('group')}, bit {pin.get('pin')})"
         for pin in pins
     )
-    return (
-        f"Route OK, but {len(pins)} of {total} GPIO not supported by the capability mask "
-        f"({masks}): {described}. Check these schematic traces (often the adjacent pin)."
-    )
+    return "FAIL", (
+        f"PARTIAL: {counts['gpio_supported_pins']} of {counts['gpio_expected_pins']} GPIO "
+        f"supported by the capability mask ({masks}). Not supported: {described}. "
+        "Check these schematic traces (often the adjacent pin)."
+    ), pins
 
 
 def _section_reason(report: Mapping[str, Any], verdict: str) -> tuple[str, str | None]:
@@ -1572,19 +1597,18 @@ def execute_validation_sections(
             warnings.append(
                 f"runner exit code {command['exit_code']} disagrees with report verdict {verdict}"
             )
-        gpio_pins = _gpio_suspect_pins(contract, report) if section == "GPIO" else []
+        reason, observation = _section_reason(report, verdict)
+        gpio_pins: list[dict[str, Any]] = []
+        if section == "GPIO":
+            verdict, reason, gpio_pins = _gpio_outcome(contract, report, verdict, reason)
         completed = {
             "sequence": section_plan.get("sequence"),
             "section": section,
             "execution_status": "COMPLETED",
             "verdict": verdict,
             "result": report.get("result"),
-            "reason": (
-                _gpio_partial_mask_reason(report, gpio_pins)
-                if gpio_pins
-                else _section_reason(report, verdict)[0]
-            ),
-            "phase2_observation": _section_reason(report, verdict)[1],
+            "reason": reason,
+            "phase2_observation": observation,
             "gpio_suspect_pins": gpio_pins,
             "channel_summary": report.get("channel_summary"),
             "validation_layers": report.get("validation_layers"),
@@ -1599,6 +1623,15 @@ def execute_validation_sections(
             "started_at": started_at,
             "completed_at": _utc_now(),
         }
+        if verdict != "PASS":
+            decision = analyze_section_trigger(completed, report)
+            completed["fallback_trigger"] = {
+                "eligible": decision.eligible,
+                "code": decision.code,
+                "reason": decision.reason,
+                "passed_channels": list(decision.passed_channels),
+                "failed_channels": list(decision.failed_channels),
+            }
         results.append(completed)
         by_section[section] = completed
 
@@ -2162,9 +2195,9 @@ def write_validation_summary(
         lines.append(
             f"  {tag:<{tag_width}}  {str(item.get('section')):<{name_width}}  {detail}".rstrip()
         )
-        note = _fallback_note(item.get("fallback"))
-        if note:
-            lines.append(f"{indent}{note}")
+        for note in (_fallback_note(item.get("fallback")), _trigger_note(item)):
+            if note:
+                lines.append(f"{indent}{note}")
     lines.extend(["", f"Rollback: [{rollback.get('status')}]"])
     run_root = contract.outputs.run_root
     if fallback is not None:
@@ -2208,18 +2241,40 @@ def _display_path(path: Any, run_root: Path) -> str:
         return str(candidate)
 
 
+def _attempt_label(attempt: Mapping[str, Any]) -> str:
+    route = str(attempt.get("route_value"))
+    if "gpio_caps_state" not in attempt:
+        return f"{route} {'OK' if attempt.get('success') else 'failed'}"
+    if attempt.get("gpio_caps_state") != "PARTIAL_SUCCESS":
+        return f"{route} GetCaps failed"
+    return (
+        f"{route} {attempt.get('gpio_supported_pins')}/{attempt.get('gpio_expected_pins')} pins"
+    )
+
+
 def _fallback_note(fallback: Any) -> str:
     if not isinstance(fallback, Mapping):
         return ""
     status = fallback.get("status")
     count = fallback.get("attempt_count", 0)
+    attempts = [a for a in fallback.get("attempts") or [] if isinstance(a, Mapping)]
+    tried = f"; tried: {', '.join(_attempt_label(a) for a in attempts)}" if attempts else ""
     if status == "CONVERGED":
         route = f"{fallback.get('route_field') or 'route'}={fallback.get('selected_route')}"
         return (
             f"fallback CONVERGED on attempt {fallback.get('winning_attempt')}/{count}, "
-            f"{route} (baseline was {fallback.get('baseline_verdict')})"
+            f"{route} written to the INI (baseline was {fallback.get('baseline_verdict')}){tried}"
         )
-    return f"fallback {status} after {count} attempt(s)"
+    return f"fallback {status} after {count} attempt(s){tried}"
+
+
+def _trigger_note(item: Mapping[str, Any]) -> str:
+    trigger = item.get("fallback_trigger")
+    if not isinstance(trigger, Mapping) or item.get("fallback"):
+        return ""
+    if trigger.get("eligible"):
+        return f"fallback trigger: ELIGIBLE {trigger.get('code')}"
+    return f"fallback trigger: not eligible {trigger.get('code')}"
 
 
 def finalize_summary_after_fallback(
@@ -2270,6 +2325,21 @@ def finalize_summary_after_fallback(
                 "baseline_verdict": item.get("verdict"),
                 "baseline_result": item.get("result"),
                 "baseline_report_path": item.get("local_report_path"),
+                "attempts": [
+                    {
+                        key: attempt.get(key)
+                        for key in (
+                            "index",
+                            "route_value",
+                            "success",
+                            "gpio_caps_state",
+                            "gpio_supported_pins",
+                            "gpio_expected_pins",
+                        )
+                        if key in attempt
+                    }
+                    for attempt in attempts
+                ],
             }
             winner = next((a for a in reversed(attempts) if a.get("success")), None)
             if converged.get("status") == "CONVERGED" and winner is not None:
@@ -2285,20 +2355,19 @@ def finalize_summary_after_fallback(
                 try:
                     report = json.loads(Path(report_path).read_text(encoding="utf-8-sig"))
                     verdict, sw_verdict, dqa_verdict = _normalize_report_verdict(report)
-                    gpio_pins = (
-                        _gpio_suspect_pins(contract, report)
-                        if str(item.get("section")) == "GPIO" else []
-                    )
+                    reason, observation = _section_reason(report, verdict)
+                    gpio_pins: list[dict[str, Any]] = []
+                    if str(item.get("section")) == "GPIO":
+                        verdict, reason, gpio_pins = _gpio_outcome(
+                            contract, report, verdict, reason
+                        )
+                    item.pop("fallback_trigger", None)
                     item.update({
                         "verdict": verdict,
                         "result": report.get("result"),
                         "gpio_suspect_pins": gpio_pins,
-                        "reason": (
-                            _gpio_partial_mask_reason(report, gpio_pins)
-                            if gpio_pins
-                            else _section_reason(report, verdict)[0]
-                        ),
-                        "phase2_observation": _section_reason(report, verdict)[1],
+                        "reason": reason,
+                        "phase2_observation": observation,
                         "channel_summary": report.get("channel_summary"),
                         "validation_layers": report.get("validation_layers"),
                         "sw_verdict": sw_verdict,
@@ -2345,6 +2414,83 @@ def finalize_summary_after_fallback(
         fallback=fallback_summary,
         write_tests_enabled=bool(baseline.get("write_tests_enabled", True)),
     )
+
+
+def _registry_path(repo_root: str | Path) -> Path:
+    return (
+        Path(repo_root).expanduser().resolve()
+        / "targetB_task"
+        / "machineB_validation"
+        / "fallback_candidate_registry.json"
+    )
+
+
+def write_fallback_plan(
+    contract: PostIniContract,
+    registry_path: Path,
+) -> Path | None:
+    """Write fallback-plan.json for every section whose baseline met the trigger.
+
+    The plan is derived from the summary's deterministic trigger decisions, the
+    registry whitelist and the full INI's current route; the agent only decides
+    whether to run --converge with it.
+    """
+
+    if not contract.outputs.summary_json.is_file():
+        return None
+    summary = json.loads(contract.outputs.summary_json.read_text(encoding="utf-8"))
+    if not isinstance(summary.get("rollback"), Mapping) or summary["rollback"].get("status") != "PASS":
+        return None
+    eligible = [
+        item for item in summary.get("sections", [])
+        if isinstance(item.get("fallback_trigger"), Mapping) and item["fallback_trigger"].get("eligible")
+    ]
+    if not eligible:
+        return None
+    registry = load_candidate_registry(registry_path)
+    ini_text = contract.inputs.full_ini.read_text(encoding="utf-8")
+    decisions: list[dict[str, Any]] = []
+    for item in eligible:
+        trigger = item["fallback_trigger"]
+        section = str(item.get("section"))
+        if section not in registry.sections:
+            continue
+        baseline_route = section_baseline_route(ini_text, section)
+        report_path = Path(str(item.get("local_report_path") or ""))
+        if baseline_route is None or not report_path.is_file():
+            continue
+        decisions.append({
+            "section": section,
+            "trigger_code": trigger.get("code"),
+            "trigger_reason": trigger.get("reason"),
+            "passed_channels": trigger.get("passed_channels") or [],
+            "failed_channels": trigger.get("failed_channels") or [],
+            "baseline_route": baseline_route,
+            "baseline_report_path": str(report_path),
+            "baseline_report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        })
+    if not decisions:
+        return None
+    plan = build_fallback_plan(
+        project=contract.project,
+        run_id=contract.run_id,
+        summary_path=str(contract.outputs.summary_json),
+        summary_sha256=hashlib.sha256(contract.outputs.summary_json.read_bytes()).hexdigest(),
+        full_ini_path=str(contract.inputs.full_ini),
+        full_ini_sha256=hashlib.sha256(contract.inputs.full_ini.read_bytes()).hexdigest(),
+        section_decisions=decisions,
+        registry=registry,
+        applicable_sections=set(contract.inputs.generated_sections),
+    )
+    path = contract.outputs.run_root / "fallback-plan.json"
+    path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    sections = ", ".join(str(entry["section"]) for entry in plan["sections"])
+    with contract.outputs.summary_text.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f"Fallback plan ({sections}): {_display_path(path, contract.outputs.run_root)} "
+            "-- run --converge with this plan\n"
+        )
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2408,12 +2554,7 @@ def main(argv: list[str] | None = None) -> int:
 
         fallback_plan: dict[str, object] | None = None
         if args.converge:
-            registry = load_candidate_registry(
-                Path(args.repo_root).expanduser().resolve()
-                / "targetB_task"
-                / "machineB_validation"
-                / "fallback_candidate_registry.json"
-            )
+            registry = load_candidate_registry(_registry_path(args.repo_root))
             fallback_plan = load_and_validate_fallback_plan(
                 Path(args.fallback_plan).expanduser().resolve(),
                 expected_project=contract.project,
@@ -2471,6 +2612,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             output_path = contract.outputs.summary_json
             exit_code = int(summary["exit_code"])
+            try:
+                write_fallback_plan(contract, _registry_path(args.repo_root))
+            except Exception as exc:
+                print(
+                    json.dumps({"phase": "FALLBACK_PLAN", "message": str(exc)}, sort_keys=True),
+                    file=sys.stderr,
+                )
     except (ContractError, RemoteStageError) as exc:
         print(json.dumps(exc.to_dict(), sort_keys=True), file=sys.stderr)
         return 2

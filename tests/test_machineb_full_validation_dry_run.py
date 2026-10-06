@@ -211,5 +211,67 @@ class LocalPreflightAndDryRunTests(unittest.TestCase):
         self.assertEqual(execute_contract.project, contract.project)
 
 
+    def test_cli_execute_writes_a_plan_that_converge_accepts(self):
+        # The plan written after --execute must pass the --converge loader for
+        # the same run ID; otherwise an eligible fallback can never run.
+        import shutil
+        from machineb_fallback import load_and_validate_fallback_plan, load_candidate_registry
+        from run_machineB_full_validation import main, write_validation_summary
+
+        root, contract = self._build_contract()
+        registry_src = Path(__file__).resolve().parents[1] / "targetB_task" / "machineB_validation" / "fallback_candidate_registry.json"
+        shutil.copy(registry_src, root / "targetB_task" / "machineB_validation" / registry_src.name)
+
+        def fake_run(run_contract, *_args, **_kwargs):
+            report = run_contract.outputs.reports_dir / "smbus_1.json"
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text("{}", encoding="utf-8")
+            return write_validation_summary(
+                run_contract,
+                runtime_ini={"status": "PASS"},
+                reload_result={"status": "PASS"},
+                section_results=[{
+                    "section": "SMBus",
+                    "execution_status": "COMPLETED",
+                    "verdict": "FAIL",
+                    "reason": "all channels failed",
+                    "local_report_path": str(report),
+                    "fallback_trigger": {
+                        "eligible": True,
+                        "code": "EXPECTED_SECTION_ALL_CHANNEL_API_FAILED",
+                        "reason": "r",
+                        "passed_channels": [],
+                        "failed_channels": ["Bus0"],
+                    },
+                }],
+                rollback={"status": "PASS"},
+                errors=[],
+                warnings=[],
+            )
+
+        with (
+            patch("machineb_transport.SshPowerShellTransport", return_value=Mock()),
+            patch("run_machineB_full_validation.stage_remote_bundle", return_value={"status": "PASS"}),
+            patch("run_machineB_full_validation.run_activated_validation", side_effect=fake_run),
+        ):
+            exit_code = main([
+                "--project", "BOARD", "--repo-root", str(root), "--run-id", "run-1",
+                "--execute", "--host", "192.0.2.10", "--user", "susiaa",
+            ])
+
+        self.assertEqual(exit_code, 1)
+        plan_path = contract.outputs.run_root / "fallback-plan.json"
+        plan = load_and_validate_fallback_plan(
+            plan_path,
+            expected_project="BOARD",
+            expected_run_id="run-1",
+            expected_full_ini=contract.inputs.full_ini,
+            registry=load_candidate_registry(registry_src),
+            applicable_sections={"SMBus"},
+        )
+        self.assertEqual(plan["sections"][0]["section"], "SMBus")
+        self.assertIn("Fallback plan (SMBus): fallback-plan.json", contract.outputs.summary_text.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

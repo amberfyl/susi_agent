@@ -289,15 +289,30 @@ def _hex_or_none(value: object) -> int | None:
 
 
 def gpio_capability_coverage(report: Mapping[str, object]) -> dict[str, dict[str, int]]:
-    """Per bank: expected mask, mask supported for both input and output, missing."""
+    """Per bank: expected mask, mask supported for both input and output, missing.
+
+    Only banks whose GetCaps input and output both returned SUCCESS are counted;
+    a mask reported next to a failed GetCaps is not capability evidence.
+    """
 
     metrics = report.get("metrics")
     banks = metrics.get("banks") if isinstance(metrics, dict) else None
+    calls = report.get("api_calls")
     coverage: dict[str, dict[str, int]] = {}
-    if not isinstance(banks, dict):
+    if not isinstance(banks, dict) or not isinstance(calls, list):
         return coverage
+    statuses = {
+        str(call.get("name") or ""): call.get("status_code")
+        for call in calls
+        if isinstance(call, dict)
+    }
     for bank, raw in banks.items():
         if not isinstance(raw, dict):
+            continue
+        if not all(
+            _status_code_succeeded(statuses.get(f"GPIO GetCaps {kind}:{bank}"))
+            for kind in ("input", "output")
+        ):
             continue
         expected = _hex_or_none(raw.get("expected_mask"))
         inputs = _hex_or_none(raw.get("input_support"))
@@ -311,6 +326,31 @@ def gpio_capability_coverage(report: Mapping[str, object]) -> dict[str, dict[str
             "missing": expected & ~supported,
         }
     return coverage
+
+
+def gpio_pin_counts(report: Mapping[str, object]) -> dict[str, object]:
+    """Whole-report GPIO coverage: GetCaps state plus supported/expected pin counts."""
+
+    probe_state, _, _ = _gpio_route_probe_outcomes(report)
+    coverage = gpio_capability_coverage(report)
+    return {
+        "gpio_caps_state": probe_state,
+        "gpio_expected_pins": sum(bin(item["expected"]).count("1") for item in coverage.values()),
+        "gpio_supported_pins": sum(bin(item["supported"]).count("1") for item in coverage.values()),
+    }
+
+
+def section_baseline_route(ini_text: str, section: str) -> str | None:
+    """The single IOPort/Address value used by every tuple row of a section."""
+
+    try:
+        routes = set(
+            rewrite_section_route(ini_text, section=section, route_value="0").before_routes.values()
+        )
+    except FallbackMutationError:
+        return None
+    values = {_parse_uint32(route, field=f"{section}.route") for route in routes}
+    return next(iter(routes)) if len(values) == 1 else None
 
 
 def _gpio_candidate_succeeded(report: Mapping[str, object]) -> bool:
@@ -812,6 +852,8 @@ def execute_section_fallback(
             "failed_channels": list(failed),
             "success": success,
         }
+        if section == "GPIO" and isinstance(report, dict):
+            attempt_evidence.update(gpio_pin_counts(report))
         attempts.append(attempt_evidence)
         if not infrastructure_ok:
             return {
