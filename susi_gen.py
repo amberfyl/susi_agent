@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import agent_llm
+from build_machineB_section_configs import VOLTAGE_API_INDEX
 from extract_pdf import extract_pdf_to_json, resolve_paths as resolve_extract_paths
 from generate_ini import resolve_paths as resolve_generate_paths
 from machineb_fallback import apply_project_route_overrides
@@ -775,6 +776,16 @@ def _pick_alias_from_bios_labels(report_name: str, labels: set[str]) -> tuple[st
         return y
 
     canon_labels = {_canon(x) for x in labels if isinstance(x, str)}
+
+    # DC input rail (SUSI HWM_VOLTAGE_DC): BIOS pages label it "+Vin" / "DC IN".
+    # Return the BIOS text as written so Name matches the BIOS screen.
+    dc_input_labels = {"+VIN", "VIN", "DCIN", "+DCIN", "VDCIN"}
+    if re.search(r"(^|_)DC$", rn.strip()):
+        for label in sorted(x for x in labels if isinstance(x, str)):
+            if _canon(label) in dc_input_labels:
+                return label.strip(), "BIOS_LABEL_MATCH_DC_INPUT"
+        return None, "NO_CONFIDENT_ALIAS_DC"
+
     has_5vsb = any(x in canon_labels for x in {"+5VSB", "5VSB", "5VSTANDBY", "+5VSTANDBY"})
     has_5v_plain = any(x in canon_labels for x in {"+5V", "5V"})
     has_12v = any(x in canon_labels for x in {"+12V", "12V"})
@@ -1200,7 +1211,6 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
     )
 
     merged = 0
-    oem_fallback_count = 0
     item_override_count = 0
     rows_to_remove: set[int] = set()
     for row in rows:
@@ -1251,45 +1261,30 @@ def _merge_voltage_alias_into_rows(query_result: dict, alias_bridge_path: Path |
     if rows_to_remove:
         rows[:] = [row for row in rows if id(row) not in rows_to_remove]
 
-    # If still unmatched after alias merge, keep count visibility by parking them
-    # into VOEM<n> slots (name mismatch fallback).
+    # Rows still without a BIOS alias keep their key and an empty Name
+    # (orchestrator 10.5 rules 4 and 10): the key comes from DB/probe and decides
+    # the SUSI ID, so a missing display name must never rename it.
+    unresolved_rows: list[dict] = []
     if unresolved_keys:
-        used_items: set[str] = set()
         for r in rows:
             if not isinstance(r, dict):
                 continue
-            item = _canonical_voltage_item_name(
-                str(r.get("report_name") or ""),
-                str(r.get("item_name") or r.get("channel_name") or "")
+            rk = (
+                str(r.get("report_name") or "").strip(),
+                str(r.get("channel_id") or r.get("channel") or "").strip(),
             )
-            if item:
-                used_items.add(item)
-
-        oem_slots = [f"VOEM{i}" for i in range(4) if f"VOEM{i}" not in used_items]
-        if oem_slots:
-            for r in rows:
-                if not isinstance(r, dict) or not oem_slots:
-                    continue
-                rk = (
-                    str(r.get("report_name") or "").strip(),
-                    str(r.get("channel_id") or r.get("channel") or "").strip(),
-                )
-                if rk not in unresolved_keys:
-                    continue
-                cur = _canonical_voltage_item_name(
-                    str(r.get("report_name") or ""),
-                    str(r.get("item_name") or r.get("channel_name") or "")
-                )
-                if cur.startswith("VOEM"):
-                    continue
-                r["item_name"] = oem_slots.pop(0)
-                if not str(r.get("disp_name") or "").strip():
-                    r["disp_name"] = "OEM Voltage"
-                oem_fallback_count += 1
+            if rk in unresolved_keys:
+                unresolved_rows.append({
+                    "report_name": rk[0],
+                    "channel_id": rk[1],
+                    "item_name": _canonical_voltage_item_name(
+                        rk[0], str(r.get("item_name") or r.get("channel_name") or "")
+                    ),
+                })
 
     query_result["alias_merged_count"] = merged
     query_result["alias_unresolved_count"] = len(unresolved_keys)
-    query_result["alias_oem_fallback_count"] = oem_fallback_count
+    query_result["alias_unresolved"] = unresolved_rows
     query_result["alias_item_override_count"] = item_override_count
     query_result["alias_bridge_path"] = str(alias_bridge_path)
     return query_result
@@ -1342,6 +1337,56 @@ def _canonical_voltage_item_name(report_name: str, fallback: str = "") -> str:
 
     fb = (fallback or "").strip().upper()
     return fb if fb else fallback
+
+
+VOLTAGE_OEM_SLOTS = ("VOEM0", "VOEM1", "VOEM2", "VOEM3")
+
+
+def _assign_oem_slots_for_unmapped_voltage_rows(query_result: dict) -> dict:
+    """EC route: park rows that DB + probe cannot place on a SUSI voltage ID.
+
+    A row keeps its key whenever that key has a SUSI voltage ID (the same table
+    the Machine-B builder uses, aligned with Susi4.h). Only rows whose key has no
+    ID are moved to the next free VOEM0..VOEM3 slot; the BIOS name, if any,
+    stays as Name, otherwise "OEM Voltage". BIOS names never decide the key.
+    """
+    rows = query_result.get("rows")
+    if not isinstance(rows, list):
+        return query_result
+
+    def key_of(row: dict) -> str:
+        return _canonical_voltage_item_name(
+            str(row.get("report_name") or ""),
+            str(row.get("item_name") or row.get("channel_name") or ""),
+        ).strip().upper()
+
+    used = {key_of(r) for r in rows if isinstance(r, dict)}
+    free_slots = [slot for slot in VOLTAGE_OEM_SLOTS if slot not in used]
+    assigned: list[dict] = []
+    unplaced: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = key_of(row)
+        if key in VOLTAGE_API_INDEX:
+            continue
+        record = {
+            "report_name": str(row.get("report_name") or ""),
+            "channel_id": str(row.get("channel_id") or row.get("channel") or ""),
+            "from_key": key,
+        }
+        if not free_slots:
+            unplaced.append(record)
+            continue
+        slot = free_slots.pop(0)
+        row["item_name"] = slot
+        if not str(row.get("disp_name") or "").strip():
+            row["disp_name"] = "OEM Voltage"
+        assigned.append({**record, "slot": slot})
+
+    query_result["voltage_oem_slots"] = assigned
+    query_result["voltage_unplaced"] = unplaced
+    return query_result
 
 
 def _probe_ok_voltage_report_names(probe_path: Path | None) -> list[str]:
@@ -4666,6 +4711,16 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
 
         if sec == "HWM.Voltage" and is_ec is True and result.get("status") == "FOUND":
             result = _merge_voltage_alias_into_rows(result, voltage_alias_bridge_path)
+            if result.get("alias_unresolved"):
+                route = f"{route}+AMBIGUOUS_HWM_VOLTAGE_ALIAS"
+                fan_meta["voltage_alias_unresolved"] = result["alias_unresolved"]
+            result = _assign_oem_slots_for_unmapped_voltage_rows(result)
+            if result.get("voltage_oem_slots"):
+                route = f"{route}+VOLTAGE_OEM_SLOT"
+                fan_meta["voltage_oem_slots"] = result["voltage_oem_slots"]
+            if result.get("voltage_unplaced"):
+                route = f"{route}+AMBIGUOUS_HWM_VOLTAGE_ALIAS"
+                fan_meta["voltage_unplaced"] = result["voltage_unplaced"]
 
         status = result.get("status")
 

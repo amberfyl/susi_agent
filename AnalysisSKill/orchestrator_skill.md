@@ -229,14 +229,18 @@ EC 路線：
 3. **Name 回填時機**：初始模板 `Name` 一律留空，後處理階段再回填 alias。
 4. **key 與 Name 分工**：item key 保留 DB/report 語意（`report_name` + `channel_id`）；BIOS label 只用來填 Name，不改 key（例外見第 8、9 點）。
 5. **消歧**：
-   - BIOS 可直接區分時直接回填（`+12V -> V120`、`VBAT -> VBAT`）。
+   - BIOS 可直接區分時直接回填（`+12V -> V120`、`VBAT -> VBAT`、DC 輸入 `+Vin`/`DC IN -> DC`，Name 照 BIOS 原文）。
    - 有歧義時（`+5V` vs `+5VSB`；`+3.3V` vs `3VSB`）：以該 row 的 `report_name` 對齊 probe `HWM_VOLTAGE_*` 決定回填目標列。
    - `+9V/9V` 是合法 BIOS 電壓 label。
 6. **證據優先序**：BIOS 分析文字的實測 label（`VOLTAGE_VALUE: ...`）> `voltage_value_hints` > 一般 label hints。
 7. **Singleton remainder**：bridge 最後只剩一列未對上、且 BIOS 只剩一個未用的已知 rail label 時，直接配對並記 `BIOS_SINGLETON_REMAINDER_MATCH`。
 8. **VBAT 升級**：BIOS 顯示 `VBAT`、唯一候選是 `HWM_VOLTAGE_VBATLI`、且 section 內沒有真正的 `VBAT` key 時，key 由 `VBATLI` 改為 `VBAT`（只做一次）。
 9. **AIMB + NCT6126D 例外（使用者決策 2B）**：structured net-level 證據證明 DB `V5SB`/VIN0 實際量 `+3.3V` 時，保留原 tuple/channel，INI key 改 `V33`、Name 填 `+3.3V`；同 channel 已有 V33 row 時保留 V33 並移除 V5SB。只有 BIOS label、block diagram 或自由文字不足以觸發。
-10. **無法收斂**：BIOS、probe、mapping 三者對不上 → `AMBIGUOUS_HWM_VOLTAGE_ALIAS`，保留模板列，不硬判。
+10. **對不上時的落點（使用者拍板 2026-10-06）**：key 一律由 DB + probe（`report_name` / `channel_id`）決定，BIOS 名稱只填 Name。
+    - BIOS 名稱對不上、但 key 有 SUSI 電壓 ID（例：`DC`、`12NV`）→ key 不改、Name 留空，route 加 `+AMBIGUOUS_HWM_VOLTAGE_ALIAS`，matrix 列 `voltage_alias_unresolved`。
+    - DB + probe 都給不出有 SUSI 電壓 ID 的 key → 才放到下一個空的 `VOEM0`～`VOEM3`，Name 用 BIOS 名稱、沒有就填 `OEM Voltage`；route 加 `+VOLTAGE_OEM_SLOT`，matrix 列 `voltage_oem_slots`。
+    - VOEM 四格用完 → 不猜，matrix 列 `voltage_unplaced`。
+    - 「有沒有 SUSI 電壓 ID」以 `build_machineB_section_configs.VOLTAGE_API_INDEX`（對齊 Susi4.h）為唯一判斷來源。
 11. **回歸檢查**：不同 rail 不可併成同一 key（`V5SB` 不可變 `V50`）；DB 同時有 5V 與 5VSB 時輸出必須分開。
 
 SuperIO 路線（`NCT61xxD` / `NCT6776D`；EIO-300 / `NCT6694B` 複合晶片走 EC 路線，見 9.1）：

@@ -48,20 +48,24 @@ TEMPERATURE_API_INDEX = {
 }
 
 # HWM.Voltage INI tuples use project/configuration channels, while
-# SusiBoardGetValue uses the public voltage namespace 0x00021000 + index.
-# The report/display name is authoritative for aliases such as V50/+5V and
-# V120/+12V; the key is retained as a fallback for standard names.
+# SusiBoardGetValue uses the public voltage namespace 0x00021000 + index
+# (SUSI_ID_HWM_VOLTAGE_* in Susi4.h). The INI key decides the SUSI ID the
+# driver exposes, so it is looked up first; the display name (tuple field 7)
+# is only a fallback for keys outside this table.
 VOLTAGE_API_INDEX = {
-    "VCORE": 0, "VCORE2": 1, "2V5": 2, "3V3": 3,
-    "5V": 4, "+5V": 4, "V50": 4,
-    "12V": 5, "+12V": 5, "V120": 5,
-    "5VSB": 6, "+5VSB": 6, "V5SB": 6,
-    "3VSB": 7, "+3VSB": 7, "V3SB": 7,
-    "VBAT": 8, "5NV": 9, "12NV": 10, "VTT": 11,
+    # SDK names (Susi4.h offsets)
+    "VCORE": 0, "VCORE2": 1, "2V5": 2, "3V3": 3, "5V": 4, "12V": 5,
+    "5VSB": 6, "3VSB": 7, "VBAT": 8, "5NV": 9, "12NV": 10, "VTT": 11,
     "24V": 12, "DC": 13, "DCSTBY": 14, "VBATLI": 15,
-    "OEM0": 16, "OEM1": 17, "OEM2": 18,
-    "1V05": 19, "1V5": 20, "1V8": 21,
-    "12VS5": 22, "5VS5": 23, "3V3S5": 24,
+    "OEM0": 16, "OEM1": 17, "OEM2": 18, "OEM3": 19,
+    "1V05": 20, "1V5": 21, "1V8": 22, "12VS5": 23, "5VS5": 24, "3V3S5": 25,
+    # INI item keys emitted by susi_gen.py
+    "V25": 2, "V33": 3, "V50": 4, "V120": 5, "V5SB": 6, "V3SB": 7,
+    "VN50": 9, "VN120": 10, "V240": 12,
+    "VOEM0": 16, "VOEM1": 17, "VOEM2": 18, "VOEM3": 19,
+    "V105": 20, "V15": 21, "V18": 22,
+    # BIOS-style display names (fallback only)
+    "+5V": 4, "+12V": 5, "+5VSB": 6, "+3VSB": 7, "+3.3V": 3,
 }
 
 # HWM.Current INI tuples use 0x80000000 + index as configuration channels,
@@ -716,9 +720,9 @@ def build_voltage_config(
         report_name = fields[6].strip('"') if len(fields) >= 7 else key
         report_norm = report_name.upper().replace(" ", "")
         key_norm = key.strip().upper()
-        api_index = VOLTAGE_API_INDEX.get(report_norm)
+        api_index = VOLTAGE_API_INDEX.get(key_norm)
         if api_index is None:
-            api_index = VOLTAGE_API_INDEX.get(key_norm)
+            api_index = VOLTAGE_API_INDEX.get(report_norm)
         if api_index is None:
             raise BuildError(f"[HWM.Voltage]{key} has no canonical SUSI Board API mapping (report_name={report_name})")
         tuple_channel = parse_int_auto(fields[1])
