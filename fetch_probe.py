@@ -5,7 +5,7 @@ fetch_probe.py — A 端腳本
 支援模式：
 1) ssh：透過 SSH 執行遠端 .bat，scp 拉回 report
 2) winrm：透過 WinRM 執行遠端 .bat，直接讀回 report 內容
-3) auto：先嘗試 WinRM（可多 host failover），失敗再嘗試 SSH
+3) auto：先嘗試 SSH（所有指定 host），失敗再用 WinRM（只限 192.168.100.10-50 的固定 IP）
 4) http：舊版 forB/agent.py API（POST /run）
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import ipaddress
 import json
 import shlex
 import subprocess
@@ -32,8 +33,11 @@ DEFAULT_REMOTE_REPORT_SPD_IDX = "C:/Users/susiaa/Desktop/suto/V7/susi_spd_idx_pr
 DEFAULT_REMOTE_BAT = DEFAULT_REMOTE_BAT_FULL
 DEFAULT_REMOTE_REPORT = DEFAULT_REMOTE_REPORT_FULL
 
-# Practical default host pool (WinRM-first/SSH-fallback probe flow)
-DEFAULT_HOST_POOL = ["192.168.100.16", "192.168.100.15", "172.22.12.77"]
+# WinRM is allowed only to Machine-B static IPs on the direct link
+# (this host is 192.168.100.1; TrustedHosts covers 192.168.100.10-50).
+# The static IP is bound to the platform's NIC, so the user names it per run.
+WINRM_ALLOWED_FIRST = ipaddress.IPv4Address("192.168.100.10")
+WINRM_ALLOWED_LAST = ipaddress.IPv4Address("192.168.100.50")
 
 
 def _default_out_dir(project: str | None, out_dir: str | None) -> Path:
@@ -55,16 +59,30 @@ def _default_filename(project: str | None, output_name: str | None, probe_kind: 
     return f"probe_{ts}.txt"
 
 
-def _resolve_hosts(host: str | None, hosts_csv: str | None) -> list[str]:
+def _is_winrm_allowed_host(host: str) -> bool:
+    try:
+        address = ipaddress.IPv4Address(host.strip())
+    except ValueError:
+        return False
+    return WINRM_ALLOWED_FIRST <= address <= WINRM_ALLOWED_LAST
+
+
+def _explicit_hosts(host: str | None, hosts_csv: str | None) -> list[str]:
     hosts: list[str] = []
-    if hosts_csv:
-        hosts.extend([h.strip() for h in hosts_csv.split(",") if h.strip()])
     if host:
         hosts.append(host.strip())
+    if hosts_csv:
+        hosts.extend([h.strip() for h in hosts_csv.split(",") if h.strip()])
+    return _dedupe(hosts)
 
-    if not hosts:
-        hosts = list(DEFAULT_HOST_POOL)
 
+def _winrm_hosts(explicit_hosts: list[str]) -> list[str]:
+    """WinRM targets: only user-named hosts inside the allowed static-IP range."""
+
+    return [h for h in explicit_hosts if _is_winrm_allowed_host(h)]
+
+
+def _dedupe(hosts: list[str]) -> list[str]:
     uniq: list[str] = []
     seen: set[str] = set()
     for h in hosts:
@@ -100,7 +118,7 @@ def fetch_probe_http(host: str) -> str:
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    p = subprocess.run(cmd, text=True, capture_output=True)
+    p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
         cmd_s = " ".join(shlex.quote(x) for x in cmd)
         err = (p.stderr or p.stdout or "").strip()
@@ -133,7 +151,9 @@ def _run_powershell(script: str) -> subprocess.CompletedProcess[str]:
         "-Command",
         script,
     ]
-    p = subprocess.run(cmd, text=True, capture_output=True)
+    # Windows PowerShell on a zh-TW host writes Big5 (cp950); decoding it as
+    # UTF-8 raised UnicodeDecodeError and aborted the whole host failover.
+    p = subprocess.run(cmd, capture_output=True, encoding="cp950", errors="replace")
     if p.returncode != 0:
         err = (p.stderr or p.stdout or "").strip()
         raise RuntimeError(f"[ERROR] PowerShell failed ({p.returncode}):\n{err}")
@@ -223,8 +243,17 @@ def main() -> None:
         default="ssh",
         help="Fetch mode (ssh/http/winrm/auto, default: ssh)",
     )
-    ap.add_argument("--host", default=None, help="Target host IP or hostname (optional; default host pool used when omitted)")
-    ap.add_argument("--hosts", default=None, help="Fallback host list, comma-separated (optional). Default pool: 192.168.100.16,192.168.100.15,172.22.12.77")
+    ap.add_argument(
+        "--host",
+        default=None,
+        help="Machine-B IP for this run (required; it changes when the test disk moves "
+        "to another platform). WinRM is used only for a static IP in 192.168.100.10-50",
+    )
+    ap.add_argument(
+        "--hosts",
+        default=None,
+        help="Additional Machine-B IPs, comma-separated (e.g. the direct-link static IP)",
+    )
     ap.add_argument(
         "--probe-kind",
         choices=["full", "spd_idx"],
@@ -253,7 +282,12 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    hosts = _resolve_hosts(args.host, args.hosts)
+    explicit_hosts = _explicit_hosts(args.host, args.hosts)
+    if not explicit_hosts:
+        ap.error("--host is required: give the current Machine-B IP (no default host is assumed)")
+    hosts = explicit_hosts
+    winrm_hosts = _winrm_hosts(explicit_hosts)
+    rejected_winrm = [h for h in explicit_hosts if h not in winrm_hosts]
 
     out_dir = _default_out_dir(args.project, args.dir)
     filename = _default_filename(args.project, args.output_name, args.probe_kind)
@@ -284,7 +318,17 @@ def main() -> None:
 
     def try_winrm() -> bool:
         nonlocal last_err
-        for h in hosts:
+        if not winrm_hosts:
+            reason = (
+                "WinRM needs the Machine-B static IP via --host (192.168.100.10-50)"
+                if not explicit_hosts
+                else "WinRM is allowed only for 192.168.100.10-50; not in range: "
+                + ", ".join(rejected_winrm)
+            )
+            last_err = RuntimeError(f"[ERROR] {reason}")
+            print(f"[WARN] {reason}")
+            return False
+        for h in winrm_hosts:
             print(f"[*] WinRM preflight: {h}")
             if not _winrm_preflight(h, args.win_user, args.win_pass):
                 print(f"[WARN] WinRM unreachable or auth failed: {h}")
@@ -344,12 +388,13 @@ def main() -> None:
             return
         sys.exit(str(last_err) if last_err else "[ERROR] SSH failed")
 
-    # auto: WinRM first, SSH fallback
-    print("[*] Auto mode: try WinRM first, then SSH fallback")
-    if try_winrm():
-        return
-    print("[WARN] Auto mode WinRM path failed, fallback to SSH")
+    # auto: SSH first (the validation pipeline is SSH-only), WinRM fallback
+    # on the direct-link static IP.
+    print("[*] Auto mode: try SSH first, then WinRM fallback")
     if try_ssh():
+        return
+    print("[WARN] Auto mode SSH path failed, fallback to WinRM")
+    if try_winrm():
         return
     sys.exit(str(last_err) if last_err else "[ERROR] Auto mode failed")
 
