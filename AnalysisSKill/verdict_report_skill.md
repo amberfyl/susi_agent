@@ -40,13 +40,14 @@
 2. **只用本次報告**：只採本次 run 新產生的 report；舊報告不可當作修正後的結果。
 3. **多通道 section**：任一 required channel 失敗時整體可為 `FAIL`，但必須寫明 `PARTIAL_FAIL` 或全通道失敗，並列出成功/失敗通道與 status code；不可把 `Backlight1=PASS、Backlight2=FAIL` 寫成「VGA.Backlight failed」。
 4. **讀回成功 ≠ 功能確認**：API 讀回成功只證明 SW 路徑可用，不代表實體功能已驗證（例：GPIO 讀寫回不等於電氣 loopback；Brightness 讀到值不等於亮度真的有變）。
-5. **`SUSI_STATUS_UNSUPPORTED`（`0xFFFFFCFF`）**：表示目前 runtime 不支援該 API；先確認部署的 INI 與 driver reload 狀態，不可直接判定 mapping 錯誤。
-6. **GPIO 能力遮罩只缺部分 bit**（例：要求 `0x0000FFFF`，回報 `0x00009FFF`）：
-   - 代表 route 正確：channel、IOPort、option 都對，所以 GetCaps 成功、其他 bit 都支援。
-   - 缺的 bit 對應的 `GPIOnn`（bit n = `GPIOnn`）**是 group/pin 錯了**，也就是電路圖追線錯誤，最常見是追到隔壁腳。
-   - fallback 時：GetCaps/讀取成功且支援腳位超過一半 → 該 IOPort 判定為正確路由，寫入最終 INI；缺的腳位讓 GPIO 判 `FAIL`，summary 逐支列出（程式自動產生，`gpio_suspect_pins`）。
-   - 處理方式：**在報告中指出可疑腳位即可，不自動重新截圖追線**。每支列出：`GPIOnn`、外部訊號（例：`EC_P2_GPIO5`）、目前的 function label 與 group/pin，並註明「可能追錯腳（常見為隔壁腳），請人工確認」。
-   - **禁止**：裁掉這些 GPIO、改 route／IOPort／option、判定為硬體不支援，或自行重新追線改值。
+5. **`SUSI_STATUS_UNSUPPORTED`（`0xFFFFFCFF`）**：表示目前 runtime 不支援該 API；先確認部署的 INI 與 driver reload 狀態，不可直接判定 mapping 錯誤。例外：GPIO GetCaps 在每個 bank 都回此碼時屬 route fallback trigger（見第 6 點）。
+6. **GPIO 判定**（程式自動判定並寫進 summary，代理照抄，不自行推論）：
+   - **全部腳位都在 capability mask 裡才算 PASS。**
+   - **GetCaps 在每個 bank 都回錯誤碼**（例：`0xFFFFFCFF`）：代表 route 未被證實，這就是 fallback trigger，summary 會出現 `fallback trigger: ELIGIBLE`。此時報告裡附帶的 mask 值不算證據，不可據此說 route 正確。
+   - **GetCaps 成功但 mask 只缺部分 bit**（例：要求 `0x0000FFFF`，回報 `0x00009FFF`）：判 `FAIL`，reason 以 `PARTIAL:` 開頭並寫明支援幾支、共幾支。route 本身是對的；缺的 bit 對應的 `GPIOnn`（bit n = `GPIOnn`）是 group/pin 追錯，最常見是追到隔壁腳。發生在 baseline 時不觸發 fallback。
+   - **fallback 收斂**：照白名單順序嘗試，第一個 GetCaps/GetDirection/GetLevel 都成功、且支援腳位超過一半的候選即勝出，該 route 寫入最終 INI。全部支援判 PASS；部分支援判 `FAIL`（`PARTIAL:`），並列出缺的腳位。支援腳位不到一半（含剛好一半）的候選淘汰，改試下一個。summary 會列出每個試過的候選與結果（`tried: 1 GetCaps failed, 0x2E 13/16 pins`）。
+   - **缺腳的處理**：在報告中指出可疑腳位即可，不自動重新截圖追線。每支列出：`GPIOnn`、外部訊號（例：`EC_P2_GPIO5`）、目前的 function label 與 group/pin，並註明「可能追錯腳（常見為隔壁腳），請人工確認」（程式自動產生，`gpio_suspect_pins`）。
+   - **禁止**：裁掉這些 GPIO、為了缺的腳位改 route／IOPort／option、判定為硬體不支援，或自行重新追線改值。
 7. **execution_status**：
    - `COMPLETED`：runner 正常完成並取得報告（verdict 另看 report）。
    - `BLOCKED_DEPENDENCY`：依賴的 section 失敗而未執行（例：`HWM.Fan` 失敗 → `HWM.Fan.Control` 不跑）。

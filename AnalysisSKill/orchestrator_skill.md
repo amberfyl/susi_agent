@@ -109,7 +109,7 @@
 1. 只適用 `HWM.Voltage/Current/Temperature/Fan/Fan.Control/CaseOpen`。
 2. 完成且可讀的 BIOS Hardware Monitor 畫面是 HWM section/item 存在性的裁決來源：BIOS 有顯示才產生；未顯示就不產生，即使 spec 勾選。BIOS 有顯示時，spec 漏勾或空 list 不得阻止產生。
 3. `HWM.Fan.Control` 可沿用 Fan / Smart Fan 的 BIOS 證據，不要求 BIOS 有同名 section。
-- **證據只看 Hardware Monitor 頁的即時讀值**：只有顯示即時讀值的那張 BIOS 圖算數（例：MIO-5854 只有 bios1）；CPU 設定、iManager、主畫面版本等其他頁面一律不算。分析文字裡的否定句或設定選項名稱（例：`Case Open Detection`）不是證據。程式只依 cache 的結構化讀值（`*_value_hints`、`caseopen_hints`）判斷。
+- **證據只看 Hardware Monitor 頁的即時讀值**：只有顯示即時讀值的那張 BIOS 圖算數；CPU 設定、iManager、主畫面版本等其他頁面一律不算。分析文字裡的否定句或設定選項名稱（例：`Case Open Detection`）不是證據。程式只依 cache 的結構化讀值（`*_value_hints`、`caseopen_hints`）判斷。
 4. 非 HWM section 不套用此缺席 gate，依各自 spec/probe/DB/電路圖規則判定。
 5. BIOS 圖缺失、不可讀或分析未完成：保留 pending/ambiguous，停止正式 HWM 輸出，不以 spec/DB 猜測。
 
@@ -217,7 +217,7 @@ AMD SPD idx（固定路徑）：
    - `spec.json.gpio.pins[].name` 有值才填 `[Name]`，未填留空，不自動命名。
 2. **電路圖路線**（SIO `NCT61**D*`，以及 EIO-300 / `NCT6694B*` 複合晶片的 GPIO）：GPIO 無法由 DB query 得到，`[Group],[Bit]` 只能由電路圖判定（diagram skill R-016/R-017），不套用 EC 的 auto report/template。
 3. **INI key 規則（所有路線）**：`GPIO00=`、`GPIO01=`、`GPIO02=`…依序編號。電路圖路線由程式依訊號順序編（`EC_P1_GPIO0～7` → `GPIO00～07`、`EC_P2_GPIO0～7` → `GPIO08～15`；`SIO_GPIOn` 依 n），不採用代理填的 `report_name` 或晶片功能名（例：`GPIOD0` 不可變成 `GPIO130`）。group/bit 取圖上的功能名。
-4. **上機驗證後 GPIO 能力遮罩只缺部分 bit**：route 正確，缺的那幾支可能是 group/pin 追錯；在報告中指出這些腳位交人工確認，不自動重新追線，也不可裁切或改 route（見 verdict_report_skill.md 第 4 節第 6 點）。
+4. **上機驗證後 GetCaps 回 SUCCESS、但能力遮罩只缺部分 bit**：route 正確，缺的那幾支可能是 group/pin 追錯；在報告中指出這些腳位交人工確認，不自動重新追線，也不可裁切或改 route（見 verdict_report_skill.md 第 4 節第 6 點）。GetCaps 在每個 bank 都回錯誤碼時不適用本點，屬 route fallback trigger（11.5）。
 5. 電路圖 trace 只有 ambiguous 結果時：status `GPIO_TRACE_AMBIGUOUS`、`row_count=0`、不輸出 `[GPIO]`。
 4. 任一路線缺必要證據時標記 pending，不以另一條路線補猜，也不混合兩條 mapping。
 
@@ -332,9 +332,9 @@ SuperIO 路線（`NCT61xxD` / `NCT6776D`；EIO-300 / `NCT6694B` 複合晶片走 
 1. **範圍**：與 10.8 的 v2 收斂不同；只處理 `--all` 第一輪完整 INI 驗證後，符合 route-probe failure contract 的 section。
 2. **Trigger**：
    - 一般 section：`EXPECTED_SECTION_ALL_CHANNEL_API_FAILED`（所有 relevant channel API 都失敗）；任一成功即不觸發。
-   - GPIO：`EXPECTED_GPIO_ROUTE_PROBES_ALL_FAILED`，只看每個 required bank 的 `SusiGPIOGetCaps` input/output 是否全敗；`GetDirection`/`GetLevel` 成功不取消資格；GetCaps 證據缺失/模糊必須 fail closed。
+   - GPIO：`EXPECTED_GPIO_ROUTE_PROBES_ALL_FAILED`，只看每個 required bank 的 `SusiGPIOGetCaps` input/output 是否全敗；`GetDirection`/`GetLevel` 成功不取消資格；GetCaps 證據缺失/模糊必須 fail closed。報告中附帶的 capability mask 不影響判定。GPIO 收斂與 PASS/PARTIAL 判定見 `verdict_report_skill.md` §4 第 6 點。
    - 排除：`PARTIAL_FAIL`、fixture、infrastructure 問題。
-3. **AI 責任**：讀第一輪 summary/raw report，確認 section 應存在且 runner 正常完成；產生 `fallback-plan.json` 並解讀結果。
+3. **AI 責任**：讀第一輪 summary，照每個失敗 section 的 `fallback trigger:` 行決定是否執行 `--converge`；解讀結果。trigger 判定與 `fallback-plan.json` 由程式產生（validator 在第一輪結束後自動寫到 run 目錄），AI 不自行撰寫或修改 plan。
 4. **Python 責任**：驗證 plan provenance/hash 與候選白名單，固定候選順序；每輪從目前已接受的完整 INI 只改一個 section 的 `IOPort/Address`，執行 deploy → reload → targeted validation，保存 tuple、INI hash、reload、report、status code。
 5. **候選限制**：只能來自 `targetB_task/machineB_validation/fallback_candidate_registry.json`，排除 baseline 與重複值，禁止 AI 自創。只做 route fallback：`option_fallback_enabled=false`，不做 `(io_port, option)` 笛卡兒積。
 6. **禁止修改**：`channel_id`、key、HWID、Option 等其他 tuple 欄位；SMBus `Channel1` 固定不動。

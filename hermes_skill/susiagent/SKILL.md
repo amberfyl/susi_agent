@@ -15,12 +15,12 @@ Repository root: `/home/company2/AIagent_susi` (below: `<REPO>`). Project direct
 ## 1. Read first (every run)
 
 1. `<REPO>/AnalysisSKill/orchestrator_skill.md` — cross-stage policy, section rules, status meanings.
-2. Before reading BIOS images: `<REPO>/prompts/bios_reading.md`.
-3. Before tracing GPIO in schematics: `<REPO>/prompts/gpio_trace.md`.
+2. Before reading BIOS images: `<REPO>/AnalysisSKill/bios_circuit_image_analysis_rule.md` R-020.
+3. Before tracing GPIO in schematics: `<REPO>/AnalysisSKill/bios_circuit_image_analysis_rule.md` R-016 and R-017.
 4. Before fan IN/OUT pairing or voltage-divider analysis: `<REPO>/AnalysisSKill/bios_circuit_image_analysis_rule.md` (R-013, R-015, R-019) and `<REPO>/AnalysisSKill/fan_pairing_contract.md`.
 5. Before interpreting Machine-B reports: `<REPO>/AnalysisSKill/verdict_report_skill.md`.
 
-Always read the current files; never rely on remembered summaries. When sources disagree, the order is: the user's latest explicit decision > Python code and tests > `AnalysisSKill/*.md` > `prompts/*.md` wording > runbooks.
+Always read the current files; never rely on remembered summaries. When sources disagree, the order is: the user's latest explicit decision > Python code and tests > `AnalysisSKill/*.md` > runbooks. `prompts/*.md` are the generator's fallback copies of the image-reading rules; you do not read them.
 
 ## 2. Modes
 
@@ -83,12 +83,14 @@ Always use `<REPO>/.venv/bin/python`. Pass absolute, project-local paths for eve
 ### 3.5 Analyze images and write the intermediate JSON (agent work)
 Write each artifact into the project directory before running generation (3.6). The generator uses existing artifacts as-is. For the BIOS cache and the GPIO trace only, a missing or incomplete artifact makes the generator analyze the images itself (fallback via the agent CLI, section 7); that fallback is a one-shot analysis and weaker than yours, so do not rely on it.
 
-For every schematic analysis allowed by 3.4: locate the hits by keyword first, then judge only from focused high-resolution crops where the text is clearly readable. A full-page render is for navigation only. Save crops in the project directory (see `prompts/gpio_trace.md`, "Reading PDF schematics and small text").
+For every schematic analysis allowed by 3.4: locate the hits by keyword first, then judge only from focused high-resolution crops where the text is clearly readable. A full-page render is for navigation only. Save crops in the project directory (R-016, "讀 PDF 電路圖與小字").
+
+When you call the vision tool (`vision_analyze`), the model that reads the image sees only your question. Put the full text of the rule into the question: R-020 for a BIOS image, R-016 (scope, PDF reading, tracing method, function label to group/bit) for a GPIO crop. A question that only says "follow the rules" is not allowed.
 
 | Artifact | Required when | Rules | Notes |
 |---|---|---|---|
-| `<PROJECT>-bios-image-cache.json` | BIOS images exist (`bios*.png/jpg/jpeg`, case-insensitive) | `prompts/bios_reading.md` | `{"items":[{"path","filename","sha256","analysis_status":"DONE_VISION_ANALYZE","analysis_text","voltage_label_hints","voltage_value_hints","temperature_value_hints","fan_value_hints","current_value_hints","caseopen_hints"}]}`; value hints are `{label,value,unit}`, caseopen hints are `{label,state}`. Only the Hardware Monitor page has readings; for every other BIOS page leave all hint arrays empty and write `No live hardware-monitor sensor rows are visible.` (HWM sections are enabled only by readings on the monitor page). `sha256` must be the SHA-256 of the image file (`sha256sum`): the generator matches items by image hash and treats unmatched images as not analyzed. |
-| `<PROJECT>-gpio-trace.json` | `[GPIO]` on SIO and EIO-300/`NCT6694B*` routes | `prompts/gpio_trace.md` | `{"topology_status","items":[{"report_name","signal","function_label","group","bit","package_pin","status","evidence","name"}],"meta":{"images_analyzed":[...]}}`. `meta.images_analyzed` must list every `circuit*` image used; otherwise the generator treats the trace as incomplete and re-traces. INI keys (`GPIO00`, `GPIO01`, ...) are numbered by the generator in signal order; put the chip function label (e.g. `GPIOD0`) in `function_label`, not in `report_name`. |
+| `<PROJECT>-bios-image-cache.json` | BIOS images exist (`bios*.png/jpg/jpeg`, case-insensitive) | R-020 | `{"items":[{"path","filename","sha256","analysis_status":"DONE_VISION_ANALYZE","analysis_text","voltage_label_hints","voltage_value_hints","temperature_value_hints","fan_value_hints","current_value_hints","caseopen_hints"}]}`; value hints are `{label,value,unit}`, caseopen hints are `{label,state}`. Only the Hardware Monitor page has readings; for every other BIOS page leave all hint arrays empty and write `No live hardware-monitor sensor rows are visible.` (HWM sections are enabled only by readings on the monitor page). `sha256` must be the SHA-256 of the image file (`sha256sum`): the generator matches items by image hash and treats unmatched images as not analyzed. |
+| `<PROJECT>-gpio-trace.json` | `[GPIO]` on SIO and EIO-300/`NCT6694B*` routes | R-016, R-017 | `{"topology_status","items":[{"report_name","signal","function_label","group","bit","package_pin","status","evidence","name"}],"meta":{"images_analyzed":[...]}}`. `meta.images_analyzed` must list every `circuit*` image used; otherwise the generator treats the trace as incomplete and re-traces. INI keys (`GPIO00`, `GPIO01`, ...) are numbered by the generator in signal order; put the chip function label (e.g. `GPIOD0`) in `function_label`, not in `report_name`. |
 | `<PROJECT>-fan-pairing.json` | Fan sections on the **SIO route only** | R-019, `fan_pairing_contract.md` | Normalize with `build_fan_pairing.py --project <PROJECT> --input <analysis file>`. Fan idx is the SUSI fan order, not a chip pin number such as `TA4`/`PWM4`. On SIO, if missing, the generator silently falls back to one-to-one pairing — do not skip it. One-to-many boards come with a separate Fan Control schematic. |
 | `voltage_route_hints` (inside the cache item of the circuit image) | SIO route: AIMB + NCT6126D V5SB→V33 (R-013) | R-013 | Known gap: the generator currently drops this field when it rebuilds the cache (`skill_only_checklist.md` A-2). |
 
@@ -105,7 +107,7 @@ For every schematic analysis allowed by 3.4: locate the hits by keyword first, t
 ### 3.7 v2 convergence (NCT6106D / NCT6116D / NCT6126D, HWM.Voltage and HWM.Temperature)
 - Converged only when the route contains `+SUPERIO_V2_BIOS_PROBE_ALIAS` (Voltage) and `+SUPERIO_TEMP_V2_BIOS_PROBE_ALIAS` (Temperature).
 - Otherwise, once: deploy `<PROJECT>-pre.ini` to the target runtime INI, reload the SUSI4 driver, re-fetch the probe (3.2), re-run 3.6, re-check.
-- This needs remote side-effect consent (5.4). If still not converged, report the blocker (BIOS labels missing / probe has no `[OK]` channels / no consent) and do not claim completion.
+- This needs remote side-effect consent (5.5). If still not converged, report the blocker (BIOS labels missing / probe has no `[OK]` channels / no consent) and do not claim completion.
 
 ### 3.8 Build Machine-B section JSON
 ```
@@ -113,7 +115,7 @@ For every schematic analysis allowed by 3.4: locate the hits by keyword first, t
   --matrix <REPO>/CASES/<PROJECT>/<PROJECT>-section-matrix.json --output-dir <REPO>/CASES/<PROJECT>
 ```
 - Only `GENERATED` sections get JSON. Report section buckets (`GENERATED` / `SKIPPED_*` / `PENDING_*`) with absolute paths.
-- GPIO preflight: Machine-B consumes the INI key suffix as the SUSI public GPIO API ID, which must be decimal `0..127`. Physical tuple `group,pin` is separate evidence and may include hexadecimal groups (for example `GPIOD0` -> tuple group 13, pin 0). Never encode a physical group/bit by decimal concatenation (`GPIO130`) as the public ID. Require an evidence-backed logical/public ID mapping; if the request form supplies only a count or partial logical entries, mark GPIO `PENDING_LOGICAL_PUBLIC_ID_MAPPING` and do not deploy or run `--all` for that generated artifact. See `references/gpio-public-id-contract.md`.
+- GPIO preflight: Machine-B consumes the INI key suffix as the SUSI public GPIO API ID, which must be decimal `0..127`. Physical tuple `group,pin` is separate evidence and may include hexadecimal groups (for example `GPIOD0` -> tuple group 13, pin 0). Never encode a physical group/bit by decimal concatenation (`GPIO130`) as the public ID. The generator numbers the keys and `build_machineB_section_configs.py` rejects IDs outside `0..127`.
 - Without `--all`, stop here.
 
 ### 3.9 Full validation (only with `--all` or `--validate`)
@@ -123,13 +125,21 @@ For every schematic analysis allowed by 3.4: locate the hits by keyword first, t
 ```
 - `<MACHINE_B_HOST>` is the SSH IP. Validation has no WinRM path. If SSH to that IP fails, report it and ask before retrying over SSH on the direct-link IP; never switch IPs silently in the middle of a run.
 - Add `--no-write-tests` only when the user gave `--limit`. Then no set/write/control switch reaches any runner; sections with a Set API that were not exercised report `CONDITIONAL`, and the summary's Scope line says `READ-ONLY`.
-- Use a new unique run ID each time; never delete or reuse an existing run directory.
+- Use a new unique run ID for each `--execute`; never delete an existing run directory. `--converge` is the exception: it must use the run ID of the baseline `--execute` run, because `fallback-plan.json` is bound to that run's summary and INI.
 - Never run this when generation is blocked or artifacts belong to another project.
 - Report `completed` plus the summary path once rollback/recovery closes safely; individual section failures stay in the summary. Interpret results with `verdict_report_skill.md`.
+- The validator process may exit non-zero (for example `1`) when its aggregate status is `SECTION_FAIL`, even though every runnable section report was collected and rollback/recovery completed safely. Always read the newly produced summary JSON/text and verify `rollback.status == PASS` before classifying the lifecycle: section-level FAIL remains a completed run; only orchestration, report-collection, rollback, or recovery failure is lifecycle-fatal.
 - **Enabled-switch propagation gate:** a manifest's `enabled_switches` is only an intent record, not proof that a runner received a PowerShell switch. When enabling a control/functional/write switch (for example `AllowControl`), first verify the orchestrator passes each enabled switch as a boolean runner argument, with a focused regression test. In the collected section report, confirm the corresponding operation actually ran (L3/L4/L6 evidence); do not describe a `BLOCKED_SAFETY` or "requires switch" result as a completed enabled test. If the declaration and invocation disagree, fix the deterministic Python data flow and test it before any target retry.
-- Post-validation route fallback (`--converge --fallback-plan <file>`) follows orchestrator 11.5. It normally needs the user's go-ahead; however, an already-recorded user standing authorization for GPIO post-validation fallback is sufficient when the strict trigger contract is met. Before acting, verify the baseline report has every required `SusiGPIOGetCaps` input/output probe, all of those probes failed, and there is no fixture/safety/infrastructure blocker. Use only the registry whitelist, preserve the baseline after every rejected candidate, and report the convergence artifact.
-- GPIO capability mask missing only some bits (for example `0x9FFF` instead of `0xFFFF`): the route (channel/IOPort/option) is correct; the missing bits are GPIOs whose traced group/pin is probably wrong (usually the adjacent pin). Report those GPIOs (key, signal, current function label and group/pin) for human review; do not re-trace or change their values yourself. Never trim those GPIOs, change the route, or treat it as unsupported hardware (verdict_report_skill.md section 4, item 6).
-- GPIO fallback: a candidate is the correct route when GetCaps/GetDirection/GetLevel succeed and more than half of the expected pins are in the capability mask. It converges and is written into the final INI even if some pins are missing; GPIO is then reported as FAIL with each missing pin (key, signal, function label, group/bit) for human review. Do not re-trace, drop pins or try another route for those pins yourself. Half or fewer supported pins means the route is not proven.
+- Post-validation route fallback (`--converge --fallback-plan <file>`) follows orchestrator 11.5. The trigger is decided by the program, not by you: each failed section in the summary has a `fallback trigger:` line (`fallback_trigger` in the JSON), and when any section is `ELIGIBLE` the validator writes `<run>/fallback-plan.json` (whitelist order, baseline route excluded) and names it at the end of the summary. Do not write or edit the plan yourself. Running it normally needs the user's go-ahead; an already-recorded standing authorization for GPIO fallback is sufficient. If the summary says `ELIGIBLE` for GPIO, run `--converge` with that plan; if it says `not eligible`, do not. If the plan also lists sections other than GPIO, ask the user before running it.
+- Converge command (only after an `ELIGIBLE` trigger):
+  ```
+  <REPO>/.venv/bin/python <REPO>/run_machineB_full_validation.py --project <PROJECT> --repo-root <REPO> \
+    --run-id <BASELINE_RUN_ID> --converge --fallback-plan <REPO>/CASES/<PROJECT>/validation_runs/<BASELINE_RUN_ID>/fallback-plan.json \
+    --host <MACHINE_B_HOST> --user <USER>
+  ```
+  Do not regenerate the INI between `--execute` and `--converge`; the plan records the INI hash and is rejected if it changed.
+- GPIO trigger: `GetCaps` input/output returned an error status (for example `0xFFFFFCFF`) on every bank. A capability mask printed next to a failed GetCaps is not evidence; never call such a route correct.
+- GPIO verdict: PASS only when every expected pin is in the mask. GetCaps succeeded but some bits are missing is `PARTIAL` and stays FAIL; the summary lists each missing pin (key, signal, function label, group/bit) for human review. On the baseline route this does not trigger fallback (the route is right, the traces are suspect). In fallback, the first whitelist candidate whose GetCaps/GetDirection/GetLevel succeed with more than half the pins supported wins: its route is written into the final INI, and GPIO is reported PASS (all pins) or FAIL `PARTIAL` (missing pins listed). Half or fewer means that candidate is rejected and the next one is tried. Do not re-trace, drop pins or change values yourself (verdict_report_skill.md section 4, item 6).
 - After `--converge`, `<PROJECT>-machineB-summary.json/.txt` is rewritten as the single final report: converged sections take the winning attempt's verdict, and the text ends with a Details list of every evidence file. The first-pass summary is preserved as `<PROJECT>-machineB-summary.baseline.json/.txt`. Give the user only the final summary path; do not ask them to read `fallback-convergence.json` or the baseline separately.
 
 ## 4. Done criteria
@@ -152,7 +162,13 @@ For every schematic analysis allowed by 3.4: locate the hits by keyword first, t
 - "簡單跑一下" does not authorize fixes, deployment, reload or functional tests.
 - After a context compaction/handoff, act only on the latest explicit user request.
 
-### 5.4 Consent and denials
+### 5.4 One section never stops the others
+- A problem in one section (an incomplete or partly AMBIGUOUS GPIO trace, a pending or skipped section, a section FAIL) never stops the validation of the other sections. Report it and keep going.
+- GPIO is validated with whatever rows the generator produced (`GENERATED`). There is no minimum number of confirmed signals and no comparison with a target count: the agent cannot know how many it missed. If GetCaps fails on every bank, the program's fallback trigger applies (3.9); missing pins are reported by the summary.
+- Stop the lifecycle only when 3.9 says so: the `--validate` preflight in section 2 fails, generation is blocked, the artifacts belong to another project, or deploy/reload/report collection/rollback/recovery fails.
+- Do not add gates, pitfalls or new stop conditions to this file on your own (including automatic skill reviews); propose them to the user (section 8).
+
+### 5.5 Consent and denials
 - Remote side effects (SCP/SSH/WinRM writes, remote scripts, INI deployment, driver reload) need explicit consent in the current turn. `/susiagent ... --all --host` is consent for the safe-default lifecycle only.
 - Run one state-changing remote command at a time and verify the result before the next.
 - If a command is denied, stop and report; never retry through another command shape or tool.
@@ -189,7 +205,7 @@ When a run reveals something worth keeping, put it in exactly one of these place
 |---|---|
 | Operating procedure for the environment (connection, transport, target recovery, packaging) | Update the matching runbook in `references/`; create a new runbook only for a new situation, and add one row to section 6 |
 | A decision the agent makes from the user's words | Section 5 of this file |
-| A rule for judging evidence, a section rule, or a cross-stage policy | The matching `AnalysisSKill/*.md` (image-reading rules for the generator: `prompts/*.md`) — **ask the user before changing rules** |
+| A rule for judging evidence, a section rule, or a cross-stage policy | The matching `AnalysisSKill/*.md` (when an image-reading rule in R-016/R-020 changes, also update the generator's English copy in `prompts/*.md`) — **ask the user before changing rules** |
 | Anything deterministic (condition, template, encoding, mapping) | Python + regression test, not documents |
 | Hardware rows/values | `config_new.db` |
 | A step that only happens because this file says so (the code does not enforce it) | Append to `<REPO>/skill_only_checklist.md` |

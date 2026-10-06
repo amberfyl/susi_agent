@@ -80,7 +80,7 @@
 - `+12V` -> `V12`
 - `+5V` -> `V50`
 - `VBAT` -> `VBAT`
-- 讀 BIOS 圖時「只取即時讀值列、不取門檻設定」等規則：給模型的版本在 `prompts/bios_reading.md`（例：`CPU Temperature` 可用、`CPU Shutdown Temperature` 不可用）。
+- 讀 BIOS 圖時「只取即時讀值列、不取門檻設定」等讀圖規則見 R-020（例：`CPU Temperature` 可用、`CPU Shutdown Temperature` 不可用）。
 
 ### 執行規則
 - 上述映射屬於「高機率」而非硬規則，必須保留可覆寫空間。
@@ -94,7 +94,7 @@
 
 ### 可做
 - BIOS 即時值（溫度/電壓/RPM）可作為後續驗證比對基準（容差比對）。
-- 讀圖時要一併記錄可見的即時值（V/mV、C、RPM）：給模型的規則在 `prompts/bios_reading.md`；程式解析後存入 `<PROJECT>-bios-image-cache.json` 的 `voltage_value_hints` / `temperature_value_hints` / `fan_value_hints`。
+- 讀圖時要一併記錄可見的即時值（V/mV、C、RPM），規則見 R-020；結果存入 `<PROJECT>-bios-image-cache.json` 的 `voltage_value_hints` / `temperature_value_hints` / `fan_value_hints`。
 
 ### 不可做
 - 不可用 BIOS 當下數值推導 ini channel 編碼。
@@ -422,7 +422,7 @@
 - HWM 證據不足時不產生正式 section，保留 pending 狀態；非 HWM 證據不足時依其專屬規則保留候選或 pending，不跨層猜測。
 
 ## 備註
-- 目前已落地分析規則十九條（R-001~R-019）；後續新增規則時延續編號。
+- 目前已落地分析規則二十條（R-001~R-020）；後續新增規則時延續編號。
 - 建議在最終報告中記錄：
   - 觸發證據（BIOS 圖哪一張、擷取到的 CPU 字串/項目列表）
   - 實際執行結果（是否刪除 SMBus section、各 section 刪除哪些非 BIOS 項目）
@@ -432,14 +432,37 @@
 
 > **適用範圍：SIO（`NCT61**D*`，起點 `SIO_GPIO*`）與 EIO-300 / `NCT6694B*` 複合晶片（起點 `EC_P*_GPIO*`）的 `[GPIO]`。** 其他 EC 的 GPIO 走 DB 路線，不追線（orchestrator 9.1）。
 
-> **給模型看的判斷規則在 `prompts/gpio_trace.md`**（程式 `_auto_generate_gpio_trace` 執行時載入；要改追線規則請改那份檔案）。
 > 各晶片的起點訊號（`NCT6694B*`/`EIO-300*` → `EC_P*_GPIO*`、`NCT61**D*`/`NCT6776D*` → `SIO_GPIO*`、`EIO-211*` → `EC_GP*`）由程式 `_gpio_target_signal_pattern` 決定。
+> 本節是 agent 追線的規則。呼叫視覺工具（例：`vision_analyze`）看圖時，把本節「範圍」「讀 PDF 電路圖」「追線方法」「function label 轉 group/bit」的內容寫進提問，不可只寫「依規則」。`prompts/gpio_trace.md` 是 py 備援專用的英文副本，改規則時兩邊一起改。
 
-### 重點摘要（給人看）
-- 只追目標 pattern 的外部訊號，先列出完整 `target_signal_set`；其他訊號一律 `OUT_OF_SCOPE`。
-- 沿實際 wire 追到晶片腳，答案是腳旁的 GPIO function label；文字位置、上下排列不是連線證據。
-- 讀 PDF 電路圖：先用關鍵字找出所有命中頁與區域，對每個區域做「看得清楚字」的高解析放大裁切再判讀；整頁圖只能用來定位，字太小時不可據以判定。裁切圖存在專案目錄。（Fan 配對、電壓分壓等其他電路圖分析同樣適用。）
-- 看不清楚就先放大重裁；放大後仍看不清楚才標 AMBIGUOUS，不猜。
+### 範圍：先建立目標訊號集合
+- 只追 case 指定的目標 pattern 外部 GPIO 訊號（例：`EC_P*_GPIO*`、`SIO_GPIO*`）。
+- 對應前先列出完整的目標訊號集合與數量；每個成員最後都要有對應結果或 AMBIGUOUS。
+- `EC_P*_GPIO*` 要包含所有 port（P1、P2、P3…），不可追完第一組 port 就停。
+- 目標 pattern 以外的訊號即使接到 GP* 腳也是 OUT_OF_SCOPE（例：FAN_SPEED*、*_PWM、*BEEP*、SIO_LED*、PORT80*），不輸出。
+
+### 讀 PDF 電路圖與小字
+- 先定位：在 PDF 文字中搜尋目標 pattern 或關鍵字，列出所有命中頁與區域；不可只看第一個命中或第一組 port。
+- 先放大再判斷：每個命中區域都裁成聚焦的高解析圖，讓訊號名、走線轉折、接點、腳號與 function label 都清楚可讀。
+- 整頁圖只能用來定位。字太小時不可據以判定，要再裁更小範圍、放更大；放大後仍看不清楚才標 AMBIGUOUS。
+- 保留證據：裁切圖存在專案目錄（不可只放 /tmp），並列在 `meta.evidence_images`。（Fan 配對、電壓分壓等其他電路圖分析同樣適用。）
+
+### 追線方法
+- 外部訊號名只是起點；答案是走線實際接到的晶片腳旁印的 GPIO function label。
+- 沿連續的電氣走線逐段追，包含轉折與垂直段。文字位置、上下排列、OCR 順序、名稱相似都不是連線證據。
+- 最常見的錯誤是落到隔壁腳（例：`GPIOA6` 誤為 `GPIOA5`、`GPIO91` 誤為 `GPIO90`）。採用對應前，確認走線末端的腳號，並讀同一腳位列上的 function label。
+- 交叉處沒有接點（junction dot）不算連接；只在接點處分岔。
+- `X`/`NC` 標記只有在同一腳或同一走線末端、且走線在那裡結束時才算數。
+- 訊號名旁的 `<數字>` 標記（例：`EC_P1_GPIO2 <49>`）不改變判斷。同一張圖上有連續走線接到晶片腳就照常對應；沒有走線接到晶片腳才標 AMBIGUOUS。
+- `<數字>` 只是列出同一條 net 出現的其他頁，絕不代表這一頁沒有走線。要從 port/BI 符號**與標記相反的那一側**追（走線可能往左接到晶片），並穿過串聯的 0Ω 電阻／跳線一路追到晶片腳。
+- 走線被截斷、端點不清楚、或分不出是走線還是標註時，標 AMBIGUOUS，不猜。
+
+### function label 轉 group/bit
+- `GPxy` / `GPIOxy` → group x、bit y（例：`GPIO34` → 3,4；`GP50` → 5,0）。
+- group 那一位可能是十六進位：`GPIOA5` → 10,5；`GPIOB0` → 11,0；`GPIOD0` → 13,0。
+- group/bit 只能由晶片 function label 解出，不可由外部訊號後綴推導（`EC_P2_GPIO5` 不代表 group 2 或 bit 5）。程式另以 `_parse_gpio_function_label` 解析並覆蓋。
+- 晶片封裝腳號（例：`F1`、`L6`）只是輔助證據，看得清楚才記錄。
+- 不決定 INI key。generator 依訊號順序編 `GPIO00`、`GPIO01`…（`EC_P1_GPIO0..7`，接著 `EC_P2_GPIO0..7`…；`SIO_GPIOn` 依 n）。晶片 function label 填在 `function_label`，不可填進 `report_name`。
 
 ### 驗證案例：ARK-1251
 - `EC_P1_GPIO4` 的文字位置接近 `ESPI_ALERT#/GPIOB3`，但實際 wire 先水平延伸、再向下摺線，最後接到 `F1`。
@@ -467,7 +490,7 @@
 1. 主要輸出先建立 signal 到 GPIO function label 的 mapping：
   - `external signal/net -> chip GPIO function label`
   - 只處理 R-016 `分析範圍 Gate` 通過的 `target_signal_set`；`OUT_OF_SCOPE` signal 不得進入 mapping 表。
-2. function label 正規化成 group/pin（含十六進位 group，例：`GPIOB0` → 11,0）：給模型的規則在 `prompts/gpio_trace.md`，程式另以 `_parse_gpio_function_label` 解析並覆蓋。group/pin 只能由 function label 解出，不可由外部訊號後綴推導。
+2. function label 正規化成 group/pin（含十六進位 group，例：`GPIOB0` → 11,0）：規則見 R-016「function label 轉 group/bit」。group/pin 只能由 function label 解出，不可由外部訊號後綴推導。
 3. chip package pin number（例如 `L6`、`M6`、`A12`）只作追線證據/除錯欄位，不是主要 GPIO mapping 結果；若圖面可讀，才附加記錄。
 4. 再輸出 SUSI logical mapping（若 form/JSON 有 GPI/GPO 項目）：
   - `logical GPI0/GPO0 -> normalized group/pin`（只有在 wire/order/文件證據支持時才能建立）
@@ -571,6 +594,30 @@
 - 無法唯一收斂：`FAN_PAIRING_AMBIGUOUS`
 
 ---
+
+## 規則 R-020：BIOS 圖讀取規則
+
+> 本節是 agent 讀 BIOS 圖的規則。呼叫視覺工具（例：`vision_analyze`）時，把本節內容寫進提問，不可只寫「依規則」。`prompts/bios_reading.md` 是 py 備援專用的英文副本，改規則時兩邊一起改。
+
+### 哪一頁算數
+- 只有 Hardware Monitor / PC Health 頁（有即時讀值的列）才是 HWM section 的證據。
+- 其他 BIOS 頁（CPU configuration、chipset/iManager configuration、顯示版本的 main 頁…）不是硬體監控證據，只回答：`No live hardware-monitor sensor rows are visible.` 否定句裡不要列感測器名稱（不寫「沒有 Case Open 項目」或「沒有風扇列」）。
+
+### 要讀什麼
+- 只回報圖上看得到的文字與數值，不猜、不補。
+- 電壓 rail 名稱（例：`+12V`、`+5V`、`+5VSB`、`+3.3V`、`+9V`、`VBAT`、`VCORE`）。
+- 溫度感測器名稱（例：`CPU Temperature`、`System Temperature`、`Chipset Temperature`）。
+- 風扇名稱（例：`CPU FAN`、`System FAN`、`COM Module FAN`、`Carrier Board FAN`）。
+- 電流讀值與 Case Open / Chassis Intrusion 即時狀態，只在有顯示數值或狀態時才算。
+
+### 即時讀值與設定值
+- 只採用有即時讀值的列（例：`CPU Temperature : 45 C`、`CPU FAN Speed : 2480 RPM`）。
+- 門檻與動作設定不是感測器，不可當感測器名稱回報：例如 `CPU Shutdown Temperature`、`Warning Temperature`、`Throttle Temperature`、風扇 duty 或目標溫度設定。
+
+### 數值
+- Case Open / Chassis Intrusion 只有即時狀態才算（例：`Open`、`Closed`、`Yes`、`No`、`OK`）；`Case Open Detection`、`Chassis Intrusion [Disabled]` 這類設定不是讀值。
+- 看得到即時值時連同單位回報：電壓 `V` 或 `mV`、溫度 `C`、轉速 `RPM`。
+- 數值照圖上抄；看不到數值時只回報名稱。
 
 ## 人工搜圖建議
 

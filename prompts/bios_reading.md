@@ -1,7 +1,7 @@
 # BIOS image reading rules
-<!-- Operational prompt rules loaded by susi_gen.py (_vision_populate_bios_cache).
-     Source for humans: AnalysisSKill/bios_circuit_image_analysis_rule.md R-003 / R-004 / R-005.
-     Edit the rules here; the human document points to this file. -->
+<!-- py fallback only: loaded by susi_gen.py when the agent did not write the artifact.
+     The agent's rules are AnalysisSKill/bios_circuit_image_analysis_rule.md R-020.
+     This file is the English copy of those rules; change both together. -->
 
 ## Which page counts
 - Only the Hardware Monitor / PC Health page (rows with live readings) is evidence for HWM sections.

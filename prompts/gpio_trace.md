@@ -1,7 +1,7 @@
 # GPIO circuit trace rules
-<!-- Operational prompt rules loaded by susi_gen.py (_auto_generate_gpio_trace).
-     Source for humans: AnalysisSKill/bios_circuit_image_analysis_rule.md R-016 / R-017.
-     Edit the rules here; the human document points to this file. -->
+<!-- py fallback only: loaded by susi_gen.py when the agent did not write the artifact.
+     The agent's rules are AnalysisSKill/bios_circuit_image_analysis_rule.md R-016.
+     This file is the English copy of those rules; change both together. -->
 
 ## Scope: build the target signal set first
 - Trace only the external GPIO signals of the target pattern given in the case info (for example `EC_P*_GPIO*` or `SIO_GPIO*`).
@@ -22,6 +22,7 @@
 - A crossing without a junction dot is not a connection. Branch only at junctions.
 - An `X`/`NC` mark counts only when it sits on the same pin or wire end and the wire terminates there.
 - A `<number>` tag next to a net label (for example `EC_P1_GPIO2 <49>`) does not change the judgement. If a continuous wire on the same image reaches a chip pin, map it normally; if no wire reaches a chip pin, mark AMBIGUOUS.
+- The `<number>` tag only lists other pages that use the same net; it never means the wire is missing on this page. Follow the wire from the port/BI symbol on the side opposite the tag (it may run left toward the chip) and through series 0Ω resistors/jumpers to the chip pin.
 - When the wire is cut off, the end point is unclear, or a wire cannot be told apart from an annotation, mark AMBIGUOUS. Never guess.
 
 ## Function label to group/bit
