@@ -341,6 +341,27 @@ class SectionReasonTests(unittest.TestCase):
             )
 
 
+class ReadOnlySummaryTests(unittest.TestCase):
+    def test_summary_scope_marks_read_only_runs(self):
+        from run_machineB_full_validation import write_validation_summary
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            summary = write_validation_summary(
+                contract,
+                runtime_ini={"status": "PASS"},
+                reload_result={"status": "PASS"},
+                section_results=[],
+                rollback={"status": "PASS"},
+                errors=[],
+                warnings=[],
+                write_tests_enabled=False,
+            )
+            self.assertFalse(summary["write_tests_enabled"])
+            text = contract.outputs.summary_text.read_text(encoding="utf-8")
+            self.assertIn("Scope: Phase 1 - SW API READ-ONLY (write tests disabled by --no-write-tests)", text)
+
+
 class FallbackFinalSummaryTests(unittest.TestCase):
     def _baseline(self, contract):
         from run_machineB_full_validation import write_validation_summary

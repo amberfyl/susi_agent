@@ -32,6 +32,15 @@ class MachineBWdtContractTests(unittest.TestCase):
         self.assertIn("[Convert]::ToUInt32('FFFFFEFA', 16)", self.runner)
         self.assertIn("ALREADY_RUNNING_NOT_MODIFIED", self.runner)
 
+    def test_start_stop_requires_explicit_switch(self):
+        self.assertIn("[switch]$EnableStartStopTest", self.runner)
+        self.assertIn("} elseif (-not $EnableStartStopTest) {", self.runner)
+        disabled_branch = self.runner[
+            self.runner.index("} elseif (-not $EnableStartStopTest) {"):
+            self.runner.index("# Phase 1 write path without reboot:")
+        ]
+        self.assertNotIn("SusiWDogStart", disabled_branch)
+
     def test_runner_never_waits_for_timeout(self):
         code = re.sub(r"#.*", "", self.runner)
         self.assertNotIn("Start-Sleep", code)

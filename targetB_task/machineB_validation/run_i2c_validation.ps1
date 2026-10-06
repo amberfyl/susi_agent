@@ -3,7 +3,8 @@ param(
     [string]$ConfigPath = "$PSScriptRoot\i2c.json",
     [string]$IniPath = "",
     [string]$IniDir = "$env:WINDIR\SUSI",
-    [string]$OutDir = ".\out"
+    [string]$OutDir = ".\out",
+    [switch]$EnableSetTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -235,7 +236,7 @@ try {
                 }
                 $setTests[$channel] = $test
 
-                if ($null -ne $meta.frequency.khz) {
+                if ($EnableSetTest -and $null -ne $meta.frequency.khz) {
                     $originalKHz = [UInt32]$meta.frequency.khz
                     $targetKHz = if ($originalKHz -ne $alternateKHz) { $alternateKHz } else { $fallbackKHz }
                     $test.original_khz = $originalKHz
@@ -278,7 +279,8 @@ try {
                     }
                 }
 
-                # SetFrequency unsupported (or no frequency): probe 7-bit addresses 0x08..0x77.
+                # Set test disabled, SetFrequency unsupported, or no frequency:
+                # read-only probe of 7-bit addresses 0x08..0x77.
                 $found = @()
                 for ($address = 0x08; $address -le 0x77; $address++) {
                     $probeStatus = [NativeSusi]::SusiI2CProbeDevice($apiId, [UInt32]($address -shl 1))
@@ -312,7 +314,8 @@ try {
                 $report.checks.recovery = 'PASS'
             } elseif ($unverified.Count -gt 0) {
                 $report.result = 'CONDITIONAL'
-                $report.reason = 'SetFrequency unsupported and no device responded on: ' + ($unverified -join ', ') + '; bus path not exercised.'
+                $prefix = if ($EnableSetTest) { 'SetFrequency unsupported' } else { 'Set test disabled' }
+                $report.reason = $prefix + ' and no device responded on: ' + ($unverified -join ', ') + '; bus path not exercised.'
                 $report.validation_layers.L4_readback = 'CONDITIONAL'
                 $report.validation_layers.L6_recovery = 'N_A'
                 $report.checks.recovery = 'NOT_REQUIRED'

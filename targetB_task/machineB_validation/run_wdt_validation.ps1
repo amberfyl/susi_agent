@@ -3,7 +3,8 @@ param(
     [string]$ConfigPath = "$PSScriptRoot\AIMB-289_wdt.json",
     [string]$IniPath = "",
     [string]$IniDir = "$env:WINDIR\SUSI",
-    [string]$OutDir = ".\out"
+    [string]$OutDir = ".\out",
+    [switch]$EnableStartStopTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -177,6 +178,14 @@ try {
             $report.validation_layers.L4_readback = 'PENDING'
             $report.validation_layers.L5_functional = 'PENDING'
             $report.checks.read_stability = 'PENDING'
+            $report.checks.control_effect = 'NOT_RUN'
+        } elseif (-not $EnableStartStopTest) {
+            $report.result = 'CONDITIONAL'
+            $report.reason = 'WDT Start/Stop test not enabled (write tests disabled); watchdog not touched.'
+            $report.validation_layers.L2_capability = 'PENDING'
+            $report.validation_layers.L3_api = 'PENDING'
+            $report.validation_layers.L4_readback = 'PENDING'
+            $report.checks.read_stability = 'NOT_RUN'
             $report.checks.control_effect = 'NOT_RUN'
         } else {
             # Phase 1 write path without reboot: Start with the maximum reset time

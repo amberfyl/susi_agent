@@ -155,7 +155,7 @@ class LocalPreflightAndDryRunTests(unittest.TestCase):
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(payload["mode"], "dry-run")
         self.assertEqual(payload["preflight"]["status"], "PASS")
-        self.assertEqual(payload["safety_policy"]["enabled_opt_in_switches"], ["AllowControl", "EnableFunctionalTest", "EnableSetConfigTest", "EnableWriteTest"])
+        self.assertEqual(payload["safety_policy"]["enabled_opt_in_switches"], ["AllowControl", "EnableFunctionalTest", "EnableSetConfigTest", "EnableSetTest", "EnableStartStopTest", "EnableWriteTest"])
 
     def test_cli_dry_run_writes_manifest_and_returns_zero(self):
         from run_machineB_full_validation import main
@@ -206,7 +206,7 @@ class LocalPreflightAndDryRunTests(unittest.TestCase):
         self.assertEqual(run.call_count, 1)
         manifest = run.call_args.args[1]
         self.assertEqual(manifest["mode"], "execute")
-        self.assertEqual(manifest["safety_policy"]["enabled_opt_in_switches"], ["AllowControl", "EnableFunctionalTest", "EnableSetConfigTest", "EnableWriteTest"])
+        self.assertEqual(manifest["safety_policy"]["enabled_opt_in_switches"], ["AllowControl", "EnableFunctionalTest", "EnableSetConfigTest", "EnableSetTest", "EnableStartStopTest", "EnableWriteTest"])
         execute_contract = run.call_args.args[0]
         self.assertEqual(execute_contract.project, contract.project)
 

@@ -266,8 +266,10 @@ try {
             $report.result = 'PASS'
             $report.reason = 'ThermalProtect SetConfig/readback/restore passed: ' + ($setVerified -join '; ')
         } else {
+            # SetConfig exists but was not exercised: phase 1 write path not proven.
             $report.result = 'CONDITIONAL'
             $report.reason = 'ThermalProtect GetCaps/GetConfig passed; SetConfig test was not enabled.'
+            $report.validation_layers.L4_readback = 'CONDITIONAL'
         }
     }
     $report.checks.read_stability = 'NOT_APPLICABLE'

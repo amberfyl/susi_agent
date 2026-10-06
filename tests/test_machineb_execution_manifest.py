@@ -133,7 +133,14 @@ class ExecutionManifestTests(unittest.TestCase):
         self.assertEqual(policy["default"], "phase1_reversible_writes_enabled")
         self.assertEqual(
             policy["enabled_opt_in_switches"],
-            ["AllowControl", "EnableFunctionalTest", "EnableSetConfigTest", "EnableWriteTest"],
+            [
+                "AllowControl",
+                "EnableFunctionalTest",
+                "EnableSetConfigTest",
+                "EnableSetTest",
+                "EnableStartStopTest",
+                "EnableWriteTest",
+            ],
         )
         self.assertEqual(
             policy["disabled_opt_in_switches"], ["EnableFixtureTest", "EnableStimulus"]
@@ -142,7 +149,29 @@ class ExecutionManifestTests(unittest.TestCase):
         self.assertEqual(by_section["SMBus"]["enabled_switches"], [])
         self.assertEqual(by_section["HWM.Fan"]["enabled_switches"], [])
         self.assertEqual(by_section["HWM.Fan.Control"]["enabled_switches"], ["AllowControl"])
+        self.assertEqual(by_section["I2C"]["enabled_switches"], ["EnableSetTest"])
+        self.assertEqual(by_section["WDT"]["enabled_switches"], ["EnableStartStopTest"])
         self.assertFalse(contract.outputs.run_root.exists())
+
+    def test_no_write_tests_passes_no_switch_to_any_runner(self):
+        from run_machineB_full_validation import (
+            READ_ONLY_POLICY,
+            SECTION_REGISTRY,
+            build_execution_manifest,
+        )
+
+        contract = self._build_contract(
+            [(entry.section, "GENERATED") for entry in SECTION_REGISTRY]
+        )
+
+        manifest = build_execution_manifest(contract, write_tests=False)
+
+        policy = manifest["safety_policy"]
+        self.assertEqual(policy["default"], READ_ONLY_POLICY)
+        self.assertEqual(policy["enabled_opt_in_switches"], [])
+        self.assertIn("AllowControl", policy["disabled_opt_in_switches"])
+        self.assertIn("EnableStartStopTest", policy["disabled_opt_in_switches"])
+        self.assertTrue(all(not section["enabled_switches"] for section in manifest["sections"]))
 
 if __name__ == "__main__":
     unittest.main()

@@ -147,6 +147,8 @@ class MachineBI2CContractTests(unittest.TestCase):
         self.assertIn("Apply-VerdictPolicy", runner)
         self.assertIn("PENDING_FIXTURE", runner)
         self.assertIn("SusiI2CSetFrequency", runner)
+        self.assertIn("[switch]$EnableSetTest", runner)
+        self.assertIn("if ($EnableSetTest -and $null -ne $meta.frequency.khz)", runner)
         self.assertIn(":restore", runner)
         self.assertIn("SusiI2CProbeDevice", runner)
         self.assertNotIn("SusiI2CWriteTransfer", runner)

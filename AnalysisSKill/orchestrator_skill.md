@@ -296,7 +296,7 @@ SuperIO 路線（`NCT61xxD` / `NCT6776D`；EIO-300 / `NCT6694B` 複合晶片走 
 3. 只把完整 `<project>-pre.ini` 複製為 `C:\Windows\SUSI\<project>.ini`；正常流程不部署 split INI。
 4. 關閉 `SusiDemo4`，validation reload 一次；以唯一 SUSI4 PnP 裝置 `Status=OK`、`Problem=0/CM_PROB_NONE` 作 readiness gate。
 5. 依 registry 固定順序執行 14 runners；`HWM.Fan` 與 `HWM.Fan.Control` 相鄰且有 dependency gate。
-6. 所有 runner 共用同一份完整 runtime INI；第一階段會還原的寫入開關（`AllowControl`、`EnableSetConfigTest`、`EnableFunctionalTest`、`EnableWriteTest`）預設開啟，`EnableFixtureTest`、`EnableStimulus` 預設不傳。判定規則見 `verdict_report_skill.md` §3。
+6. 所有 runner 共用同一份完整 runtime INI；第一階段會還原的寫入開關（`AllowControl`、`EnableSetConfigTest`、`EnableFunctionalTest`、`EnableWriteTest`、`EnableSetTest`、`EnableStartStopTest`）預設開啟，`EnableFixtureTest`、`EnableStimulus` 預設不傳。加 `--no-write-tests` 時全部不傳（唯讀）。判定規則見 `verdict_report_skill.md` §3。
 7. 每段只接受本次新產生的 `<report_prefix>_*.json`，立即下載解析；JSON verdict 為主，process exit code 只當診斷證據。
    - 多通道 section 任一 required channel 失敗時整體可為 `FAIL`，但必須標示 `PARTIAL_FAIL` 或全通道失敗，列出 total/passed/failed、成功與失敗通道及 status code。
    - 禁止把 `Backlight1=PASS、Backlight2=FAIL` 簡寫成「VGA.Backlight failed」。

@@ -29,7 +29,9 @@
    - `sw_verdict`（`Apply-VerdictPolicy`）同理：全部通過才是 `PASS_SW`，有未執行的層為 `PENDING_SW`。
 4. 寫入值一律選「與原值不同、但無害」的值，讀回才有意義：ThermalProtect 只改觸發溫度（caps 範圍內；原本有保護動作時只往上調，調不了就不改並判 `CONDITIONAL`），SourceId/EventType 不動；WDT reset time 等於原值時改用最大值減一個單位。
 5. 預設開啟的寫入測試（皆會還原）：`HWM.Fan.Control -AllowControl`、`ThermalProtect -EnableSetConfigTest`、`VGA.Backlight`/`VGA.Brightness`/`GPIO -EnableFunctionalTest`、`StorageArea -EnableWriteTest`。I2C 做頻率 Set→讀回→還原；SMBus 做唯讀 ReceiveByte 掃描（**不寫入**，避免寫壞 SPD）。WDT 做 Start（reset time 用硬體最大值、event type=NONE）→ 讀回 reset time → Trigger → 立即 Stop（`finally` 內最多重試 3 次），不等逾時、不重開機；Start 回 `SUSI_STATUS_RUNNING` 表示 WDT 已被其他程式使用，完全不動並判 `CONDITIONAL`；Stop 失敗判 `FAIL` 並警告目標機可能重開。
+   I2C 頻率測試由 `-EnableSetTest`、WDT Start/Stop 由 `-EnableStartStopTest` 控制，同樣預設開啟。
    預設不開：`SMBus -EnableFixtureTest`（需治具）、`HWM.Fan -EnableStimulus`（需刺激源）。
+   唯讀模式：`run_machineB_full_validation.py --no-write-tests` 不傳任何開關，所有寫入都不做；有 Set API 但沒測到的 section 判 `CONDITIONAL`，summary 的 Scope 行標示 `READ-ONLY`。
 6. 治具、硬體刺激、DQA 相關的待辦，一律寫在 summary 的「Phase 2 recommendations」段落，不降低第一階段判定。
 7. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
 

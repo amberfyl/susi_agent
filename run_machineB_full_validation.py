@@ -42,6 +42,8 @@ from machineb_fallback import (
 CONTRACT_SCHEMA_VERSION = "machineb.post_ini_contract.v1"
 MANIFEST_SCHEMA_VERSION = "machineb.execution_manifest.v1"
 SUMMARY_SCHEMA_VERSION = "machineb.validation_summary.v1"
+WRITE_POLICY = "phase1_reversible_writes_enabled"
+READ_ONLY_POLICY = "read_only_no_write_tests"
 DEFAULT_REMOTE_VERIFY_ROOT = PureWindowsPath(r"C:\Users\susiaa\Desktop\verify")
 DEFAULT_REMOTE_SUSI_ROOT = PureWindowsPath(r"C:\Windows\SUSI")
 DEFAULT_RELOAD_BAT = PureWindowsPath(
@@ -189,7 +191,9 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "i2c",
         ExecutionTier.GATED_READ,
         5,
-        "protocol capability and frequency checks",
+        "protocol capability checks with frequency set/readback/restore",
+        opt_in_switches=("EnableSetTest",),
+        default_switches=("EnableSetTest",),
     ),
     SectionRegistryEntry(
         "SMBus",
@@ -208,7 +212,9 @@ SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
         "wdt",
         ExecutionTier.GATED_READ,
         7,
-        "safety-sensitive watchdog capability/configuration checks",
+        "watchdog start/readback/trigger/stop without waiting for timeout",
+        opt_in_switches=("EnableStartStopTest",),
+        default_switches=("EnableStartStopTest",),
     ),
     SectionRegistryEntry(
         "ThermalProtect",
@@ -878,8 +884,14 @@ def stage_remote_bundle(
     }
 
 
-def build_execution_manifest(contract: PostIniContract) -> dict[str, Any]:
-    """Build a deterministic, side-effect-free dry-run execution manifest."""
+def build_execution_manifest(
+    contract: PostIniContract, *, write_tests: bool = True
+) -> dict[str, Any]:
+    """Build a deterministic, side-effect-free dry-run execution manifest.
+
+    ``write_tests=False`` (CLI ``--no-write-tests``) passes no opt-in switch to
+    any runner, so the run is read-only.
+    """
 
     generated = set(contract.inputs.generated_sections)
     for section in contract.inputs.generated_sections:
@@ -931,20 +943,22 @@ def build_execution_manifest(contract: PostIniContract) -> dict[str, Any]:
                 "script_dependencies": list(entry.script_dependencies),
                 "section_dependencies": list(entry.section_dependencies),
                 "available_opt_in_switches": list(entry.opt_in_switches),
-                "enabled_switches": list(entry.default_switches),
+                "enabled_switches": list(entry.default_switches) if write_tests else [],
                 "extra_path_arguments": list(entry.extra_path_arguments),
             }
         )
 
     enabled_switches = sorted(
         {switch for entry in SECTION_REGISTRY for switch in entry.default_switches}
+        if write_tests
+        else set()
     )
     disabled_switches = sorted(
         {
             switch
             for entry in SECTION_REGISTRY
             for switch in entry.opt_in_switches
-            if switch not in entry.default_switches
+            if switch not in enabled_switches
         }
     )
     contract_payload = contract.to_dict()
@@ -958,7 +972,7 @@ def build_execution_manifest(contract: PostIniContract) -> dict[str, Any]:
         "target": contract_payload["target"],
         "sections": sections,
         "safety_policy": {
-            "default": "phase1_reversible_writes_enabled",
+            "default": WRITE_POLICY if write_tests else READ_ONLY_POLICY,
             "enabled_opt_in_switches": enabled_switches,
             "disabled_opt_in_switches": disabled_switches,
         },
@@ -1082,11 +1096,11 @@ def run_local_preflight(
     }
 
 
-def write_dry_run_manifest(contract: PostIniContract) -> Path:
+def write_dry_run_manifest(contract: PostIniContract, *, write_tests: bool = True) -> Path:
     """Build configs, run local preflight, and atomically write dry-run manifest."""
 
     config_build = prepare_section_configs(contract)
-    manifest = build_execution_manifest(contract)
+    manifest = build_execution_manifest(contract, write_tests=write_tests)
     manifest["config_build"] = config_build
     manifest["preflight"] = run_local_preflight(contract, manifest)
     contract.outputs.run_root.mkdir(parents=True, exist_ok=True)
@@ -1947,6 +1961,11 @@ def run_activated_validation(
         errors=errors,
         warnings=warnings,
         started_at=started_at,
+        write_tests_enabled=(
+            manifest.get("safety_policy", {}).get("default") != READ_ONLY_POLICY
+            if isinstance(manifest.get("safety_policy"), Mapping)
+            else True
+        ),
     )
 
 
@@ -1961,6 +1980,7 @@ def write_validation_summary(
     warnings: list[Any],
     started_at: str | None = None,
     fallback: Mapping[str, Any] | None = None,
+    write_tests_enabled: bool = True,
 ) -> dict[str, Any]:
     """P9/P10: write deterministic machine-readable and text summaries."""
 
@@ -1989,6 +2009,7 @@ def write_validation_summary(
         "rollback": dict(rollback),
         "warnings": list(warnings),
         "errors": list(errors),
+        "write_tests_enabled": write_tests_enabled,
     }
     phase2 = [
         {"section": item.get("section"), "recommendation": note}
@@ -2015,7 +2036,11 @@ def write_validation_summary(
         f"Project: {contract.project}",
         f"Run ID: {contract.run_id}",
         f"Status: [{status}]  (exit code {exit_code})",
-        "Scope: Phase 1 - SW API read/write path (set, read back, restore)",
+        (
+            "Scope: Phase 1 - SW API read/write path (set, read back, restore)"
+            if write_tests_enabled
+            else "Scope: Phase 1 - SW API READ-ONLY (write tests disabled by --no-write-tests)"
+        ),
         f"Result: {counts or 'no sections'}",
         "",
         "Sections:",
@@ -2223,6 +2248,7 @@ def finalize_summary_after_fallback(
         warnings=list(baseline.get("warnings", [])),
         started_at=timestamps.get("started_at") if isinstance(timestamps, Mapping) else None,
         fallback=fallback_summary,
+        write_tests_enabled=bool(baseline.get("write_tests_enabled", True)),
     )
 
 
@@ -2253,6 +2279,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", help="Machine-B SSH host (required with --execute/--converge)")
     parser.add_argument("--user", help="Machine-B SSH user (required with --execute/--converge)")
     parser.add_argument("--runner-timeout-seconds", type=int, default=180)
+    parser.add_argument(
+        "--no-write-tests",
+        action="store_true",
+        help="Read-only run: pass no set/write/control switch to any runner",
+    )
     args = parser.parse_args(argv)
     if (args.execute or args.converge) and (not args.host or not args.user):
         parser.error("--host and --user are required with --execute/--converge")
@@ -2268,12 +2299,14 @@ def main(argv: list[str] | None = None) -> int:
             run_id=args.run_id,
         )
         if args.dry_run:
-            manifest_path = write_dry_run_manifest(contract)
+            manifest_path = write_dry_run_manifest(
+                contract, write_tests=not args.no_write_tests
+            )
             print(manifest_path)
             return 0
 
         config_build = prepare_section_configs(contract)
-        manifest = build_execution_manifest(contract)
+        manifest = build_execution_manifest(contract, write_tests=not args.no_write_tests)
         manifest["mode"] = "converge" if args.converge else "execute"
         manifest["config_build"] = config_build
         manifest["preflight"] = run_local_preflight(contract, manifest)
