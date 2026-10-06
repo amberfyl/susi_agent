@@ -12,19 +12,17 @@ Output shape:
                                              # embedded images extracted from the PDF)
 }
 
-LLM is configured via env vars (OpenAI-compatible), same convention as understand.py:
-  LLM_BASE_URL  — default: https://api.openai.com/v1
-  LLM_API_KEY   — required
-  LLM_MODEL     — default: gpt-5.3-codex
-  LLM_API_MODE  — auto|chat|responses (default: auto)
+The deep analysis is sent to the current agent CLI (agent_llm.py, default
+Hermes one-shot); provider, model and credentials come from the agent's own
+settings, not from this program.
 """
 
 import argparse
-import base64
 import json
-import os
 import sys
 from pathlib import Path
+
+from agent_llm import AgentLLMError, ask_agent_for_json
 
 TEMPLATE_PLACEHOLDER_HINT = (
     'Text like "<Ex: ...>", "{Ex: ...}", "<Add If Needed>", or a bare "Ex: ..." prefix '
@@ -380,90 +378,6 @@ Now output the analysis JSON object described in the system prompt:"""
 # LLM call
 # ---------------------------------------------------------------------------
 
-def _response_output_text(response) -> str:
-    txt = getattr(response, "output_text", None)
-    if txt:
-        return txt
-
-    chunks = []
-    for item in (getattr(response, "output", None) or []):
-        for c in (getattr(item, "content", None) or []):
-            t = getattr(c, "text", None)
-            if t:
-                chunks.append(t)
-
-    if chunks:
-        return "\n".join(chunks)
-    return str(response)
-
-
-def call_analysis_llm(user_message: str, image_paths: list[Path]) -> str:
-    try:
-        from openai import OpenAI
-    except ImportError:
-        sys.exit("openai package not installed — run: pip install openai")
-
-    api_key  = os.environ.get("LLM_API_KEY", "")
-    base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
-    model    = os.environ.get("LLM_MODEL", "gpt-5.3-codex")
-
-    api_mode = os.environ.get("LLM_API_MODE", "auto").strip().lower()
-
-    if not api_key:
-        sys.exit("LLM_API_KEY not set")
-
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
-    content: list = [{"type": "text", "text": user_message}]
-    for img_path in image_paths:
-        suffix = img_path.suffix.lower().lstrip(".")
-        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                "png": "image/png", "webp": "image/webp"}.get(suffix, "image/png")
-        b64 = base64.b64encode(img_path.read_bytes()).decode()
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
-        })
-
-    use_responses = (
-        api_mode == "responses"
-        or (api_mode == "auto" and model.startswith("gpt-5"))
-    )
-
-    if use_responses:
-        resp_input = [{"type": "input_text", "text": user_message}]
-        for img_path in image_paths:
-            suffix = img_path.suffix.lower().lstrip(".")
-            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "png": "image/png", "webp": "image/webp"}.get(suffix, "image/png")
-            b64 = base64.b64encode(img_path.read_bytes()).decode()
-            resp_input.append({
-                "type": "input_image",
-                "image_url": f"data:{mime};base64,{b64}",
-            })
-
-        response = client.responses.create(
-            model=model,
-            instructions=SYSTEM_PROMPT,
-            input=[{"role": "user", "content": resp_input}],
-            text={"format": {"type": "json_object"}},
-            temperature=0.1,
-            max_output_tokens=4096,
-        )
-        return _response_output_text(response)
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": content},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-    return response.choices[0].message.content
-
-
 # ---------------------------------------------------------------------------
 # Output validation (lightweight, mirrors understand.py's style)
 # ---------------------------------------------------------------------------
@@ -489,14 +403,11 @@ def run_deep_analysis(raw: dict, image_paths: list[Path], project_name: str,
     raw_text = raw_pages_to_text(raw)
     user_msg = build_user_message(raw_text, project_name, len(image_paths), guidance)
 
-    print(f"Calling LLM ({os.environ.get('LLM_MODEL', 'gpt-5.3-codex')}) for deep analysis "
-          f"({len(image_paths)} embedded image(s)) …", file=sys.stderr)
-    raw_response = call_analysis_llm(user_msg, image_paths)
-
     try:
-        analysis = json.loads(raw_response)
-    except json.JSONDecodeError as e:
-        sys.exit(f"LLM returned invalid JSON: {e}\n\nRaw output:\n{raw_response[:500]}")
+        analysis = ask_agent_for_json(SYSTEM_PROMPT, user_msg, image_paths,
+                                      purpose="PDF deep analysis")
+    except AgentLLMError as e:
+        sys.exit(str(e))
 
     if not analysis.get("file_name"):
         analysis["file_name"] = f"{project_name}.pdf"

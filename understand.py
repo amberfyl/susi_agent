@@ -4,20 +4,18 @@ understand.py — Stage 1: LLM form understanding
 Input : {project}.json  (from extract_pdf.py)  + optional screenshot(s)
 Output: {project}-spec.json  (consumed by generate_ini.py)
 
-LLM is configured via env vars (OpenAI-compatible):
-  LLM_BASE_URL  — default: https://api.openai.com/v1
-  LLM_API_KEY   — required
-  LLM_MODEL     — default: gpt-5.3-codex
-  LLM_API_MODE  — auto|chat|responses (default: auto)
+The form is sent to the current agent CLI (agent_llm.py, default Hermes
+one-shot); provider, model and credentials come from the agent's own settings,
+not from this program.
 """
 
 import argparse
-import base64
 import json
-import os
 import re
 import sys
 from pathlib import Path
+
+from agent_llm import AgentLLMError, ask_agent_for_json
 
 # ---------------------------------------------------------------------------
 # Valid ini_key sets — single source of truth for the closed key sets.
@@ -306,104 +304,6 @@ CaseOpen: {CASEOPEN_KEYS}
 {form_text}
 
 Now output the spec.json:"""
-
-
-# ---------------------------------------------------------------------------
-# LLM call
-# ---------------------------------------------------------------------------
-
-def _response_output_text(response) -> str:
-    txt = getattr(response, "output_text", None)
-    if txt:
-        return txt
-
-    chunks = []
-    for item in (getattr(response, "output", None) or []):
-        for c in (getattr(item, "content", None) or []):
-            t = getattr(c, "text", None)
-            if t:
-                chunks.append(t)
-
-    if chunks:
-        return "\n".join(chunks)
-    return str(response)
-
-
-def call_llm(user_message: str, screenshots: list[Path]) -> str:
-    """Call the configured LLM and return the raw text response."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        sys.exit("openai package not installed — run: pip install openai")
-
-    api_key  = os.environ.get("LLM_API_KEY", "")
-    base_url = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1")
-    model    = os.environ.get("LLM_MODEL", "gpt-5.3-codex")
-
-    api_mode = os.environ.get("LLM_API_MODE", "auto").strip().lower()
-
-    if not api_key:
-        sys.exit("LLM_API_KEY not set")
-
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
-    # Build content blocks
-    content: list = [{"type": "text", "text": user_message}]
-
-    for img_path in screenshots:
-        if not img_path.exists():
-            print(f"Warning: screenshot not found: {img_path}", file=sys.stderr)
-            continue
-        suffix = img_path.suffix.lower()
-        mime = {"jpg": "image/jpeg", ".jpeg": "image/jpeg",
-                ".png": "image/png", ".webp": "image/webp"}.get(suffix, "image/png")
-        b64 = base64.b64encode(img_path.read_bytes()).decode()
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{b64}"},
-        })
-
-    # Keep legacy Chat Completions path unchanged unless model/mode requires Responses.
-    # gpt-5.x (e.g., gpt-5.3-codex) is unsupported on chat.completions in this endpoint.
-    use_responses = (
-        api_mode == "responses"
-        or (api_mode == "auto" and model.startswith("gpt-5"))
-    )
-
-    if use_responses:
-        resp_input = [{"type": "input_text", "text": user_message}]
-        for img_path in screenshots:
-            if not img_path.exists():
-                continue
-            suffix = img_path.suffix.lower().lstrip(".")
-            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                    "png": "image/png", "webp": "image/webp"}.get(suffix, "image/png")
-            b64 = base64.b64encode(img_path.read_bytes()).decode()
-            resp_input.append({
-                "type": "input_image",
-                "image_url": f"data:{mime};base64,{b64}",
-            })
-
-        response = client.responses.create(
-            model=model,
-            instructions=SYSTEM_PROMPT,
-            input=[{"role": "user", "content": resp_input}],
-            text={"format": {"type": "json_object"}},
-            temperature=0.1,
-            max_output_tokens=4096,
-        )
-        return _response_output_text(response)
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": content},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-    return response.choices[0].message.content
 
 
 # ---------------------------------------------------------------------------
@@ -833,13 +733,11 @@ def understand(project: str | None, in_json: str | None, spec_out: str | None,
     # Inject project name hint into the prompt
     user_msg    = f"Project name: {proj_name}\n\n" + user_msg
 
-    print(f"Calling LLM ({os.environ.get('LLM_MODEL', 'gpt-5.3-codex')}) …", file=sys.stderr)
-    raw = call_llm(user_msg, screenshots)
-
     try:
-        spec = json.loads(raw)
-    except json.JSONDecodeError as e:
-        sys.exit(f"LLM returned invalid JSON: {e}\n\nRaw output:\n{raw[:500]}")
+        spec = ask_agent_for_json(SYSTEM_PROMPT, user_msg, screenshots,
+                                  purpose="request-form understanding")
+    except AgentLLMError as e:
+        sys.exit(str(e))
 
     # Ensure project field is set
     if not spec.get("project"):

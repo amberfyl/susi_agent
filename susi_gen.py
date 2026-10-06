@@ -11,6 +11,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import agent_llm
 from extract_pdf import extract_pdf_to_json, resolve_paths as resolve_extract_paths
 from generate_ini import resolve_paths as resolve_generate_paths
 from machineb_fallback import apply_project_route_overrides
@@ -578,41 +579,20 @@ def _build_gpio_trace_prompt(rules_text: str, chip_u: str, target_signal_hint: s
     )
 
 
-# Fallback vision call used only when the agent did not pre-produce the result.
-# The agent CLI is configurable so any harness can supply its own vision tool:
-#   SUSI_VISION_CMD="<agent cli> ... {prompt} ..."   ({image} = image path, optional)
-DEFAULT_VISION_CMD = "hermes -z {prompt} -t vision"
+# All AI calls go through agent_llm: the current agent CLI (default Hermes
+# one-shot) answers with its own provider/model/credentials. Template env:
+# SUSI_AGENT_CMD (or legacy SUSI_VISION_CMD), "{prompt}" required, "{image}" optional.
+DEFAULT_VISION_CMD = agent_llm.DEFAULT_AGENT_CMD
 
 
 def _vision_command(prompt: str, image_path: Path) -> list[str]:
-    """Build the vision CLI argv from SUSI_VISION_CMD (default: Hermes)."""
-    template = os.environ.get("SUSI_VISION_CMD", "").strip() or DEFAULT_VISION_CMD
-    # Split the template first so the prompt always stays a single argument.
-    return [
-        part.replace("{prompt}", prompt).replace("{image}", str(image_path))
-        for part in shlex.split(template)
-    ]
+    """Build the agent CLI argv for one image (see agent_llm.agent_command)."""
+    return agent_llm.agent_command(prompt, image_path)
 
 
 def _run_vision_analyze(image_path: Path, prompt: str) -> str | None:
-    """Run the configured agent vision CLI and return plain text output."""
-    cmd = _vision_command(prompt, image_path)
-    try:
-        proc = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    except Exception as exc:
-        print(f"WARNING: vision command failed to start ({cmd[0]}): {exc}", file=sys.stderr)
-        return None
-
-    if proc.returncode != 0:
-        return None
-
-    out = (proc.stdout or "").strip()
-    return out or None
+    """Run the agent CLI on one image and return its plain-text answer."""
+    return agent_llm.run_agent(prompt, image_path)
 
 
 def _vision_populate_bios_cache(cache_path: Path, prompt_issues: dict | None = None,
@@ -4903,7 +4883,7 @@ def main():
             "SUSI pipeline wrapper\n"
             "  Stages: extract → understand → generate\n"
             "  PDF → form.json → spec.json → pre-INI\n"
-            "  'understand' requires LLM_API_KEY env var (OpenAI-compatible)"
+            "  'extract'/'understand' call the current agent CLI (agent_llm.py; default Hermes)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -4915,7 +4895,7 @@ def main():
         default="all",
         help=(
             "extract   — PDF → form.json\n"
-            "understand — form.json → spec.json (LLM, needs LLM_API_KEY)\n"
+            "understand — form.json → spec.json (agent LLM)\n"
             "generate  — config_new.db query → pre-INI + section INIs\n"
             "all       — extract + understand + generate"
         ),
