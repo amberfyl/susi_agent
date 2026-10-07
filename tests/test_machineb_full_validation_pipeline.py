@@ -799,6 +799,28 @@ class RunnerAndReportTests(unittest.TestCase):
             self.assertIn("AllowControl", invocations[1][2])
             self.assertTrue(invocations[1][2]["AllowControl"])
 
+    def test_all_enabled_switches_propagate_as_boolean_runner_arguments(self):
+        from run_machineB_full_validation import SECTION_REGISTRY, execute_validation_sections
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            transport = FakePipelineTransport()
+            plans = [section_plan(
+                entry.section, entry.report_prefix, entry.runner,
+                entry.config_template.format(model="BOARD"),
+                dependencies=entry.section_dependencies,
+                opt_ins=entry.opt_in_switches,
+                enabled=entry.default_switches,
+                extra=entry.extra_path_arguments,
+            ) for entry in SECTION_REGISTRY]
+            execute_validation_sections(contract, {"sections": plans}, transport)
+            calls = [call for call in transport.calls if call[0] == "runner"]
+            self.assertEqual(len(calls), len(plans))
+            for plan, call in zip(plans, calls):
+                for switch in plan["enabled_switches"]:
+                    self.assertIs(call[2][switch], True)
+                self.assertNotIn("EnableFixtureTest", call[2])
+                self.assertNotIn("EnableStimulus", call[2])
+
     def test_fan_sw_failure_blocks_control_but_independent_section_continues(self):
         from run_machineB_full_validation import execute_validation_sections
 
