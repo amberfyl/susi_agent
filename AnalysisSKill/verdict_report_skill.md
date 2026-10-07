@@ -27,7 +27,7 @@
    - `FAIL`：L1–L4 任一 `FAIL*`、L6 還原失敗、或其他 `FAIL_*` result。
    - `CONDITIONAL`：L1–L4 有 `PENDING`/`CONDITIONAL`，表示 API 通道**沒有被實際走過**（例：WDT 未執行 Start；SMBus 掃描無任何裝置回應；I2C 不支援 SetFrequency 且無裝置回應）。
    - `sw_verdict`（`Apply-VerdictPolicy`）同理：全部通過才是 `PASS_SW`，有未執行的層為 `PENDING_SW`。
-4. 寫入值一律選「與原值不同、但無害」的值，讀回才有意義：ThermalProtect 只改觸發溫度（caps 範圍內；原本有保護動作時只往上調，調不了就不改並判 `CONDITIONAL`），SourceId/EventType 不動；WDT reset time 等於原值時改用最大值減一個單位。
+4. 寫入值一律選「與原值不同、但無害」的值，讀回才有意義：ThermalProtect：EventType 為 NONE 時 EC 不保存溫度（讀回固定是預設值），所以原本 NONE 的 channel 暫時設成 THROTTLE、觸發溫度 = `trigger_maximum` − 10、解除溫度 ≤ `clear_maximum`；原本已有保護動作的 channel 維持原動作、只把觸發溫度往上調（調不了就不改並判 `CONDITIONAL`）。SourceId/EventType/觸發/解除四欄都要讀回相同才算 PASS，之後還原原設定（原本 NONE 的只比對 SourceId 與 EventType）；WDT reset time 等於原值時改用最大值減一個單位。
 5. 預設開啟的寫入測試（皆會還原）：`HWM.Fan.Control -AllowControl`、`ThermalProtect -EnableSetConfigTest`、`VGA.Backlight`/`VGA.Brightness`/`GPIO -EnableFunctionalTest`、`StorageArea -EnableWriteTest`。I2C 做頻率 Set→讀回→還原；SMBus 做唯讀 ReceiveByte 掃描（**不寫入**，避免寫壞 SPD）。WDT 做 Start（reset time 用硬體最大值、event type=NONE）→ 讀回 reset time → Trigger → 立即 Stop（`finally` 內最多重試 3 次），不等逾時、不重開機；Start 回 `SUSI_STATUS_RUNNING` 表示 WDT 已被其他程式使用，完全不動並判 `CONDITIONAL`；Stop 失敗判 `FAIL` 並警告目標機可能重開。
    I2C 頻率測試由 `-EnableSetTest`、WDT Start/Stop 由 `-EnableStartStopTest` 控制，同樣預設開啟。
    預設不開：`SMBus -EnableFixtureTest`（需治具）、`HWM.Fan -EnableStimulus`（需刺激源）。
