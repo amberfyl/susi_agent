@@ -2428,6 +2428,139 @@ def _duplicate_channels(rows: list[dict]) -> list[str]:
     return sorted([ch for ch, n in counts.items() if n > 1])
 
 
+_VOLTAGE_DIVIDER_RAIL_ITEMS = (
+    # Order matters: standby rails must be tested before their main-rail prefixes.
+    (("5VSB", "V5SB", "5V_DUAL", "5VDUAL", "5V_STBY", "5VSTBY", "5V_SB"), "V5SB"),
+    (("3VSB", "V3SB", "3V3SB", "3V3_DUAL", "3V3DUAL", "3V3_STBY", "3V_SB", "3.3VSB"), "V3SB"),
+    (("12V",), "V120"),
+    (("5V",), "V50"),
+    (("3V3", "3.3V", "V33", "3VCC"), "V33"),
+)
+
+
+def _voltage_rail_to_item(*names: object) -> str:
+    """Map schematic rail/net text (e.g. 'SIO_+V5SBIN', '+V5_DUAL') to an HWM.Voltage item key."""
+    for raw in names:
+        raw_text = str(raw or "").upper()
+        if re.search(r"-\s*V?\d", raw_text):  # negative rails are not divider routes
+            continue
+        text = re.sub(r"[\s+]", "", raw_text)
+        text = re.sub(r"(?<![\d.])V(12|5|3\.3|33|3)(?![\d.])", lambda m: {"33": "3V3", "3.3": "3V3"}.get(m.group(1), m.group(1) + "V"), text)
+        if not text:
+            continue
+        for tokens, item in _VOLTAGE_DIVIDER_RAIL_ITEMS:
+            if any(tok in text for tok in tokens):
+                return item
+    return ""
+
+
+def _scale_divider_pair(r1: object, r2: object) -> tuple[str, str] | None:
+    """Parse resistor strings (K ohm unit, e.g. '40.2K') and return integer R1/R2 with the ratio kept.
+
+    The INI cannot hold decimals: scale both by the same power of 10 until both are integers
+    (40.2K/10K -> 402/100, 30K/10K -> 30/10).
+    """
+    from decimal import Decimal, InvalidOperation
+
+    def _to_k(v: object) -> Decimal | None:
+        t = re.sub(r"(OHMS?|Ω|\s)", "", str(v or "").upper())
+        mult = Decimal(1)
+        if t.endswith("M"):
+            mult, t = Decimal(1000), t[:-1]
+        elif t.endswith("K"):
+            t = t[:-1]
+        try:
+            return Decimal(t) * mult
+        except InvalidOperation:
+            return None
+
+    a, b = _to_k(r1), _to_k(r2)
+    if a is None or b is None or a <= 0 or b <= 0:
+        return None
+    digits = max(0, -a.normalize().as_tuple().exponent, -b.normalize().as_tuple().exponent)
+    scale = Decimal(10) ** digits
+    return str(int(a * scale)), str(int(b * scale))
+
+
+def _apply_superio_voltage_divider(result: dict, evidence_path: Path | None) -> dict:
+    """Apply schematic-traced divider evidence to non-EC SIO HWM.Voltage rows.
+
+    Only the VIN0/VIN1/VIN2(AUXTIN) inputs carry dividers. Each traced route gives
+    rail -> actual VIN channel (no fixed left/right order) plus R1/R2. All other rows keep R1/R2=0.
+    """
+    meta: dict = {"status": "HWM_VOLTAGE_DIVIDER_EVIDENCE_INSUFFICIENT", "routes": []}
+    out = dict(result)
+    out["voltage_divider"] = meta
+    rows = result.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return out
+    if not evidence_path or not evidence_path.exists():
+        meta["reason"] = "voltage vision evidence file missing"
+        return out
+    try:
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        meta["reason"] = f"voltage vision evidence unreadable: {exc}"
+        return out
+    routes = evidence.get("routes") if isinstance(evidence, dict) else None
+    if not isinstance(routes, list) or not routes:
+        meta["reason"] = "voltage vision evidence has no routes"
+        return out
+
+    claims: dict[str, dict] = {}  # item -> {channel, r1, r2}
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        m = re.search(r"VIN\s*([0-2])", str(route.get("vin") or "").upper())
+        item = _voltage_rail_to_item(route.get("rail"), route.get("net"))
+        scaled = _scale_divider_pair(route.get("r1"), route.get("r2"))
+        entry = {"vin": route.get("vin"), "rail": route.get("rail"), "net": route.get("net"), "item": item}
+        if not m or not item or not scaled or item in claims:
+            entry["status"] = "UNUSABLE"
+            meta["routes"].append(entry)
+            continue
+        channel = f"0x{0x80000000 + int(m.group(1)):08X}"
+        claims[item] = {"channel": channel, "r1": scaled[0], "r2": scaled[1]}
+        entry.update({"status": "OK", "channel": channel, "r1": scaled[0], "r2": scaled[1]})
+        meta["routes"].append(entry)
+
+    if not claims:
+        meta["reason"] = "no usable divider route"
+        return out
+
+    claimed_channels = {c["channel"].upper(): item for item, c in claims.items()}
+    new_rows: list[dict] = []
+    dropped: list[dict] = []
+    applied: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        r = dict(row)
+        item = str(r.get("item_name") or "").upper()
+        ch = str(r.get("channel") or r.get("channel_id") or "").upper()
+        if item in claims:
+            c = claims[item]
+            r["channel"], r["channel_id"] = c["channel"], c["channel"]
+            r["resistor1"], r["resistor2"] = c["r1"], c["r2"]
+            applied.add(item)
+        elif ch in claimed_channels:
+            dropped.append({"item_name": item, "channel": ch, "claimed_by": claimed_channels[ch]})
+            continue
+        else:
+            r["resistor1"], r["resistor2"] = "0", "0"
+        new_rows.append(r)
+
+    meta.update({
+        "status": "HWM_VOLTAGE_DIVIDER_REMAPPED_BY_SCHEMATIC",
+        "applied_items": sorted(applied),
+        "unmatched_items": sorted(set(claims) - applied),
+        "dropped": dropped,
+    })
+    out["rows"] = new_rows
+    out["row_count"] = len(new_rows)
+    return out
+
+
 def _evaluate_non_ec_hwm_voltage(product_name: str, chip_name: str, rows: list[dict]) -> dict:
     """Return non-EC HWM.Voltage routing decision before diagram evidence is applied."""
     if _is_superio_voltage_seed_chip(chip_name):
@@ -4741,6 +4874,18 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                     result = dict(result)
                     result["rows"] = _apply_superio_voltage_seed_rows(result.get("rows") or [])
                     result["row_count"] = len(result.get("rows") or [])
+
+                    # Divider values come from the schematic trace (VIN0/1/2 -> rail), not the DB.
+                    result = _apply_superio_voltage_divider(
+                        result, proj_dir / f"{name}-voltage-vision-evidence.json")
+                    div_meta = result.get("voltage_divider") or {}
+                    fan_meta["voltage_divider_status"] = div_meta.get("status")
+                    if div_meta.get("status") == "HWM_VOLTAGE_DIVIDER_REMAPPED_BY_SCHEMATIC":
+                        route = f"{route}+SUPERIO_VOLTAGE_DIVIDER_SCHEMATIC"
+                        fan_meta["voltage_divider"] = {
+                            k: div_meta.get(k) for k in ("routes", "applied_items", "unmatched_items", "dropped")}
+                    else:
+                        fan_meta["voltage_divider"] = {"reason": div_meta.get("reason")}
 
                     # v2 refine (when probe + BIOS cache are both available):
                     # keep BIOS-visible + probe-OK items, and backfill Name(alias).

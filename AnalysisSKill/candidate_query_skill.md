@@ -58,7 +58,7 @@
 ### 5.4 HWM.Voltage / HWM.Temperature
 - query 欄位：`report_name`（對齊 probe `HWM_VOLTAGE_*` / `HWM_TEMP_*` 列舉名稱）、`channel_name`、`channel_id`（對應 INI `Channel` 欄位）。
 - table 可不覆蓋 probe 全列舉；未收錄者視為例外，不代表錯誤。
-- EC 與非 EC 都用相同 key 查詢，不跳過。查詢之後的處理（EC alias 融合；SuperIO v1 種子 / v2 收斂；R-014/R-015 判圖修正）全部屬 orchestrator / diagram skill 職責，本 skill 不執行：
+- EC 與非 EC 都用相同 key 查詢，不跳過。查詢之後的處理（EC alias 融合；SuperIO v1 種子 / v2 收斂；R-014 分壓圖判讀）全部屬 orchestrator / diagram skill 職責，本 skill 不執行：
   - 不檢查 probe `SUCCESS/ERR`。
   - 不判定 BIOS 名稱應回填到哪一列（例如 `+5V` vs `+5VSB`）。
   - 不做跨來源融合裁決。

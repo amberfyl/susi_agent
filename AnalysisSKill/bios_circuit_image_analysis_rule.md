@@ -309,100 +309,52 @@
 - 本規則僅限 `(AIMB, NCT6126D)`，不外推到其他 ProductChip。
 - 若 BIOS 顯示 `+3.3V` 但沒有 structured net-level 電路圖強證據，僅標記：`BIOS_DB_LABEL_MISMATCH_PENDING_SCHEMATIC`，不得改 key/alias。
 
-## 規則 R-014：AIMB + NCT6106D（SuperIO，非 EC）之 HWM.Voltage 三路分壓重建（AIMB-205）
+## 規則 R-014：SIO（`NCT61**D*`）HWM.Voltage 分壓圖判讀（通用；R-015 併入本規則）
 
-> **適用範圍：只適用 SIO（`NCT61**D*`）。** EC 與 EIO-300 / `NCT6694B*` 複合晶片的 HWM.Voltage 走 DB 路線，不看分壓圖（orchestrator 9.1）。
+> **適用範圍：所有 SIO（`NCT61**D*`，含 NCT6106D/6116D/6126D），不分產品線與型號。** EC 與 EIO-300 / `NCT6694B*` 的 HWM.Voltage 走 DB 路線，不看分壓圖（orchestrator 9.1）。
 
 ### 背景
-- 本規則屬 **SuperIO（非 EC）** 案例。
-- `ProductChip = (AIMB, NCT6106D)` 時，DB query 回來的 `HWM.Voltage` 可能包含多個電壓項目，不只三項。
-- 在本規則流程中，會先過濾掉 `R1/R2` 為 0 的候選；可進入三路分壓判圖的通常是有實際分壓值的候選。
-- 目前已確認命中此特例的型號：`AIMB-205`。
+- SIO 只有 `VIN0 / VIN1 / VIN2(AUXTIN)` 三個輸入接外部分壓電阻，只有這三路的 R1/R2 不為 0；其他電壓項目（VCORE、VBAT、3VCC…）R1/R2 一律是 0。
+- DB 的 `HWM.Voltage` 對 R1/R2 都是 0，且 DB 的 rail↔VIN 對應只是「常見假設」。實際哪個 rail 接到哪個 VIN 因板子而異，**不得假設固定順序**（不可預設 VIN0=5VSB、VIN1=5V、VIN2=12V，也不可套固定左右順序）。
 
-### 觸發條件（必須同時成立）
-1. `product_name == AIMB`
-2. `chip_name == NCT6106D`
-3. 已取得兩類電路圖證據：
-   - 分壓電阻圖（可讀三路 rail/net 與 R1/R2）
-   - SIO pin/net 圖（可讀 `VIN0/VIN1/VIN2(AUXTIN)` 對應）
-4. 可建立 `rail/net -> VIN channel` 的可追溯映射
+### 判讀流程（agent 看圖）
+1. 在 SIO 晶片圖上找 `VIN0/VIN1/VIN2(AUXTIN)` 三支腳（記錄 package pin），沿 net 追到分壓電阻節點，再追到來源 rail。
+2. 讀出每一路分壓的 R1（上臂，rail 側）與 R2（下臂，接地側）。
+3. 以追線結果決定每個 VIN 實際接到哪個 rail；判斷依據是 net/rail 連線，不是 pin 的功能字串（如 `ATX_5VSB`）。
+4. 看不清楚就裁更小範圍再放大（見 R-016 的裁圖與證據保留規則）；放大後仍不確定的 VIN 不要寫進 `routes`。
+5. 結果寫入專案目錄 `<PROJECT>-voltage-vision-evidence.json`：
 
-### 判定原則（重點）
-- 不可先假設最右一路一定是 `V5SB`（其他平台可能是 `V33` 或其他項）。
-- 必須依圖面標籤/net 證據判定每一路是什麼 rail，再決定對應 item。
-- alias 不是在本規則判定；alias 由 BIOS 圖後續回填。
+```json
+{
+  "evidence_images": ["<裁切圖路徑>"],
+  "routes": [
+    {"vin": "VIN0", "package_pin": 100, "net": "SIO_+V5SBIN", "rail": "+V5_DUAL", "r1": "30K", "r2": "10K"}
+  ],
+  "analysis_status": "DONE_VISION_ANALYZE"
+}
+```
+- `r1`/`r2` 照圖面原樣填（含小數與單位，例 `40.2K`），縮放由程式處理。
+- `vin` 為 `VIN0`/`VIN1`/`VIN2`（AUXTIN 即 VIN2）。
 
-### 執行動作（命中時）
-1. 以圖面證據重建三路對應：`rail/net <-> VIN0/VIN1/VIN2`。
-2. 在 query 輸出中，僅對命中的三路候選覆寫：
-   - `Channel`
-   - `R1`
-   - `R2`
-3. `R1/R2` 填值規則：
-   - 由分壓圖讀出的電阻值以「保比例」方式寫入。
-   - 若有小數點，存值為 `實際值 x 10`（例：`56.2K -> 562`）。
-   - 無小數則直接存整數（例：`30K -> 30`、`10K -> 10`）。
-4. 其他欄位（`HW`, `IOPort/Device Address`, `option`, `offset`）維持既有模板。
-5. 記錄標記：`HWM_VOLTAGE_DIVIDER_REMAPPED_BY_SCHEMATIC`。
+### 程式處理（`susi_gen._apply_superio_voltage_divider`，SIO 一律執行）
+1. 由 `rail`/`net` 文字決定電壓 item（`+5VSB`/`+V5_DUAL`→`V5SB`、`+5V`→`V50`、`+12V`→`V120`、`+3.3V`→`V33`、`+3VSB`→`V3SB`；負電壓不處理）。
+2. 該 item 的 `Channel` 改為圖證的 VIN channel（`VIN0=0x80000000`、`VIN1=0x80000001`、`VIN2=0x80000002`），`R1/R2` 填入縮放後整數。
+3. 沒有出現在 `routes` 的 item，R1/R2 一律寫 `0`。
+4. 若其他 item（非圖證 rail）佔用了被圖證認定的 VIN channel（例：DB 中 `V33` 與 `V5SB` 同為 `0x80000000`），該列刪除（`dropped`）。
+5. 路線加 `+SUPERIO_VOLTAGE_DIVIDER_SCHEMATIC`，matrix 的 `voltage_divider` 記錄每條 route 結果、已套用 item、未對上 item、被刪除列。
 
-### 已知案例（AIMB-205）
-- 由 SIO 圖可讀到：
-  - `VIN0 -> SIO_+12VIN`
-  - `VIN1 -> SIO_+5VIN`
-  - `VIN2/AUXTIN -> SIO_+5VSBIN`
-- 因此三路判圖時應依圖面方向重建，不可套用固定左右順序假設。
+### R1/R2 整數縮放（INI 不可有小數點）
+- INI 的 R1/R2 必須是整數，且 R1:R2 比例不可變。
+- 兩個電阻（以 K 為單位）以同一個 10 的次方等比例放大，直到兩者都是整數：`40.2K/10K → 402/100`、`30K/10K → 30/10`、`5.6K/1.2K → 56/12`。
+- 不可只放大有小數的那一個。
 
-### 未命中或證據不足
-- 若缺少分壓圖或 pin/net 對應不足：
-  - 不做自動重映射
-  - 標記 `HWM_VOLTAGE_DIVIDER_EVIDENCE_INSUFFICIENT`
+### 證據不足
+- 沒有證據檔、檔案無 `routes`、或沒有任何可用 route：不改動 R1/R2（維持 DB 值），matrix `voltage_divider_status=HWM_VOLTAGE_DIVIDER_EVIDENCE_INSUFFICIENT`，最終報告要列出此項，不可當成已處理。
 
-## 規則 R-015：AIMB + NCT6126D（SuperIO，非 EC）之 HWM.Voltage 三路去重與 alias 回填
+### 輸出標記
+- `HWM_VOLTAGE_DIVIDER_REMAPPED_BY_SCHEMATIC`、`HWM_VOLTAGE_DIVIDER_EVIDENCE_INSUFFICIENT`
+- 不可輸出：非圖證據驅動的硬刪除、脫離 `VIN0/1/2` 與 net/rail 的主觀猜測。
 
-> **適用範圍：只適用 SIO（`NCT61**D*`）。** EC 與 EIO-300 / `NCT6694B*` 複合晶片的 HWM.Voltage 走 DB 路線，不看分壓圖（orchestrator 9.1）。
-
-### 目的
-- 處理 `HWM.Voltage` 候選中「同一分壓 channel 被多個 item 佔用」的情況，
-  以電路圖 + BIOS 名稱做保留/刪除與 alias 回填。
-
-### 適用前提
-1. `product_name == AIMB`
-2. `chip_name == NCT6126D`（SuperIO，非 EC）
-3. 已有 DB query 結果
-4. 已有電路圖可判讀三路分壓（`VIN0/VIN1/VIN2`）
-5. 已有 BIOS 電壓名稱可回填 alias
-
-### 標準三路與圖面判讀原則
-- NCT6126D 三路分壓預設由 **最右往左** 對應：
-  - `VIN0 = 0x80000000`
-  - `VIN1 = 0x80000001`
-  - `VIN2 = 0x80000002`
-- 判讀以圖上的 `VIN0/VIN1/VIN2` 及 net/rail 連線為準，
-  不以 pin 的功能字串（如 `ATX_5VSB`）直接下結論。
-
-### 執行流程
-1. 先從 query 候選中篩出 `R1/R2 != 0` 的電壓列（分壓候選）。
-2. 檢查三路 channel 唯一性：`0x80000000 / 01 / 02` 應各對應單一候選。
-3. 若同一 channel 出現多列（例：`V33` 與 `V5SB` 同為 `0x80000000`）：
-   - 以電路圖判定該 channel 實際 rail
-   - 以 BIOS 名稱交叉確認
-   - 保留符合圖證據者，刪除不符者
-4. 對保留列回填 BIOS alias 與分壓值（R1/R2 依圖面）。
-
-### 已知特例
-- 標準假設常為：`VIN0(5VSB), VIN1(+5V), VIN2(+12V)`。
-- 但 `VIN0` 可能接到其他 rail（不一定是 5VSB），需由圖面決定。
-- 目前已知例外型號：`AIMB-522`、`AIMB-523`。
-
-### 本規則輸出契約
-- 可輸出：
-  - `HWM_VOLTAGE_CHANNEL_DUPLICATE_DETECTED`
-  - `HWM_VOLTAGE_ALIAS_BACKFILLED_BY_BIOS_AND_SCHEMATIC`
-  - `HWM_VOLTAGE_ITEM_DROPPED_BY_SCHEMATIC`
-  - `AMBIGUOUS_HWM_VOLTAGE_ALIAS`
-- 不可輸出：
-  - 非圖證據驅動的硬刪除
-  - 脫離 `VIN0/1/2` 與 net/rail 的主觀猜測
 
 ## 方向原則（跨案適用）
 

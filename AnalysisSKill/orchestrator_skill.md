@@ -207,7 +207,7 @@ AMD SPD idx（固定路徑）：
 ### 10.3 VGA.Backlight / VGA.Brightness
 1. **Backlight key 大小寫**：INI 必須是 `Backlight1=`、`Backlight2=`；禁止 `BACKLIGHT1=`。DB/JSON 的大寫 item name 不得沿用到 INI key；由 `susi_gen.py` renderer 落實並有回歸測試。
 2. **Channel 數量**：DB rows 為 maximum set。probe 含 `VGA.Brightness Channels` / `VGA.Backlight Channels` 區塊時，只計 primary channel 的 `[OK] ... Status=FOUND`（`_Max`、`_Min`、`_Enable`、`_Level` 不重複計數），保留 DB 前 N rows，超出者從 split INI 與 pre-INI 剔除。兩個 section 分開計數。
-3. 報告沒有對應區塊時維持 DB 全集，不可誤刪。
+3. 報告沒有對應區塊時維持 DB 全集，不可誤刪。`VGA.Brightness` 例外：probe 的 primary channel 為 0 個（全 UNSUPPORTED）時也維持 DB 全集（以 DB query 為準）；≥1 個才裁切。`VGA.Backlight` 維持 0 個即全剔除。
 4. matrix 記錄 probe count、DB row count、trimmed count 與 `PROBE_CHANNEL_FILTER` route。
 
 ### 10.4 GPIO
