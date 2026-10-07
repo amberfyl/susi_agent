@@ -2795,14 +2795,8 @@ def _build_smbus_query_result(
     result["cpu"] = cpu
 
     chip_norm = _norm_chip_name(chip_name)
-    is_sio_route = chip_norm.startswith(("NCT6106D", "NCT6116D", "NCT6126D", "NCT6776D"))
-    # SMBus policy lock:
-    # - SIO route: SMBus remains empty by default.
-    # - EC route + Intel: Channel1 must exist even when spec.features.smbus=false.
-    if is_sio_route:
-        result["status"] = "SECTION_EMPTY"
-        result["reason"] = "SIO route: SMBus is empty by policy"
-        return result
+    # SMBus policy lock: SIO routes follow the normal CPU-family flow
+    # (Intel: fixed Channel1 even when spec.features.smbus=false; AMD: SPD idx).
 
     features = spec.get("features") if isinstance(spec, dict) else None
     feature_details = spec.get("feature_details") if isinstance(spec, dict) else None

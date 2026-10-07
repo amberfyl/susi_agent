@@ -175,8 +175,8 @@
 
 ### 10.1 SMBus
 決策優先序（由上而下）：
-1. **SIO 短路**：`NCT61**D*`、`NCT6776D*` 路線一律 `SECTION_EMPTY`。
-2. **Intel EC Channel1 例外**：Intel EC 路線即使 `features.smbus=false`，仍固定產生 SDRAM `Channel1=0x00000001,0,0,0xA0000000,`；但 `features.smbus=false` 不允許 Channel2+。
+1. **SIO 不短路**：`NCT61**D*`、`NCT6776D*` 走一般 CPU 家族路線（Intel 固定 Channel1、AMD 用 SPD idx），不再一律 `SECTION_EMPTY`；SIO 的 SMBus 晶片通常是 PCH，非 EC-related，只有 Channel1。
+2. **Intel Channel1 例外**：Intel 路線（含 EC、SIO）即使 `features.smbus=false`，仍固定產生 SDRAM `Channel1=0x00000001,0,0,0xA0000000,`；但 `features.smbus=false` 不允許 Channel2+。
 3. **Spec gate**：其餘情況 `features.smbus=false` → `SECTION_EMPTY`；`true` 才往下。
 4. **EC 描述 gate**：`feature_details.smbus.chip` 含 `EC` 才允許 Channel2+ 擴展。
 5. **Source chip rule**：依實際 `smbus_function_source` 判定，不可用 GPIO/HWM 的其他 chip 名稱觸發。`EIO-300 / NCT6694B` 的 SMBus 走 `NCT6694B` DB query/template；template 未完成時標記 pending，不自行填值。此規則優先於 CPU 家族路線。
