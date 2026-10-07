@@ -246,7 +246,7 @@ EC 路線：
 SuperIO 路線（`NCT61xxD` / `NCT6776D`；EIO-300 / `NCT6694B` 複合晶片走 EC 路線，見 9.1）：
 1. **v1 種子**：不以 `report_name` 對位為前置；DB 查到的 `channel_id` 列全部輸出，先上機驗證。
 2. **v2 收斂**：只保留 BIOS 有顯示的電壓 item，並把 BIOS 顯示名稱回填到 `Name`（例：`+12V/+5V/+3.3V/+5VSB`）。
-3. 同一 `channel_id` 仍有多 item 衝突（`CHANNEL_DUPLICATE`）時，交 R-014/R-015 圖證收斂；無證據標 pending。
+3. 同一 `channel_id` 仍有多 item 衝突（`CHANNEL_DUPLICATE`）時，交 R-014 圖證收斂；無證據標 pending。
 4. 兩輪規則見 10.8。
 
 驗證層級（Non-EC Voltage）：

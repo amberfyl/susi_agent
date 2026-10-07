@@ -2353,6 +2353,11 @@ def _filter_vga_rows_by_probe(result: dict, section: str, probe_spec: dict | Non
     except (TypeError, ValueError):
         return result, meta
 
+    # Brightness: DB query is the answer; a probe with zero primary channels
+    # (all UNSUPPORTED) must not empty the section. Trimming still applies when >=1.
+    if kind == "brightness" and supported_count == 0:
+        return result, meta
+
     rows = list(result.get("rows") or [])
     kept = rows[:supported_count]
     filtered = dict(result)
