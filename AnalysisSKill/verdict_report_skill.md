@@ -32,8 +32,9 @@
    I2C 頻率測試由 `-EnableSetTest`、WDT Start/Stop 由 `-EnableStartStopTest` 控制，同樣預設開啟。
    預設不開：`SMBus -EnableFixtureTest`（需治具）、`HWM.Fan -EnableStimulus`（需刺激源）。
    唯讀模式：`run_machineB_full_validation.py --no-write-tests` 不傳任何開關，所有寫入都不做；有 Set API 但沒測到的 section 判 `CONDITIONAL`，summary 的 Scope 行標示 `READ-ONLY`。
-6. 治具、硬體刺激、DQA 相關的待辦，一律寫在 summary 的「Phase 2 recommendations」段落，不降低第一階段判定。
-7. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
+6. summary 的「Not generated / not applicable」段落列出沒有產生、因此沒有驗證的 section 與原因（程式讀 `<PROJECT>-section-matrix.json` 產生，代理照抄）：`REQUEST_NOT_SELECTED`＝request 表單沒有勾選；`BIOS_EVIDENCE_NOT_FOUND`＝BIOS Hardware Monitor 頁面沒有該項；其餘＝DB query / probe 篩選後沒有資料。這些 section 不是 PASS 也不是 FAIL，最終報告要說明是「沒有被要求或不適用」，不可寫成漏做。
+7. 治具、硬體刺激、DQA 相關的待辦，一律寫在 summary 的「Phase 2 recommendations」段落，不降低第一階段判定。
+8. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
 
 ## 4. 結果判讀規則
 1. **report JSON 為準**：section 結論看 report JSON；process exit code 只當診斷證據。

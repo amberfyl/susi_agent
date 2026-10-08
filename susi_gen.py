@@ -2787,7 +2787,8 @@ def _build_i2c_query_result(db_path: Path, product_name: str, chip_name: str,
             "row_count": 0,
             "source": "SPEC_FEATURE_GATE",
             "i2c_feature_enabled": False,
-            "reason": "spec.features.i2c is not true; skip I2C generation",
+            "reason_code": "REQUEST_NOT_SELECTED",
+            "reason": "Request form did not select I2C (spec.features.i2c is not true)",
         }
 
     result = query_section(
@@ -2996,7 +2997,8 @@ def _build_smbus_query_result(
 
     if (not smbus_enabled) and (not cpu.get("is_intel")):
         result["status"] = "SECTION_EMPTY"
-        result["reason"] = "spec.features.smbus=false; skip SMBus generation"
+        result["reason_code"] = "REQUEST_NOT_SELECTED"
+        result["reason"] = "Request form did not select SMBus (spec.features.smbus=false)"
         return result
 
     def _smbus_desc_is_ec_or_soc(desc: str) -> bool:
@@ -5052,6 +5054,8 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 "path": None,
                 "query_key": result.get("query_key"),
                 "route": route,
+                **({"reason_code": result["reason_code"]} if result.get("reason_code") else {}),
+                **({"reason": result["reason"]} if result.get("reason") else {}),
                 **fan_meta,
                 **({
                     "ec_voltage_base": str(ec_voltage_base_path) if ec_voltage_base_path else None,
