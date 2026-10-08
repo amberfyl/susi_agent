@@ -32,7 +32,7 @@
    I2C 頻率測試由 `-EnableSetTest`、WDT Start/Stop 由 `-EnableStartStopTest` 控制，同樣預設開啟。
    預設不開：`SMBus -EnableFixtureTest`（需治具）、`HWM.Fan -EnableStimulus`（需刺激源）。
    唯讀模式：`run_machineB_full_validation.py --no-write-tests` 不傳任何開關，所有寫入都不做；有 Set API 但沒測到的 section 判 `CONDITIONAL`，summary 的 Scope 行標示 `READ-ONLY`。
-6. summary 的「Not selected in the request form」段落列出因為 request 表單沒有勾選而沒產生、因此沒驗證的 section（程式讀 `<PROJECT>-section-matrix.json` 中 `reason_code=REQUEST_NOT_SELECTED` 的項目產生，代理照抄）。這些 section 不是 PASS 也不是 FAIL，最終報告要說明是「使用者沒有要求」，不可寫成漏做。BIOS 沒顯示或 DB/probe 沒資料造成的未產生不列入此段。
+6. summary 的「Not selected in the request form」段落列出因為 request 表單沒有勾選而沒產生、因此沒驗證的 section（程式讀 `<PROJECT>-section-matrix.json` 中 `reason_code=REQUEST_NOT_SELECTED` 的項目產生，代理照抄）。這些 section 不是 PASS 也不是 FAIL，最終報告要說明是「使用者沒有要求」，不可寫成漏做。
 7. 治具、硬體刺激、DQA 相關的待辦，一律寫在 summary 的「Phase 2 recommendations」段落，不降低第一階段判定。
 8. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
 
