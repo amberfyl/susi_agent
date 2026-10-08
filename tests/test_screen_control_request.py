@@ -70,20 +70,6 @@ class ParentCheckboxParsingTests(unittest.TestCase):
 
 
 
-class RequestGateForEmptySectionTests(unittest.TestCase):
-    def test_unticked_storage_and_thermal_are_labelled_request_not_selected(self):
-        spec = {"features": {"storage": False, "thermalprotect": True}}
-        out = susi_gen._request_gate_for_empty_section("StorageArea", spec, {})
-        self.assertEqual(out["reason_code"], "REQUEST_NOT_SELECTED")
-        self.assertEqual(susi_gen._request_gate_for_empty_section("ThermalProtect", spec, {}), {})
-        self.assertEqual(susi_gen._request_gate_for_empty_section("WDT", spec, {}), {})
-
-    def test_existing_reason_code_is_kept(self):
-        spec = {"features": {"storage": False}}
-        self.assertEqual(
-            susi_gen._request_gate_for_empty_section("StorageArea", spec, {"reason_code": "X"}), {})
-
-
 class GpioNameTests(unittest.TestCase):
     def test_gpio_name_is_always_empty(self):
         lines = susi_gen._render_section_lines("GPIO", {

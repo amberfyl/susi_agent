@@ -4621,30 +4621,6 @@ def _apply_fan_control_topology(
     return out, decision
 
 
-_FEATURE_FLAG_BY_SECTION = {"StorageArea": "storage", "ThermalProtect": "thermalprotect"}
-
-
-def _request_gate_for_empty_section(section: str, spec: dict | None, result: dict) -> dict:
-    """Label an empty StorageArea/ThermalProtect as request-not-selected when the form left it unticked.
-
-    Reporting only: generation is still driven by the DB rows, so an EC board whose
-    rows exist keeps its section even if the form box was left blank.
-    """
-    flag = _FEATURE_FLAG_BY_SECTION.get(section)
-    features = spec.get("features") if isinstance(spec, dict) else None
-    if (
-        flag is None
-        or result.get("reason_code")
-        or not isinstance(features, dict)
-        or features.get(flag) is not False
-    ):
-        return {}
-    return {
-        "reason_code": "REQUEST_NOT_SELECTED",
-        "reason": f"Request form did not select {section} (spec.features.{flag} is false)",
-    }
-
-
 def _fill_screen_control_selected(spec: dict | None, in_json_path: Path) -> dict | None:
     """Old specs lack screen_control.selected; read the parent checkbox from the form JSON."""
     if not isinstance(spec, dict):
@@ -5079,7 +5055,6 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 "route": route,
                 **({"reason_code": result["reason_code"]} if result.get("reason_code") else {}),
                 **({"reason": result["reason"]} if result.get("reason") else {}),
-                **_request_gate_for_empty_section(sec, spec, result),
                 **fan_meta,
                 **({
                     "ec_voltage_base": str(ec_voltage_base_path) if ec_voltage_base_path else None,

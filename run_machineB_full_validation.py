@@ -2212,10 +2212,8 @@ def write_validation_summary(
             if note:
                 lines.append(f"{indent}{note}")
     if not_generated:
-        lines.extend(["", "Not selected in the request form (not generated, no validation was run):"])
-        for entry in not_generated:
-            detail = f" - {entry['detail']}" if entry["detail"] else ""
-            lines.append(f"- {entry['section']}{detail}")
+        lines.extend(["", "No INI generated (not required / not supported for this project):"])
+        lines.extend(f"- {name}" for name in not_generated)
     lines.extend(["", f"Rollback: [{rollback.get('status')}]"])
     run_root = contract.outputs.run_root
     if fallback is not None:
@@ -2248,8 +2246,8 @@ def write_validation_summary(
     return summary
 
 
-def _not_generated_sections(matrix_path: Path) -> list[dict[str, str]]:
-    """Sections skipped because the request form did not select them."""
+def _not_generated_sections(matrix_path: Path) -> list[str]:
+    """Sections the generator produced no INI for (not required / not supported by this project)."""
     try:
         matrix = json.loads(Path(matrix_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -2258,13 +2256,9 @@ def _not_generated_sections(matrix_path: Path) -> list[dict[str, str]]:
     if not isinstance(entries, list):
         return []
     return [
-        {
-            "section": str(entry.get("section")),
-            "reason_code": "REQUEST_NOT_SELECTED",
-            "detail": str(entry.get("reason") or "").strip(),
-        }
+        str(entry.get("section"))
         for entry in entries
-        if isinstance(entry, dict) and entry.get("reason_code") == "REQUEST_NOT_SELECTED"
+        if isinstance(entry, dict) and entry.get("status") != "GENERATED"
     ]
 
 
