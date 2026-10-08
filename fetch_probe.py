@@ -24,10 +24,12 @@ from pathlib import Path
 
 
 B_PORT = 8765
-DEFAULT_REMOTE_BAT_FULL = "C:/Users/susiaa/Desktop/suto/V7/run_susi_full_probe.bat"
-DEFAULT_REMOTE_REPORT_FULL = "C:/Users/susiaa/Desktop/suto/V7/susi_full_probe_report.txt"
-DEFAULT_REMOTE_BAT_SPD_IDX = "C:/Users/susiaa/Desktop/suto/V7/run_susi_spd_idx_probe.bat"
-DEFAULT_REMOTE_REPORT_SPD_IDX = "C:/Users/susiaa/Desktop/suto/V7/susi_spd_idx_probe_report.txt"
+DEFAULT_REMOTE_BAT_FULL = "C:/Users/{user}/Desktop/suto/V7/run_susi_full_probe.bat"
+DEFAULT_REMOTE_REPORT_FULL = "C:/Users/{user}/Desktop/suto/V7/susi_full_probe_report.txt"
+DEFAULT_REMOTE_BAT_SPD_IDX = "C:/Users/{user}/Desktop/suto/V7/run_susi_spd_idx_probe.bat"
+DEFAULT_REMOTE_REPORT_SPD_IDX = "C:/Users/{user}/Desktop/suto/V7/susi_spd_idx_probe_report.txt"
+
+DEFAULT_REMOTE_USER = "susiaa"  # {user} in the paths above is filled from --ssh-user / --win-user
 
 # Backward-compatible aliases (full probe defaults)
 DEFAULT_REMOTE_BAT = DEFAULT_REMOTE_BAT_FULL
@@ -293,12 +295,13 @@ def main() -> None:
     filename = _default_filename(args.project, args.output_name, args.probe_kind)
     out_path = out_dir / filename
 
+    remote_user = args.ssh_user or args.win_user or DEFAULT_REMOTE_USER
     if args.probe_kind == "spd_idx":
-        remote_bat = args.remote_bat or DEFAULT_REMOTE_BAT_SPD_IDX
-        remote_report = args.remote_report or DEFAULT_REMOTE_REPORT_SPD_IDX
+        remote_bat = args.remote_bat or DEFAULT_REMOTE_BAT_SPD_IDX.format(user=remote_user)
+        remote_report = args.remote_report or DEFAULT_REMOTE_REPORT_SPD_IDX.format(user=remote_user)
     else:
-        remote_bat = args.remote_bat or DEFAULT_REMOTE_BAT_FULL
-        remote_report = args.remote_report or DEFAULT_REMOTE_REPORT_FULL
+        remote_bat = args.remote_bat or DEFAULT_REMOTE_BAT_FULL.format(user=remote_user)
+        remote_report = args.remote_report or DEFAULT_REMOTE_REPORT_FULL.format(user=remote_user)
 
     last_err: Exception | None = None
 

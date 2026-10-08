@@ -25,3 +25,4 @@ targetB_task/machineB_validation/*aimb289*
 targetB_task/machineB_validation/hwm.fan.control.ps1
 targetB_task/machineB_validation/hwm.fan_verify.ps1
 targetB_task/machineB_validation/hwm_temperature_option_fallback.py
+targetB_task/setup_ssh.bat

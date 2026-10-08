@@ -49,10 +49,12 @@ MANIFEST_SCHEMA_VERSION = "machineb.execution_manifest.v1"
 SUMMARY_SCHEMA_VERSION = "machineb.validation_summary.v1"
 WRITE_POLICY = "phase1_reversible_writes_enabled"
 READ_ONLY_POLICY = "read_only_no_write_tests"
-DEFAULT_REMOTE_VERIFY_ROOT = PureWindowsPath(r"C:\Users\susiaa\Desktop\verify")
+DEFAULT_REMOTE_USER = "susiaa"
+# Machine-B paths below live under the SSH user's profile; {user} is filled from --user.
+DEFAULT_REMOTE_VERIFY_ROOT = PureWindowsPath(r"C:\Users\{user}\Desktop\verify")
 DEFAULT_REMOTE_SUSI_ROOT = PureWindowsPath(r"C:\Windows\SUSI")
 DEFAULT_RELOAD_BAT = PureWindowsPath(
-    r"C:\Users\susiaa\Desktop\reload driver\reload_susi4_driver.bat"
+    r"C:\Users\{user}\Desktop\reload driver\reload_susi4_driver.bat"
 )
 
 EXECUTION_MANIFEST_SCHEMA: dict[str, Any] = {
@@ -592,9 +594,10 @@ def build_post_ini_contract(
     project: str,
     repo_root: str | Path,
     run_id: str,
-    remote_verify_root: str | PureWindowsPath = DEFAULT_REMOTE_VERIFY_ROOT,
+    remote_user: str | None = None,
+    remote_verify_root: str | PureWindowsPath | None = None,
     remote_susi_root: str | PureWindowsPath = DEFAULT_REMOTE_SUSI_ROOT,
-    reload_bat: str | PureWindowsPath = DEFAULT_RELOAD_BAT,
+    reload_bat: str | PureWindowsPath | None = None,
 ) -> PostIniContract:
     """Resolve and validate P1 inputs, outputs, and canonical target paths.
 
@@ -605,6 +608,13 @@ def build_post_ini_contract(
 
     _validate_path_token(project, "project")
     _validate_path_token(run_id, "run_id")
+
+    user = remote_user or DEFAULT_REMOTE_USER
+    _validate_path_token(user, "remote_user")
+    if remote_verify_root is None:
+        remote_verify_root = str(DEFAULT_REMOTE_VERIFY_ROOT).format(user=user)
+    if reload_bat is None:
+        reload_bat = str(DEFAULT_RELOAD_BAT).format(user=user)
 
     root = Path(repo_root).expanduser().resolve()
     case_dir = (root / "CASES" / project).resolve()
@@ -2538,6 +2548,7 @@ def main(argv: list[str] | None = None) -> int:
             project=args.project,
             repo_root=args.repo_root,
             run_id=args.run_id,
+            remote_user=args.user,
         )
         if args.dry_run:
             manifest_path = write_dry_run_manifest(

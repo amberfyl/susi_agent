@@ -77,7 +77,7 @@
     → 再以 run_machineB_full_validation.py --execute 執行 P5-P12
 ```
 1. `--all` 是 `/susiagent` 的旗標，不可原樣轉傳給 `susi_gen.py`。
-2. `--user` 預設 `susiaa`。P12 host 禁止猜測、沿用 context summary 或拿不相關 SSH alias。
+2. `--user` 是變數，取自使用者輸入的 `<user>@<IP>`（沒給才退回 `susiaa`）；Machine B 路徑 `C:\Users\<user>\Desktop\...` 隨它變動。P12 host 禁止猜測、沿用 context summary 或拿不相關 SSH alias。
 3. 使用者說「所有 section 都要」：14 個 section 都要給 status；`SKIPPED_EMPTY_SECTION` 不算失敗，需分別列出 `GENERATED` / `SKIPPED_EMPTY_SECTION` / `PENDING_*`。
 
 ### 5.2 本地 probe 模式
@@ -190,7 +190,7 @@ Intel Channel2+（full board probe）：
 4. 無 OEM EXISTS 或非 EC-related：只保留 Channel1。
 
 AMD SPD idx（固定路徑）：
-1. 以 SSH 觸發 `C:\Users\susiaa\Desktop\suto\V7\run_susi_spd_idx_probe.bat`，完成後以 SCP 拉回 `C:\Users\susiaa\Desktop\suto\V7\susi_spd_idx_probe_report.txt`；不可改成手動搬檔。
+1. 以 SSH 觸發 `C:\Users\<user>\Desktop\suto\V7\run_susi_spd_idx_probe.bat`，完成後以 SCP 拉回 `C:\Users\<user>\Desktop\suto\V7\susi_spd_idx_probe_report.txt`；不可改成手動搬檔。
 2. Channel1 採 SPD 動態 idx。
 3. `features.smbus=true` 且 EC-related：Channel1 idx 在 `0..3` → `Channel2=0x80000004`；idx 為 `4` → 不產生 Channel2。Channel2 的 HWID 取 DB，`io_port=0`、`option=0xA0000000`。
 4. `SMBUS_SUPPORTED` 或 bus `EXISTS` 只能篩候選，不能取代實際 SPD 讀取結果。
