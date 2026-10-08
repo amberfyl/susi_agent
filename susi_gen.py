@@ -22,7 +22,7 @@ from query_config_db import (
     chip_uses_hwm_fan_defaults,
     load_hwm_fan_defaults,
 )
-from understand import understand
+from understand import parse_screen_control_selected, understand
 
 
 SPLIT_SECTIONS = [
@@ -126,6 +126,51 @@ def _bios_has_section_evidence(section: str, bios_cache_path: Path | None) -> bo
     return False
 
 
+def _evaluate_screen_control_request(section: str, spec: dict | None) -> dict[str, object]:
+    """Request-form gate for VGA.Brightness / VGA.Backlight.
+
+    - any sub-item ticked            -> only the ticked sub-items are wanted
+    - none ticked, Screen control on -> both sub-items are wanted
+    - nothing ticked at all          -> neither is wanted (DB is not even queried)
+    - parent state unknown (old spec without the field) -> legacy behaviour, section stays applicable
+    """
+    sc = spec.get("screen_control") if isinstance(spec, dict) else None
+    sc = sc if isinstance(sc, dict) else {}
+    features = spec.get("features") if isinstance(spec, dict) else None
+    features = features if isinstance(features, dict) else {}
+
+    def _child_ticked(key: str) -> bool:
+        node = sc.get(key)
+        return bool(isinstance(node, dict) and node.get("enabled") is True) or features.get(key) is True
+
+    ticked = {k for k in ("brightness", "backlight") if _child_ticked(k)}
+    selected = sc.get("selected") if isinstance(sc.get("selected"), bool) else None
+    key = "brightness" if section == "VGA.Brightness" else "backlight"
+
+    if ticked:
+        wanted = key in ticked
+        inconsistent = selected is False
+    elif selected is True:
+        wanted, inconsistent = True, False
+    elif selected is False:
+        wanted, inconsistent = False, False
+    else:
+        return {"applicable": True, "reason_code": "SCREEN_CONTROL_STATE_UNKNOWN"}
+
+    if wanted:
+        out: dict[str, object] = {"applicable": True, "reason_code": "REQUEST_SELECTED"}
+    else:
+        out = {
+            "applicable": False,
+            "reason_code": "REQUEST_NOT_SELECTED",
+            "reason": f"Request form did not select {section} (Screen control / "
+                      f"{'Brightness' if key == 'brightness' else 'Backlight'} not ticked)",
+        }
+    if inconsistent:
+        out["warning"] = "SCREEN_CONTROL_FORM_INCONSISTENT"
+    return out
+
+
 def evaluate_section_applicability(
     section: str,
     spec: dict | None,
@@ -140,6 +185,8 @@ def evaluate_section_applicability(
         "HWM.Fan.Control",
         "HWM.CaseOpen",
     }
+    if section in ("VGA.Brightness", "VGA.Backlight"):
+        return _evaluate_screen_control_request(section, spec)
     if section not in bios_gated_sections:
         return {"applicable": True, "reason_code": "SECTION_NOT_BIOS_GATED"}
     if _bios_has_section_evidence(section, bios_cache_path):
@@ -2351,11 +2398,6 @@ def _filter_vga_rows_by_probe(result: dict, section: str, probe_spec: dict | Non
     try:
         supported_count = max(0, int(channel_spec.get("count", 0)))
     except (TypeError, ValueError):
-        return result, meta
-
-    # Brightness: DB query is the answer; a probe with zero primary channels
-    # (all UNSUPPORTED) must not empty the section. Trimming still applies when >=1.
-    if kind == "brightness" and supported_count == 0:
         return result, meta
 
     rows = list(result.get("rows") or [])
@@ -4578,11 +4620,31 @@ def _apply_fan_control_topology(
     return out, decision
 
 
+def _fill_screen_control_selected(spec: dict | None, in_json_path: Path) -> dict | None:
+    """Old specs lack screen_control.selected; read the parent checkbox from the form JSON."""
+    if not isinstance(spec, dict):
+        return spec
+    sc = spec.get("screen_control")
+    if isinstance(sc, dict) and isinstance(sc.get("selected"), bool):
+        return spec
+    try:
+        form = json.loads(Path(in_json_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return spec
+    selected = parse_screen_control_selected(form)
+    if selected is None:
+        return spec
+    spec = dict(spec)
+    spec["screen_control"] = {**(sc if isinstance(sc, dict) else {}), "selected": selected}
+    return spec
+
+
 def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path,
                             db_path: Path, product_name: str, chip_name: str,
                             probe_spec: dict | None, probe_path: Path | None,
                             sections: list[str]) -> tuple[list[Path], Path, Path, Path, Path | None, Path | None]:
     spec = _load_spec_json(in_json_path)
+    spec = _fill_screen_control_selected(spec, in_json_path)
 
     proj_dir = out_ini_path.parent
     name = out_ini_path.stem.replace("-pre", "")
@@ -4672,11 +4734,16 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
                 "row_count": 0,
                 "path": None,
                 "query_key": None,
-                "route": f"{route}+BIOS_HWM_APPLICABILITY",
+                "route": f"{route}+{'REQUEST_GATE' if applicability.get('reason_code') == 'REQUEST_NOT_SELECTED' else 'BIOS_HWM_APPLICABILITY'}",
                 "reason_code": applicability.get("reason_code"),
-                "reason": "HWM section absent from completed BIOS Hardware Monitor evidence",
+                "reason": applicability.get("reason")
+                or "HWM section absent from completed BIOS Hardware Monitor evidence",
+                **({"warning": applicability["warning"]} if applicability.get("warning") else {}),
             })
             continue
+
+        if applicability.get("warning"):
+            fan_meta["screen_control_warning"] = applicability["warning"]
 
         if sec == "SMBus":
             result = _build_smbus_query_result(
@@ -4830,7 +4897,9 @@ def _run_config_db_generate(project: str, in_json_path: Path, out_ini_path: Path
             )
 
         if sec in {"VGA.Brightness", "VGA.Backlight"}:
-            result, vga_filter = _filter_vga_rows_by_probe(result, sec, probe_spec)
+            # Probe channel counts are only meaningful on EC routes; SIO keeps the DB answer.
+            result, vga_filter = _filter_vga_rows_by_probe(
+                result, sec, probe_spec if is_ec is True else None)
             if vga_filter.get("filter_applied"):
                 route = f"{route}+PROBE_CHANNEL_FILTER"
             fan_meta.update({

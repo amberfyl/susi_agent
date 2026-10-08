@@ -74,15 +74,6 @@ class VgaProbeChannelFilterTests(unittest.TestCase):
         self.assertEqual(filtered["row_count"], 3)
         self.assertFalse(meta["filter_applied"])
 
-    def test_brightness_with_zero_supported_channels_keeps_db_rows(self):
-        filtered, meta = susi_gen._filter_vga_rows_by_probe(
-            self.result,
-            "VGA.Brightness",
-            {"vga": {"brightness": {"present": True, "count": 0, "channel_ids": []}}},
-        )
-        self.assertEqual(filtered["row_count"], 3)
-        self.assertFalse(meta["filter_applied"])
-
     def test_present_probe_section_with_no_supported_channel_drops_all_rows(self):
         filtered, meta = susi_gen._filter_vga_rows_by_probe(
             self.result,

@@ -287,6 +287,7 @@ CaseOpen: {CASEOPEN_KEYS}
     "smbus": {{"status": true, "chip": "<EC/model/description text if present>"}}
   }},
   "screen_control": {{
+    "selected": true,
     "brightness": {{
       "enabled": true,
       "items": [{{"socket": "LVDS1", "chip": "PTN3460", "remark": ""}}]
@@ -713,6 +714,37 @@ def resolve_paths(project: str | None, in_json: str | None, spec_out: str | None
 # Main
 # ---------------------------------------------------------------------------
 
+_CHECKED_GLYPHS = "■☑☒✔✓"
+_UNCHECKED_GLYPHS = "□☐"
+
+
+def parse_screen_control_selected(form_data: dict) -> bool | None:
+    """Read the top-level "Screen control" checkbox straight from the form text.
+
+    Returns True/False for a checked/unchecked box, None when the form has no such line.
+    Deterministic on purpose: the LLM spec only carries the sub-item checks.
+    """
+    pages = form_data.get("pages") if isinstance(form_data, dict) else None
+    if not isinstance(pages, list):
+        return None
+    text = "\n".join(str(p.get("text") or "") for p in pages if isinstance(p, dict))
+    m = re.search(rf"([{_CHECKED_GLYPHS}{_UNCHECKED_GLYPHS}])\s*Screen\s*control", text, re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1) in _CHECKED_GLYPHS
+
+
+def ensure_screen_control_selected(spec: dict, form_data: dict) -> None:
+    selected = parse_screen_control_selected(form_data)
+    if selected is None:
+        return
+    sc = spec.get("screen_control")
+    if not isinstance(sc, dict):
+        sc = {}
+        spec["screen_control"] = sc
+    sc["selected"] = selected
+
+
 def understand(project: str | None, in_json: str | None, spec_out: str | None,
                screenshots: list[Path], root: Path) -> Path:
     json_path, out_path = resolve_paths(project, in_json, spec_out, root)
@@ -752,6 +784,9 @@ def understand(project: str | None, in_json: str | None, spec_out: str | None,
     # Preserve richer non-boolean feature metadata (e.g., smbus chip/description)
     # from extract analysis while keeping features booleans backward-compatible.
     ensure_feature_details(spec, form_data)
+
+    # Top-level Screen control checkbox (parent of Brightness/Backlight).
+    ensure_screen_control_selected(spec, form_data)
 
     warnings = validate_spec(spec)
     for w in warnings:

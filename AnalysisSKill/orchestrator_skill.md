@@ -206,9 +206,15 @@ AMD SPD idx（固定路徑）：
 
 ### 10.3 VGA.Backlight / VGA.Brightness
 1. **Backlight key 大小寫**：INI 必須是 `Backlight1=`、`Backlight2=`；禁止 `BACKLIGHT1=`。DB/JSON 的大寫 item name 不得沿用到 INI key；由 `susi_gen.py` renderer 落實並有回歸測試。
-2. **Channel 數量**：DB rows 為 maximum set。probe 含 `VGA.Brightness Channels` / `VGA.Backlight Channels` 區塊時，只計 primary channel 的 `[OK] ... Status=FOUND`（`_Max`、`_Min`、`_Enable`、`_Level` 不重複計數），保留 DB 前 N rows，超出者從 split INI 與 pre-INI 剔除。兩個 section 分開計數。
-3. 報告沒有對應區塊時維持 DB 全集，不可誤刪。`VGA.Brightness` 例外：probe 的 primary channel 為 0 個（全 UNSUPPORTED）時也維持 DB 全集（以 DB query 為準）；≥1 個才裁切。`VGA.Backlight` 維持 0 個即全剔除。
-4. matrix 記錄 probe count、DB row count、trimmed count 與 `PROBE_CHANNEL_FILTER` route。
+2. **Request 勾選 gate（先於 DB query）**：大項 `Screen control` 的勾選由程式從 PDF 文字讀出，寫入 `spec.screen_control.selected`（舊 spec 沒有此欄位時，generate 階段從表單 JSON 補讀）。小項（Brightness / Backlight）的勾選看 `screen_control.<item>.enabled` 或 `features.<item>`。
+   - 有小項被勾 → 只有被勾的小項為 true（大項沒勾也算，matrix 加 `warning=SCREEN_CONTROL_FORM_INCONSISTENT`）。
+   - 小項都沒勾、大項有勾 → 兩個小項都為 true。
+   - 大項、小項都沒勾 → 兩個都為 false，不查 DB；matrix 記 `SKIPPED_NOT_APPLICABLE`、`reason_code=REQUEST_NOT_SELECTED`。
+   - 大項狀態未知（表單沒有該行）→ 沿用舊行為（不擋）。
+   - 為 true 的小項才查 DB。
+3. **Channel 數量（僅 EC 路線）**：DB rows 為 maximum set。probe 含 `VGA.Brightness Channels` / `VGA.Backlight Channels` 區塊時，只計 primary channel 的 `[OK] ... Status=FOUND`（`_Max`、`_Min`、`_Enable`、`_Level` 不重複計數），保留 DB 前 N rows，超出者從 split INI 與 pre-INI 剔除（0 個即全剔除）。兩個 section 分開計數。**SIO（`NCT61**D*`）的 probe 對 VGA 沒有意義，不做刪減，以 DB query 為準。**
+4. 報告沒有對應區塊時維持 DB 全集，不可誤刪。
+5. matrix 記錄 probe count、DB row count、trimmed count 與 `PROBE_CHANNEL_FILTER` route。
 
 ### 10.4 GPIO
 1. **EC 路線**（`EIO-201*`、`EIO-211*`、`IT-8528*`、`IT-5782*`）：
