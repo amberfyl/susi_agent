@@ -13,17 +13,17 @@ When WSL cannot reach target-B (ping/ssh fail) but Windows host can, execute SSH
 
 ### 1) Remote identity sanity check
 ```bash
-powershell.exe -NoProfile -Command "ssh -i C:\Users\<win_user>\.ssh\id_ed25519_susi -o IdentitiesOnly=yes susiaa@<host> 'whoami && hostname'"
+powershell.exe -NoProfile -Command "ssh -i C:\Users\<win_user>\.ssh\id_ed25519_susi -o IdentitiesOnly=yes <user>@<host> 'whoami && hostname'"
 ```
 
 ### 2) Run probe BAT and wait until complete
 ```bash
-powershell.exe -NoProfile -Command "ssh -i C:\Users\<win_user>\.ssh\id_ed25519_susi -o IdentitiesOnly=yes susiaa@<host> \"cmd /c C:\\Users\\susiaa\\Desktop\\suto\\V7\\run_susi_full_probe.bat\""
+powershell.exe -NoProfile -Command "ssh -i C:\Users\<win_user>\.ssh\id_ed25519_susi -o IdentitiesOnly=yes <user>@<host> \"cmd /c C:\\Users\\<user>\\Desktop\\suto\\V7\\run_susi_full_probe.bat\""
 ```
 
 ### 3) Pull report back to Windows local path
 ```bash
-powershell.exe -NoProfile -Command "scp -i C:\Users\<win_user>\.ssh\id_ed25519_susi -o IdentitiesOnly=yes susiaa@<host>:/C:/Users/susiaa/Desktop/suto/V7/susi_full_probe_report.txt C:\Users\<win_user>\Desktop\susi_full_probe_report.txt"
+powershell.exe -NoProfile -Command "scp -i C:\Users\<win_user>\.ssh\id_ed25519_susi -o IdentitiesOnly=yes <user>@<host>:/C:/Users/<user>/Desktop/suto/V7/susi_full_probe_report.txt C:\Users\<win_user>\Desktop\susi_full_probe_report.txt"
 ```
 
 ## Path/quoting notes

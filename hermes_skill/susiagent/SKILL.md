@@ -17,7 +17,7 @@ Repository root: `/home/company2/AIagent_susi` (below: `<REPO>`). Project direct
 1. `<REPO>/AnalysisSKill/orchestrator_skill.md` — cross-stage policy, section rules, status meanings.
 2. Before reading BIOS images: `<REPO>/AnalysisSKill/bios_circuit_image_analysis_rule.md` R-020.
 3. Before tracing GPIO in schematics: `<REPO>/AnalysisSKill/bios_circuit_image_analysis_rule.md` R-016 and R-017.
-4. Before fan IN/OUT pairing or voltage-divider analysis: `<REPO>/AnalysisSKill/bios_circuit_image_analysis_rule.md` (R-013, R-015, R-019) and `<REPO>/AnalysisSKill/fan_pairing_contract.md`.
+4. Before fan IN/OUT pairing or voltage-divider analysis: `<REPO>/AnalysisSKill/bios_circuit_image_analysis_rule.md` (R-013, R-014, R-019) and `<REPO>/AnalysisSKill/fan_pairing_contract.md`. R-014 defines the `<PROJECT>-voltage-vision-evidence.json` schema you must write for every SIO board.
 5. Before interpreting Machine-B reports: `<REPO>/AnalysisSKill/verdict_report_skill.md`.
 
 Always read the current files; never rely on remembered summaries. When sources disagree, the order is: the user's latest explicit decision > Python code and tests > `AnalysisSKill/*.md` > runbooks. `prompts/*.md` are the generator's fallback copies of the image-reading rules; you do not read them.
@@ -31,8 +31,8 @@ Always read the current files; never rely on remembered summaries. When sources 
 | `/susiagent <PROJECT> --all --host <HOST> [--user <USER>]` | 3.1–3.9 | Yes |
 
 - `--limit` may be added to `--validate` or `--all`: the validation is read-only (see 3.9).
-- `--user` defaults to `susiaa`. The host must be given in the current invocation; never infer it from context or an unrelated SSH alias.
-- Target syntax: `susiaa@<IP>` in the command means `--user susiaa --host <IP>`. The user usually gives two IPs for the same Machine-B:
+- `--user` is a variable: take it from the `<user>@<IP>` the user typed; `susiaa` is only the fallback when no user is given. Machine-B paths (`C:/Users/<user>/Desktop/...`) follow the same user. The host must be given in the current invocation; never infer it from context or an unrelated SSH alias.
+- Target syntax: `<user>@<IP>` in the command means `--user <user> --host <IP>` (any username, e.g. `test@<IP>` → `--user test`). The user usually gives two IPs for the same Machine-B:
   - **SSH IP** (office LAN, DHCP, e.g. `172.22.12.*` / `172.22.13.*`): the primary path.
   - **Direct-link static IP** (`192.168.100.10–50`, this host is `192.168.100.1`): the fallback.
   Both change when the test disk moves to another platform, so use only the IPs given in the current invocation.
@@ -52,10 +52,10 @@ Always use `<REPO>/.venv/bin/python`. Pass absolute, project-local paths for eve
 
 ### 3.2 Fetch the probe report (skip in local-probe mode, see 5.1)
 ```
-<REPO>/.venv/bin/python <REPO>/fetch_probe.py --mode auto --ssh-user susiaa --project <PROJECT> \
+<REPO>/.venv/bin/python <REPO>/fetch_probe.py --mode auto --ssh-user <user> --project <PROJECT> \
   --host <SSH_IP> [--hosts <DIRECT_LINK_IP>] \
-  --remote-bat "C:/Users/susiaa/Desktop/suto/V7/run_susi_full_probe.bat" \
-  --remote-report "C:/Users/susiaa/Desktop/suto/V7/susi_full_probe_report.txt" \
+  --remote-bat "C:/Users/<user>/Desktop/suto/V7/run_susi_full_probe.bat" \
+  --remote-report "C:/Users/<user>/Desktop/suto/V7/susi_full_probe_report.txt" \
   --dir <REPO>/CASES/<PROJECT> --output-name <PROJECT>_susi_board_probe_report.txt
 ```
 - `auto` order: SSH on `<SSH_IP>`, then SSH on `<DIRECT_LINK_IP>`, then WinRM on `<DIRECT_LINK_IP>`. WinRM is never tried on an IP outside `192.168.100.10–50` and never guessed from a default pool. Use `--mode winrm --host <DIRECT_LINK_IP>` only when the user explicitly asks for WinRM. Add `--probe-kind spd_idx` (output `<PROJECT>_susi_spd_idx_probe_report.txt`) for AMD platforms.
@@ -191,10 +191,10 @@ Files in `~/.hermes/skills/software-development/susiagent/references/`. Use them
 
 ## 7. Fixed defaults
 - Python: `<REPO>/.venv/bin/python` (never system `python3`).
-- Machine-B IPs: none are fixed. The same test disk moves between platforms and each NIC gets a different IP, so `fetch_probe.py` requires `--host`; always use the IPs from the current invocation. SSH user `susiaa`.
+- Machine-B IPs: none are fixed. The same test disk moves between platforms and each NIC gets a different IP, so `fetch_probe.py` requires `--host`; always use the IPs from the current invocation. SSH user is the `<user>` from the invocation (fallback `susiaa`).
 - WinRM: fallback only, on user-named static IPs in `192.168.100.10–50`; this host is `192.168.100.1`. SSH is also open on the direct-link IP.
-- Remote full probe: `C:/Users/susiaa/Desktop/suto/V7/run_susi_full_probe.bat` → `susi_full_probe_report.txt`.
-- Remote AMD SPD probe: `C:/Users/susiaa/Desktop/suto/V7/run_susi_spd_idx_probe.bat` → `susi_spd_idx_probe_report.txt`.
+- Remote full probe: `C:/Users/<user>/Desktop/suto/V7/run_susi_full_probe.bat` → `susi_full_probe_report.txt`.
+- Remote AMD SPD probe: `C:/Users/<user>/Desktop/suto/V7/run_susi_spd_idx_probe.bat` → `susi_spd_idx_probe_report.txt`.
 - LLM calls made by the program (PDF extract, request-form understanding, vision fallback) all go through `agent_llm.py`, which runs the agent CLI from env `SUSI_AGENT_CMD` (legacy `SUSI_VISION_CMD`; default `hermes -z {prompt} -t vision`; `{prompt}` = prompt text, `{image}` = first image path). Provider, model and credentials are whatever Hermes is currently configured with; the program never sets them, and `LLM_*` env vars are not read.
 - User communication: concise Traditional Chinese, result first. Target-machine console/report text stays English ASCII.
 

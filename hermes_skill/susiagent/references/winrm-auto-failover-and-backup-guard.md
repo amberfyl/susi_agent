@@ -25,10 +25,10 @@ Use when updating `/susiagent` fetch flow or `fetch_probe.py` for mixed-target e
 ## Suggested command templates
 
 Full probe:
-`/home/company2/AIagent_susi/.venv/bin/python /home/company2/AIagent_susi/fetch_probe.py --mode auto --hosts <HOST1>,<HOST2> --host <HOST3> --project <PROJECT> --ssh-user susiaa --dir /home/company2/AIagent_susi/CASES/<PROJECT> --output-name <PROJECT>_susi_board_probe_report.txt`
+`/home/company2/AIagent_susi/.venv/bin/python /home/company2/AIagent_susi/fetch_probe.py --mode auto --hosts <HOST1>,<HOST2> --host <HOST3> --project <PROJECT> --ssh-user <user> --dir /home/company2/AIagent_susi/CASES/<PROJECT> --output-name <PROJECT>_susi_board_probe_report.txt`
 
 SPD idx probe:
-`/home/company2/AIagent_susi/.venv/bin/python /home/company2/AIagent_susi/fetch_probe.py --mode auto --probe-kind spd_idx --hosts <HOST1>,<HOST2> --host <HOST3> --project <PROJECT> --ssh-user susiaa --dir /home/company2/AIagent_susi/CASES/<PROJECT> --output-name <PROJECT>_susi_spd_idx_probe_report.txt`
+`/home/company2/AIagent_susi/.venv/bin/python /home/company2/AIagent_susi/fetch_probe.py --mode auto --probe-kind spd_idx --hosts <HOST1>,<HOST2> --host <HOST3> --project <PROJECT> --ssh-user <user> --dir /home/company2/AIagent_susi/CASES/<PROJECT> --output-name <PROJECT>_susi_spd_idx_probe_report.txt`
 
 Optional explicit WinRM credential:
 `--win-user <WIN_USER> --win-pass <WIN_PASS>`
