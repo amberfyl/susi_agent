@@ -69,5 +69,32 @@ class ParentCheckboxParsingTests(unittest.TestCase):
         self.assertIsNone(parse_screen_control_selected(self._form("no such item")))
 
 
+
+class RequestGateForEmptySectionTests(unittest.TestCase):
+    def test_unticked_storage_and_thermal_are_labelled_request_not_selected(self):
+        spec = {"features": {"storage": False, "thermalprotect": True}}
+        out = susi_gen._request_gate_for_empty_section("StorageArea", spec, {})
+        self.assertEqual(out["reason_code"], "REQUEST_NOT_SELECTED")
+        self.assertEqual(susi_gen._request_gate_for_empty_section("ThermalProtect", spec, {}), {})
+        self.assertEqual(susi_gen._request_gate_for_empty_section("WDT", spec, {}), {})
+
+    def test_existing_reason_code_is_kept(self):
+        spec = {"features": {"storage": False}}
+        self.assertEqual(
+            susi_gen._request_gate_for_empty_section("StorageArea", spec, {"reason_code": "X"}), {})
+
+
+class GpioNameTests(unittest.TestCase):
+    def test_gpio_name_is_always_empty(self):
+        lines = susi_gen._render_section_lines("GPIO", {
+            "status": "FOUND",
+            "prod_chip": {"hardware_id": "0x1"},
+            "rows": [{"item_name": "GPIO00", "channel": "0", "io_port": "0x2E",
+                      "option": "0xA0000003", "group": 5, "bit": 0, "disp_name": "SIO_GPIO0"}],
+        })
+        gpio = [l for l in lines if l.startswith("GPIO00=")][0]
+        self.assertTrue(gpio.endswith(",5,0,"), gpio)
+
+
 if __name__ == "__main__":
     unittest.main()

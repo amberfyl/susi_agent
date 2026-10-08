@@ -220,7 +220,7 @@ AMD SPD idx（固定路徑）：
 1. **EC 路線**（`EIO-201*`、`EIO-211*`、`IT-8528*`、`IT-5782*`）：
    - target board auto report 決定實際數量（8 個輸出 `GPIO00`~`GPIO07`，4 個輸出 `GPIO00`~`GPIO03`）。
    - `hwid` 取 `ProductChip.hardware_id`；`[IOBase]`、`[IOPort/Device Address]`、`[Option]`、`[Group]`、`[Bit]` 取同 `hardware_id` 的 `GPIO` row 之 `base_addr`、`io_port`、`options`、`group`、`pin`。
-   - `spec.json.gpio.pins[].name` 有值才填 `[Name]`，未填留空，不自動命名。
+   - `[Name]` 一律留空，由程式寫死空字串；不採用 `spec.json.gpio.pins[].name`、訊號名（如 `SIO_GPIO4`）或晶片功能名。
 2. **電路圖路線**（SIO `NCT61**D*`，以及 EIO-300 / `NCT6694B*` 複合晶片的 GPIO）：GPIO 無法由 DB query 得到，`[Group],[Bit]` 只能由電路圖判定（diagram skill R-016/R-017），不套用 EC 的 auto report/template。
 3. **INI key 規則（所有路線）**：`GPIO00=`、`GPIO01=`、`GPIO02=`…依序編號。電路圖路線由程式依訊號順序編（`EC_P1_GPIO0～7` → `GPIO00～07`、`EC_P2_GPIO0～7` → `GPIO08～15`；`SIO_GPIOn` 依 n），不採用代理填的 `report_name` 或晶片功能名（例：`GPIOD0` 不可變成 `GPIO130`）。group/bit 取圖上的功能名。
 4. **上機驗證後 GetCaps 回 SUCCESS、但能力遮罩只缺部分 bit**：route 正確，缺的那幾支可能是 group/pin 追錯；在報告中指出這些腳位交人工確認，不自動重新追線，也不可裁切或改 route（見 verdict_report_skill.md 第 4 節第 6 點）。GetCaps 在每個 bank 都回錯誤碼時不適用本點，屬 route fallback trigger（11.5）。
