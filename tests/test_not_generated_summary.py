@@ -20,10 +20,8 @@ class NotGeneratedSummaryTests(unittest.TestCase):
             path = Path(td) / "m.json"
             path.write_text(json.dumps(matrix), encoding="utf-8")
             out = _not_generated_sections(path)
-            self.assertEqual([e["section"] for e in out], ["VGA.Brightness", "HWM.CaseOpen", "StorageArea"])
-            self.assertEqual(out[0]["label"], "not selected in the request form")
-            self.assertEqual(out[1]["label"], "not shown on the BIOS Hardware Monitor page")
-            self.assertEqual(out[2]["label"], "no rows after DB query / probe filter")
+            self.assertEqual([e["section"] for e in out], ["VGA.Brightness"])
+            self.assertEqual(out[0]["reason_code"], "REQUEST_NOT_SELECTED")
             self.assertEqual(_not_generated_sections(Path(td) / "missing.json"), [])
 
 

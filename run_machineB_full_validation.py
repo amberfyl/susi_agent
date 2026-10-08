@@ -2212,10 +2212,10 @@ def write_validation_summary(
             if note:
                 lines.append(f"{indent}{note}")
     if not_generated:
-        lines.extend(["", "Not generated / not applicable (no validation was run for these):"])
+        lines.extend(["", "Not selected in the request form (not generated, no validation was run):"])
         for entry in not_generated:
             detail = f" - {entry['detail']}" if entry["detail"] else ""
-            lines.append(f"- {entry['section']}: {entry['label']} [{entry['reason_code']}]{detail}")
+            lines.append(f"- {entry['section']}{detail}")
     lines.extend(["", f"Rollback: [{rollback.get('status')}]"])
     run_root = contract.outputs.run_root
     if fallback is not None:
@@ -2248,14 +2248,8 @@ def write_validation_summary(
     return summary
 
 
-_NOT_GENERATED_LABELS = {
-    "REQUEST_NOT_SELECTED": "not selected in the request form",
-    "BIOS_EVIDENCE_NOT_FOUND": "not shown on the BIOS Hardware Monitor page",
-}
-
-
 def _not_generated_sections(matrix_path: Path) -> list[dict[str, str]]:
-    """Sections the generator did not produce, with the reason (request / BIOS / DB-probe)."""
+    """Sections skipped because the request form did not select them."""
     try:
         matrix = json.loads(Path(matrix_path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -2263,24 +2257,15 @@ def _not_generated_sections(matrix_path: Path) -> list[dict[str, str]]:
     entries = matrix.get("sections") if isinstance(matrix, dict) else None
     if not isinstance(entries, list):
         return []
-    out: list[dict[str, str]] = []
-    for entry in entries:
-        if not isinstance(entry, dict) or entry.get("status") == "GENERATED":
-            continue
-        code = str(entry.get("reason_code") or "")
-        if code in _NOT_GENERATED_LABELS:
-            label = _NOT_GENERATED_LABELS[code]
-        elif entry.get("status") == "SKIPPED_EMPTY_SECTION":
-            label = "no rows after DB query / probe filter"
-        else:
-            label = f"not generated ({entry.get('status')})"
-        out.append({
+    return [
+        {
             "section": str(entry.get("section")),
-            "reason_code": code or str(entry.get("status")),
-            "label": label,
+            "reason_code": "REQUEST_NOT_SELECTED",
             "detail": str(entry.get("reason") or "").strip(),
-        })
-    return out
+        }
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("reason_code") == "REQUEST_NOT_SELECTED"
+    ]
 
 
 _VERDICT_ORDER = {"FAIL": 0, "ERROR": 1, "CONDITIONAL": 2, "PASS": 3}
