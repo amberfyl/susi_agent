@@ -180,13 +180,14 @@ try {
         } else {
             $functionalAttempted = $true
             $functionalFailures = @()
+            $bankFailedMask = [ordered]@{}
             foreach ($bankName in @($states.Keys)) {
                 $state = $states[$bankName]
                 $bankId = [UInt32]$state.bank_id
                 $mask = [UInt32]$state.expected_mask
                 $setDirectionStatus = [NativeSusi]::SusiGPIOSetDirection($bankId, $mask, [UInt32]0)
                 Add-ApiCall -report $report -name ("GPIO set output:{0}" -f $bankName) -status $setDirectionStatus -value '0x00000000'
-                if ($setDirectionStatus -ne 0) { $functionalFailures += $bankName; continue }
+                if ($setDirectionStatus -ne 0) { $functionalFailures += $bankName; $bankFailedMask[$bankName] = [UInt32]$mask; continue }
 
                 foreach ($pattern in @([UInt32]0, $mask)) {
                     $setStatus = [NativeSusi]::SusiGPIOSetLevel($bankId, $mask, $pattern)
@@ -203,7 +204,12 @@ try {
                         read_status = Get-StatusName $readStatus
                         match = $match
                     }
-                    if (-not $match) { $functionalFailures += $bankName }
+                    if (-not $match) {
+                        $functionalFailures += $bankName
+                        if (-not $bankFailedMask.Contains($bankName)) { $bankFailedMask[$bankName] = [UInt32]0 }
+                        if ($setStatus -ne 0 -or $readStatus -ne 0) { $bankFailedMask[$bankName] = $bankFailedMask[$bankName] -bor $mask }
+                        else { $bankFailedMask[$bankName] = $bankFailedMask[$bankName] -bor (($readLevel -bxor $pattern) -band $mask) }
+                    }
                 }
             }
 
@@ -215,7 +221,26 @@ try {
             $report.validation_layers.L6_recovery = if ($restoreFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
             if ($functionalFailures.Count -gt 0 -or $restoreFailures.Count -gt 0) {
                 $report.result = 'FAIL_FUNCTIONAL'
-                $report.reason = 'GPIO set/readback or restore failed.'
+                $failedPins = @()
+                $channelMeta = Get-ConfigValue -Config $config -Name 'channels' -Default ([ordered]@{})
+                foreach ($chName in @($channelMeta.Keys)) {
+                    $cm = $channelMeta[$chName]
+                    $cmBankId = Convert-ToUInt32Safe ([string](Get-ConfigValue -Config $cm -Name 'bank_id' '0'))
+                    $cmBit = Convert-ToUInt32Safe ([string](Get-ConfigValue -Config $cm -Name 'bank_bitmask' '0'))
+                    foreach ($bn in @($bankFailedMask.Keys)) {
+                        if ([UInt32]$states[$bn].bank_id -eq $cmBankId -and (($bankFailedMask[$bn] -band $cmBit) -ne 0)) {
+                            $failedPins += ("{0} (group {1}, bit {2})" -f $chName, (Get-ConfigValue -Config $cm -Name 'tuple_group' '?'), (Get-ConfigValue -Config $cm -Name 'tuple_pin' '?'))
+                        }
+                    }
+                }
+                $report.metrics.functional_failed_pins = @($failedPins)
+                if ($failedPins.Count -gt 0) {
+                    $report.reason = ('GPIO set/readback failed on {0} of {1} pins: {2}. The other pins read back correctly.' -f $failedPins.Count, @($config.required_channels).Count, ($failedPins -join ', '))
+                    if ($restoreFailures.Count -gt 0) { $report.reason += ' Restore also failed on bank(s): ' + ($restoreFailures -join ', ') + '.' }
+                } else {
+                    $report.reason = 'GPIO set/readback or restore failed.'
+                    if ($restoreFailures.Count -gt 0) { $report.reason += ' Restore failed on bank(s): ' + ($restoreFailures -join ', ') + '.' }
+                }
             } else {
                 $report.reason = 'GPIO low/high readback and restore passed.'
             }

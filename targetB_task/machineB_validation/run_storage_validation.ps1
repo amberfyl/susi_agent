@@ -155,7 +155,26 @@ try {
         $report.metrics.write_test = [ordered]@{ attempted=$true; result=if ($writeFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }; samples=$writeResults; failed_channels=@($writeFailures | Select-Object -Unique) }
         $report.validation_layers.L5_functional = if ($writeFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
         $report.validation_layers.L6_recovery = if ($writeFailures.Count -eq 0) { 'PASS' } else { 'FAIL' }
-        if ($writeFailures.Count -gt 0) { $report.result = 'FAIL_FUNCTIONAL'; $report.reason = 'StorageArea write/verify/restore failed.' }
+        if ($writeFailures.Count -gt 0) {
+            $report.result = 'FAIL_FUNCTIONAL'
+            $details = @()
+            foreach ($w in @($writeResults | Where-Object { @($writeFailures) -contains $_.channel })) {
+                $lockValue = $report.metrics.channels[[string]$w.channel].caps.lock_status.value
+                $lockText = if ($lockValue -eq 1) { 'LOCKED' } elseif ($lockValue -eq 0) { 'UNLOCKED' } else { "unknown($lockValue)" }
+                if ($w.write_status -ne 'SUSI_STATUS_SUCCESS') {
+                    $text = "write rejected ($($w.write_status))"
+                    if ($w.restore_status -ne 'SUSI_STATUS_SUCCESS') { $text += ", restore rejected ($($w.restore_status))" }
+                    if ($lockValue -eq 1) { $text += " while lock_status=LOCKED; this runner does not unlock, so the area stayed write-protected and the write test could not run" }
+                    else { $text += " although lock_status=$lockText" }
+                } elseif (-not $w.changed) {
+                    $text = "write returned success but readback ($($w.verify_status)) did not show the written data (lock_status=$lockText)"
+                } else {
+                    $text = "restore failed (restore=$($w.restore_status), verify=$($w.restore_verify_status)); original data may not be back (lock_status=$lockText)"
+                }
+                $details += ("{0}: {1}" -f $w.channel, $text)
+            }
+            $report.reason = 'StorageArea write/verify/restore failed. ' + ($details -join '; ') + '.'
+        }
         elseif ($report.result -eq 'PASS') { $report.reason = 'StorageArea write/verify/restore passed.' }
     }
     $report.checks.read_stability = if ($report.result -like 'FAIL*') { 'FAIL' } else { 'PASS' }

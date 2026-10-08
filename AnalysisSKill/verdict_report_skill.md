@@ -34,7 +34,11 @@
    唯讀模式：`run_machineB_full_validation.py --no-write-tests` 不傳任何開關，所有寫入都不做；有 Set API 但沒測到的 section 判 `CONDITIONAL`，summary 的 Scope 行標示 `READ-ONLY`。
 6. summary 的「Not selected in the request form」段落列出因為 request 表單沒有勾選而沒產生、因此沒驗證的 section（程式讀 `<PROJECT>-section-matrix.json` 中 `reason_code=REQUEST_NOT_SELECTED` 的項目產生，代理照抄）。這些 section 不是 PASS 也不是 FAIL，最終報告要說明是「使用者沒有要求」，不可寫成漏做。
 7. 治具、硬體刺激、DQA 相關的待辦，一律寫在 summary 的「Phase 2 recommendations」段落，不降低第一階段判定。
-8. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
+8. **FAIL 的原因必須具體寫進 summary**（由 runner 的 `reason` 帶出，代理照抄，不自行概括成「failed」）：
+   - `StorageArea`：寫入被拒絕時列出 API 與狀態名（例：`StorageAreaWrite` 回 `SUSI_STATUS_WRITE_ERROR`），並附 `lock_status`。`lock_status=LOCKED` 時要寫明「儲存區被鎖住、runner 不解鎖，所以寫入測試無法進行」；若人工用 QA 工具確認過 unlock 也無效，要在最終報告補上這個外部證據。
+   - `GPIO`：set/readback 失敗時列出失敗的腳位（`GPIOnn (group g, bit b)`）與「其他腳位正常」；GetCaps 遮罩缺腳的情況沿用第 6 點的 `Not supported:` 列表。
+   - 其他 section 的失敗同理：reason 要能回答「哪一個 channel／哪一支腳／哪個 API 回了什麼狀態」。
+9. 判定邏輯以程式為準：`targetB_task/machineB_validation/common_susi.ps1` 的 `Apply-VerdictPolicy`。
 
 ## 4. 結果判讀規則
 1. **report JSON 為準**：section 結論看 report JSON；process exit code 只當診斷證據。

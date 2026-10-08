@@ -12,6 +12,11 @@ function Get-StatusName([UInt32]$st) {
         0xFFFFFBFF { 'SUSI_STATUS_NOT_FOUND' }
         0xFFFFFBFE { 'SUSI_STATUS_TIMEOUT' }
         0xFFFFF9FF { 'SUSI_STATUS_MORE_DATA' }
+        0xFFFFFEFE { 'SUSI_STATUS_INVALID_BLOCK_ALIGNMENT' }
+        0xFFFFFEFD { 'SUSI_STATUS_INVALID_BLOCK_LENGTH' }
+        0xFFFFFBFA { 'SUSI_STATUS_LOCKFAIL' }
+        0xFFFFFAFF { 'SUSI_STATUS_READ_ERROR' }
+        0xFFFFFAFE { 'SUSI_STATUS_WRITE_ERROR' }
         default { ('0x{0:X8}' -f $st) }
     }
 }
