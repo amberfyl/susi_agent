@@ -21,8 +21,8 @@
 - The most common error is landing on the adjacent pin (for example `GPIOA6` instead of `GPIOA5`, `GPIO91` instead of `GPIO90`). Before accepting a mapping, confirm the pin number printed at the exact wire end and read the function label on that same pin row.
 - A crossing without a junction dot is not a connection. Branch only at junctions.
 - An `X`/`NC` mark counts only when it sits on the same pin or wire end and the wire terminates there.
-- A `<number>` tag next to a net label (for example `EC_P1_GPIO2 <49>`) does not change the judgement. If a continuous wire on the same image reaches a chip pin, map it normally; if no wire reaches a chip pin, mark AMBIGUOUS.
-- The `<number>` tag only lists other pages that use the same net; it never means the wire is missing on this page. Follow the wire from the port/BI symbol on the side opposite the tag (it may run left toward the chip) and through series 0Ω resistors/jumpers to the chip pin.
+- A `<number>` tag next to a net label (for example `EC_P1_GPIO2 <49>`) is only a small annotation added by the drafter and has nothing to do with page numbers. Ignore it completely and inspect the actual wires directly. Never use it to infer page numbers, cross-page connections, tracing direction or an AMBIGUOUS result.
+- Follow the actual continuous wire to the chip pin, including bends and series 0Ω resistors/jumpers. Do not determine tracing direction from the position of a `<number>` tag.
 - When the wire is cut off, the end point is unclear, or a wire cannot be told apart from an annotation, mark AMBIGUOUS. Never guess.
 
 ## Function label to group/bit
