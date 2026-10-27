@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """Deterministic query tool for the active ``config_new.db`` schema.
 
-The lookup key is always ``(product_name, chip_name)``.  ``ProductChip``
-provides the corresponding ``hardware_id``; section rows are then selected by
+The lookup key is ``(product_name, chip_name)``.  ``ProductChip``
+provides the corresponding ``hardware_id``; when the tuple is missing but the
+chip is known under another product, its ``hardware_id`` is reused; section rows are then selected by
 that hardware id because the active schema no longer has ``prod_chip_id``
 foreign keys in section tables.
 
@@ -23,6 +24,7 @@ from typing import Any
 
 DEFAULT_DB_PATH = Path(__file__).with_name("config_new.db")
 VALID_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.]+$")
+CHIP_NAME_REUSE = "CHIP_NAME_REUSE"
 FAN_DEFAULT_CHIPS = {"EIO201", "EIO211", "IT8528", "IT5782", "IT5121"}
 
 
@@ -103,6 +105,31 @@ def _empty_result(product_name: str, chip_name: str, section: str) -> dict[str, 
     }
 
 
+def reuse_by_chip_name(con: sqlite3.Connection, product_name: str, chip_name: str) -> tuple[dict[str, Any] | None, str | None]:
+    """Borrow ``hardware_id``/``config_chip`` from any ProductChip row of the same chip.
+
+    ``hardware_id`` is the BOM part number of the chip, so it does not depend on
+    ``product_name``.  Returns ``(record, None)`` when every row of ``chip_name``
+    agrees, ``(None, reason)`` when the chip is unknown or its rows disagree.
+    Section flags are never copied: they describe what a spec processed.
+    """
+    pairs = con.execute(
+        'SELECT DISTINCT hardware_id, config_chip FROM "ProductChip" WHERE chip_name = ?',
+        (chip_name,),
+    ).fetchall()
+    if not pairs:
+        return None, None
+    if len(pairs) > 1:
+        return None, f"chip_name {chip_name} maps to {len(pairs)} different hardware_id/config_chip pairs"
+    return {
+        "product_name": product_name,
+        "chip_name": chip_name,
+        "hardware_id": pairs[0][0],
+        "config_chip": pairs[0][1],
+        "source": CHIP_NAME_REUSE,
+    }, None
+
+
 def query_section(
     db_path: str | Path,
     product_name: str,
@@ -148,13 +175,20 @@ def query_section(
             """,
             (product_name, chip_name),
         ).fetchone()
+        lookup_extra: dict[str, Any] = {}
         if prod is None:
-            result["status"] = "NO_SUCH_PRODUCT_CHIP"
-            return result
+            reused, reason = reuse_by_chip_name(con, product_name, chip_name)
+            if reused is None:
+                result["status"] = "NO_SUCH_PRODUCT_CHIP"
+                if reason:
+                    result["error"] = reason
+                return result
+            prod = reused
+            lookup_extra["source"] = CHIP_NAME_REUSE
 
         result["prod_chip"] = dict(prod)
         hardware_id = str(prod["hardware_id"] or "").strip()
-        result["lookup"] = {"hardware_id": hardware_id}
+        result["lookup"] = {"hardware_id": hardware_id, **lookup_extra}
 
         table_name = quote_ident(section)
         rows = con.execute(

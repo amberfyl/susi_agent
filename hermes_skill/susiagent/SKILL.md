@@ -141,6 +141,12 @@ When you call the vision tool (`vision_analyze`), the model that reads the image
 - GPIO trigger: `GetCaps` input/output returned an error status (for example `0xFFFFFCFF`) on every bank. A capability mask printed next to a failed GetCaps is not evidence; never call such a route correct.
 - GPIO verdict: PASS only when every expected pin is in the mask. GetCaps succeeded but some bits are missing is `PARTIAL` and stays FAIL; the summary lists each missing pin (key, signal, function label, group/bit) for human review. On the baseline route this does not trigger fallback (the route is right, the traces are suspect). In fallback, the first whitelist candidate whose GetCaps/GetDirection/GetLevel succeed with more than half the pins supported wins: its route is written into the final INI, and GPIO is reported PASS (all pins) or FAIL `PARTIAL` (missing pins listed). Half or fewer means that candidate is rejected and the next one is tried. Do not re-trace, drop pins or change values yourself (verdict_report_skill.md section 4, item 6).
 - After `--converge`, `<PROJECT>-machineB-summary.json/.txt` is rewritten as the single final report: converged sections take the winning attempt's verdict, and the text ends with a Details list of every evidence file. The first-pass summary is preserved as `<PROJECT>-machineB-summary.baseline.json/.txt`. Give the user only the final summary path; do not ask them to read `fallback-convergence.json` or the baseline separately.
+- ProductChip backfill (after the final report): the validator writes `<run>/productchip-backfill/proposal.json` and ends the summary text with one `ProductChip backfill ...` line (after `--execute` when no fallback plan was written, otherwise after `--converge`). If the line says `suggested`, quote it to the user and ask whether to apply. Only after the user agrees, run:
+  ```
+  <REPO>/.venv/bin/python <REPO>/productchip_backfill.py \
+    --project-dir <REPO>/CASES/<PROJECT> --run-id <RUN_ID> --apply
+  ```
+  and report the outcome (`APPLIED` / `NO_OP` / `CONFLICT` / `FAILED`) with its log path. If the user declines, write nothing. If the user declines `--converge`, run the same command without `--apply` to get the proposal from the baseline summary, then ask. A backfill problem never changes the validation result.
 
 ## 4. Done criteria
 - `section-matrix.project` equals `<PROJECT>`; all artifacts are inside the project directory.

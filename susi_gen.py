@@ -21,6 +21,7 @@ from query_config_db import (
     query_section,
     chip_uses_hwm_fan_defaults,
     load_hwm_fan_defaults,
+    reuse_by_chip_name,
 )
 from understand import parse_screen_control_selected, understand
 
@@ -3136,7 +3137,10 @@ def _load_prod_chip_record(db_path: Path, product_name: str, chip_name: str) -> 
             """,
             (product_name, chip_name),
         ).fetchone()
-        return dict(prod) if prod is not None else None
+        if prod is not None:
+            return dict(prod)
+        reused, _reason = reuse_by_chip_name(con, product_name, chip_name)
+        return reused
     finally:
         con.close()
 

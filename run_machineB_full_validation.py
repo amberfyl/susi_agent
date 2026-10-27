@@ -2525,6 +2525,34 @@ def write_fallback_plan(
     return path
 
 
+def write_productchip_backfill_proposal(contract: PostIniContract, db_path: Path) -> Path:
+    """Write the ProductChip backfill proposal for the final summary of this run.
+
+    The proposal only describes the change; the agent asks the user and runs
+    ``productchip_backfill.py --apply`` after the user agreed.
+    """
+
+    from productchip_backfill import describe, write_proposal
+
+    path, proposal = write_proposal(contract.inputs.case_dir, contract.run_id, db_path)
+    line = f"{describe(proposal)} -- proposal: {_display_path(path, contract.outputs.run_root)}"
+    if proposal.get("status") == "READY":
+        line += " -- ask the user before applying"
+    with contract.outputs.summary_text.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+    return path
+
+
+def _report_backfill_proposal(contract: PostIniContract, repo_root: str) -> None:
+    try:
+        write_productchip_backfill_proposal(contract, Path(repo_root) / "config_new.db")
+    except Exception as exc:
+        print(
+            json.dumps({"phase": "PRODUCTCHIP_BACKFILL", "message": str(exc)}, sort_keys=True),
+            file=sys.stderr,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Deterministic Machine-B full-validation orchestrator"
@@ -2631,6 +2659,7 @@ def main(argv: list[str] | None = None) -> int:
             if final_summary is not None:
                 output_path = contract.outputs.summary_json
                 exit_code = int(final_summary["exit_code"])
+                _report_backfill_proposal(contract, args.repo_root)
             else:
                 output_path = Path(str(convergence["output_path"]))
                 status = str(convergence.get("status") or "ORCHESTRATOR_ERROR")
@@ -2645,13 +2674,19 @@ def main(argv: list[str] | None = None) -> int:
             )
             output_path = contract.outputs.summary_json
             exit_code = int(summary["exit_code"])
+            plan_path: Path | None = None
             try:
-                write_fallback_plan(contract, _registry_path(args.repo_root))
+                plan_path = write_fallback_plan(contract, _registry_path(args.repo_root))
             except Exception as exc:
                 print(
                     json.dumps({"phase": "FALLBACK_PLAN", "message": str(exc)}, sort_keys=True),
                     file=sys.stderr,
                 )
+            if plan_path is None:
+                _report_backfill_proposal(contract, args.repo_root)
+            else:
+                with contract.outputs.summary_text.open("a", encoding="utf-8") as handle:
+                    handle.write("ProductChip backfill: deferred until --converge completes\n")
     except (ContractError, RemoteStageError) as exc:
         print(json.dumps(exc.to_dict(), sort_keys=True), file=sys.stderr)
         return 2
