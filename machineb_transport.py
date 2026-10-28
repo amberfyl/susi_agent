@@ -30,6 +30,8 @@ class RemoteTransport(Protocol):
 
     def close_process(self, name: str) -> int: ...
 
+    def launch_interactive(self, exe_path: str) -> Mapping[str, Any]: ...
+
     def invoke_batch(self, path: str) -> "RemoteCommandResult": ...
 
     def query_susi_device(self) -> Mapping[str, Any]: ...
@@ -272,6 +274,41 @@ class SshPowerShellTransport:
             return int(value)
         except ValueError as exc:
             raise RemoteTransportError(f"invalid CLOSED_COUNT marker: {value!r}") from exc
+
+    def launch_interactive(self, exe_path: str) -> dict[str, Any]:
+        """Start ``exe_path`` on the logged-on user's desktop (not SSH session 0).
+
+        A one-shot scheduled task with an Interactive logon is the only way an
+        SSH-launched process gets a visible window.  The task is removed again
+        right after the process shows up.
+        """
+
+        result = self._powershell(
+            "$ErrorActionPreference='Stop'; "
+            f"$exe={_ps_literal(exe_path)}; "
+            "if(-not (Test-Path -LiteralPath $exe)){Write-Output 'LAUNCHED=0'; "
+            "Write-Output 'SESSION=-1'; exit 0}; "
+            "$name=[IO.Path]::GetFileNameWithoutExtension($exe); "
+            "$task='SusiAgentLaunch_'+$name; "
+            "$action=New-ScheduledTaskAction -Execute $exe "
+            "-WorkingDirectory (Split-Path -Parent $exe); "
+            "$principal=New-ScheduledTaskPrincipal -UserId $env:USERNAME "
+            "-LogonType Interactive; "
+            "Register-ScheduledTask -TaskName $task -Action $action "
+            "-Principal $principal -Force | Out-Null; "
+            "try { Start-ScheduledTask -TaskName $task; "
+            "$p=$null; for($i=0;$i -lt 10 -and -not $p;$i++){Start-Sleep -Seconds 1; "
+            "$p=Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1} } "
+            "finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false "
+            "-ErrorAction SilentlyContinue }; "
+            "if($p){Write-Output 'LAUNCHED=1'; Write-Output ('SESSION=' + $p.SessionId)} "
+            "else {Write-Output 'LAUNCHED=0'; Write-Output 'SESSION=-1'}"
+        )
+        markers = self._parse_markers(result.stdout, ("LAUNCHED", "SESSION"))
+        return {
+            "launched": markers["LAUNCHED"] == "1",
+            "session_id": int(markers["SESSION"]) if markers["SESSION"].lstrip("-").isdigit() else -1,
+        }
 
     def invoke_batch(self, path: str) -> RemoteCommandResult:
         script = (

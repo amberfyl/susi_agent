@@ -53,6 +53,9 @@ DEFAULT_REMOTE_USER = "susiaa"
 # Machine-B paths below live under the SSH user's profile; {user} is filled from --user.
 DEFAULT_REMOTE_VERIFY_ROOT = PureWindowsPath(r"C:\Users\{user}\Desktop\verify")
 DEFAULT_REMOTE_SUSI_ROOT = PureWindowsPath(r"C:\Windows\SUSI")
+DEFAULT_DEMO_EXE = (
+    r"C:\Program Files\Advantech\SUSI\Applications\SUSI4 Demo\C#\bin\AnyCPU\SusiDemo4.exe"
+)
 DEFAULT_RELOAD_BAT = PureWindowsPath(
     r"C:\Users\{user}\Desktop\reload driver\reload_susi4_driver.bat"
 )
@@ -429,6 +432,13 @@ class TargetPaths:
     run_output: str
     runtime_ini: str
     reload_bat: str
+
+
+@dataclass(frozen=True)
+class KeepIni:
+    """``-i`` mode: leave the final INI in the SUSI folder and open the demo app."""
+
+    demo_exe: str
 
 
 @dataclass(frozen=True)
@@ -1907,10 +1917,12 @@ def run_fallback_convergence_session(
     plan: Mapping[str, object],
     *,
     runner_timeout_seconds: int = 180,
+    keep: KeepIni | None = None,
 ) -> dict[str, Any]:
     """Execute a validated plan, save evidence, converge artifacts, then recover target."""
 
     baseline_text = contract.inputs.full_ini.read_text(encoding="utf-8")
+    final_text = baseline_text
     restore_counter = 0
 
     def attempt_runner(candidate: FallbackAttemptCandidate) -> Mapping[str, object]:
@@ -1947,6 +1959,7 @@ def run_fallback_convergence_session(
             )
         )
         effective_text = str(convergence.pop("effective_ini_text"))
+        final_text = effective_text
         effective_path = contract.outputs.run_root / "fallback-effective-full.ini"
         effective_path.write_text(effective_text, encoding="utf-8")
         convergence["effective_ini_path"] = str(effective_path)
@@ -1962,7 +1975,7 @@ def run_fallback_convergence_session(
         }
     finally:
         convergence["final_runtime_recovery"] = rollback_runtime_ini(
-            contract, staging_result, transport
+            contract, staging_result, transport, keep, final_text
         )
     if convergence["final_runtime_recovery"].get("status") != "PASS":
         convergence["status"] = "ORCHESTRATOR_ERROR"
@@ -1974,13 +1987,66 @@ def run_fallback_convergence_session(
     return convergence
 
 
+def keep_final_ini(
+    contract: PostIniContract,
+    transport: Any,
+    keep: KeepIni,
+    *,
+    ini_text: str,
+) -> dict[str, Any]:
+    """``-i`` replacement for the rollback: final INI + driver reload + open the demo app.
+
+    The demo app is opened only when the INI was deployed and SUSI4 is healthy,
+    otherwise the recording would show a broken state.  A failed launch is
+    reported but never changes the validation verdict.
+    """
+
+    started_at = _utc_now()
+    deploy = deploy_fallback_ini_only(contract, transport, ini_text=ini_text, label="keep-final")
+    if deploy.get("status") != "PASS":
+        return {
+            "status": "FAIL",
+            "action": "KEEP_INI",
+            "error": str(deploy.get("error") or "keep-ini deployment failed"),
+            "deploy": deploy,
+            "started_at": started_at,
+            "completed_at": _utc_now(),
+        }
+    try:
+        launch = dict(transport.launch_interactive(keep.demo_exe))
+    except Exception as exc:
+        launch = {"launched": False, "error": str(exc)}
+    return {
+        "status": "PASS",
+        "action": "KEPT_VALIDATED_INI",
+        "kept_ini": contract.target.runtime_ini,
+        "recovery_reload_attempt_count": 1,
+        "command": deploy.get("command"),
+        "readiness": deploy.get("readiness"),
+        "demo_exe": keep.demo_exe,
+        "demo_launch": launch,
+        "started_at": started_at,
+        "completed_at": _utc_now(),
+    }
+
+
 def rollback_runtime_ini(
     contract: PostIniContract,
     staging_result: Mapping[str, Any],
     transport: Any,
+    keep: KeepIni | None = None,
+    keep_ini_text: str | None = None,
 ) -> dict[str, Any]:
-    """P10: restore the pre-run INI state and reload it as a separate recovery action."""
+    """P10: restore the pre-run INI state and reload it as a separate recovery action.
 
+    With ``keep`` the pre-run state is not restored: ``keep_ini_text`` (default:
+    the full pre-INI) stays in place and the demo app is opened.
+    """
+
+    if keep is not None:
+        if keep_ini_text is None:
+            keep_ini_text = contract.inputs.full_ini.read_text(encoding="utf-8")
+        return keep_final_ini(contract, transport, keep, ini_text=keep_ini_text)
     started_at = _utc_now()
     backup = dict(staging_result.get("backup", {}))
     original_exists = bool(backup.get("original_exists", False))
@@ -2026,6 +2092,7 @@ def run_activated_validation(
     transport: Any,
     *,
     runner_timeout_seconds: int = 180,
+    keep: KeepIni | None = None,
 ) -> dict[str, Any]:
     """Coordinate P7-P10 after P6 staging and always attempt INI rollback."""
 
@@ -2079,7 +2146,7 @@ def run_activated_validation(
     except Exception as exc:
         errors.append({"phase": "ORCHESTRATOR", "message": str(exc), "details": {}})
     finally:
-        rollback = rollback_runtime_ini(contract, staging_result, transport)
+        rollback = rollback_runtime_ini(contract, staging_result, transport, keep)
 
     return write_validation_summary(
         contract,
@@ -2215,6 +2282,13 @@ def write_validation_summary(
         lines.extend(["", "No INI generated (not required / not supported for this project):"])
         lines.extend(f"- {name}" for name in not_generated)
     lines.extend(["", f"Rollback: [{rollback.get('status')}]"])
+    if rollback.get("action") == "KEPT_VALIDATED_INI":
+        launch = rollback.get("demo_launch") or {}
+        opened = "opened" if launch.get("launched") else f"NOT opened ({launch.get('error') or 'process not found'})"
+        lines.append(
+            f"  --keep-ini: rollback skipped, INI kept at {rollback.get('kept_ini')}; "
+            f"SusiDemo4 {opened}"
+        )
     run_root = contract.outputs.run_root
     if fallback is not None:
         lines.extend([
@@ -2585,7 +2659,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Read-only run: pass no set/write/control switch to any runner",
     )
+    parser.add_argument(
+        "-i",
+        "--keep-ini",
+        action="store_true",
+        help="Do not roll back: keep the final INI in the SUSI folder, reload the "
+        "driver and open SusiDemo4 (for recording); requires --execute/--converge",
+    )
+    parser.add_argument("--demo-exe", default=DEFAULT_DEMO_EXE, help="SusiDemo4.exe path on the target")
     args = parser.parse_args(argv)
+    if args.keep_ini and args.dry_run:
+        parser.error("--keep-ini requires --execute or --converge")
+    keep = KeepIni(demo_exe=args.demo_exe) if args.keep_ini else None
     if (args.execute or args.converge) and (not args.host or not args.user):
         parser.error("--host and --user are required with --execute/--converge")
     if args.converge and not args.fallback_plan:
@@ -2654,6 +2739,7 @@ def main(argv: list[str] | None = None) -> int:
                 transport,
                 fallback_plan,
                 runner_timeout_seconds=args.runner_timeout_seconds,
+                keep=keep,
             )
             final_summary = finalize_summary_after_fallback(contract, convergence)
             if final_summary is not None:
@@ -2671,6 +2757,7 @@ def main(argv: list[str] | None = None) -> int:
                 staging,
                 transport,
                 runner_timeout_seconds=args.runner_timeout_seconds,
+                keep=keep,
             )
             output_path = contract.outputs.summary_json
             exit_code = int(summary["exit_code"])

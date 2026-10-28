@@ -960,5 +960,76 @@ class RollbackAndSummaryTests(unittest.TestCase):
             self.assertTrue(contract.outputs.summary_text.is_file())
 
 
+class KeepIniTransport(FakePipelineTransport):
+    def __init__(self, *, launched=True, **kwargs):
+        super().__init__(**kwargs)
+        self.launched = launched
+        self.uploaded = {}
+
+    def upload(self, local_path, remote_path):
+        self.calls.append(("upload", remote_path))
+        self.uploaded[remote_path] = local_path.read_bytes()
+        self.remote_files.add(remote_path)
+
+    def remote_sha256(self, remote_path):
+        import hashlib
+
+        return hashlib.sha256(self.uploaded[remote_path]).hexdigest()
+
+    def launch_interactive(self, exe_path):
+        self.calls.append(("launch", exe_path))
+        return {"launched": self.launched, "session_id": 1}
+
+
+class KeepIniTests(unittest.TestCase):
+    EXE = r"C:\SUSI\SusiDemo4.exe"
+
+    def test_keep_ini_deploys_final_text_reloads_then_opens_demo_app(self):
+        from run_machineB_full_validation import KeepIni, rollback_runtime_ini
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            transport = KeepIniTransport()
+            transport.remote_files.add(contract.target.reload_bat)
+            result = rollback_runtime_ini(
+                contract,
+                {"backup": {"original_exists": True, "backup_ini": "unused"}},
+                transport,
+                KeepIni(self.EXE),
+                "[Final]\n",
+            )
+            kinds = [c[0] for c in transport.calls]
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["action"], "KEPT_VALIDATED_INI")
+            self.assertTrue(result["demo_launch"]["launched"])
+            self.assertNotIn("remove", kinds)
+            self.assertNotIn(("copy", "unused", contract.target.runtime_ini), transport.calls)
+            self.assertLess(kinds.index("close_process"), kinds.index("batch"))
+            self.assertLess(kinds.index("batch"), kinds.index("launch"))
+            self.assertEqual(list(transport.uploaded.values()), [b"[Final]\n"])
+
+    def test_keep_ini_does_not_open_demo_app_when_driver_is_unhealthy(self):
+        from run_machineB_full_validation import KeepIni, rollback_runtime_ini
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            transport = KeepIniTransport(healthy=False)
+            transport.remote_files.add(contract.target.reload_bat)
+            result = rollback_runtime_ini(contract, {}, transport, KeepIni(self.EXE), "[Final]\n")
+            self.assertEqual(result["status"], "FAIL")
+            self.assertNotIn("launch", [c[0] for c in transport.calls])
+
+    def test_failed_launch_is_reported_but_keeps_pass(self):
+        from run_machineB_full_validation import KeepIni, rollback_runtime_ini
+
+        with tempfile.TemporaryDirectory() as td:
+            contract = make_contract(td)
+            transport = KeepIniTransport(launched=False)
+            transport.remote_files.add(contract.target.reload_bat)
+            result = rollback_runtime_ini(contract, {}, transport, KeepIni(self.EXE), "[Final]\n")
+            self.assertEqual(result["status"], "PASS")
+            self.assertFalse(result["demo_launch"]["launched"])
+
+
 if __name__ == "__main__":
     unittest.main()
