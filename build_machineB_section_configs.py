@@ -1158,6 +1158,8 @@ def build_gpio_config(
             "bank": bank_no,
             "bank_id": f"0x{0x00010000 + bank_no:08X}",
             "bank_bitmask": f"0x{bank_bitmask:08X}",
+            # Single pin mode ignores Bitmask (SUSI 4 manual 3.7); always pass 1.
+            "single_bitmask": "0x00000001",
             "api_id_source": "GPIO_KEY_SUFFIX",
         }
 
@@ -1184,6 +1186,7 @@ def build_gpio_config(
         },
         "functional_check": {
             "enabled": bool(policy_value(functional, "enabled", True)),
+            "modes": ["single", "multiple"],
             "patterns": ["0x00000000", "EXPECTED_MASK"],
             "settle_time_ms": int(policy_value(functional, "settle_time_ms", 100)),
             "restore_original": True,

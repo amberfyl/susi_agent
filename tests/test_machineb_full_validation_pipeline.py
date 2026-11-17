@@ -250,6 +250,9 @@ class Phase1VerdictTests(unittest.TestCase):
 
         def verdict(section, result, validation_layers):
             report = {"category": section, "result": result, "validation_layers": validation_layers}
+            if section == "GPIO":
+                # GPIO functional PASS needs both modes to have succeeded.
+                report["metrics"] = {"modes": {"single": "success", "multiple": "success"}}
             return _normalize_report_verdict(report)[0]
 
         for section in ("VGA.Backlight", "VGA.Brightness", "GPIO", "StorageArea"):

@@ -1276,6 +1276,24 @@ PHASE2_RECOMMENDATIONS: Mapping[str, str] = MappingProxyType({
 })
 
 
+def _gpio_modes_incomplete(report: Mapping[str, Any]) -> bool:
+    """True when a GPIO report claims functional PASS without both modes succeeding.
+
+    A mode that failed is caught by the layer check; this catches not_run / missing.
+    """
+
+    if str(report.get("category")) != "GPIO":
+        return False
+    layers = report.get("validation_layers")
+    if not isinstance(layers, Mapping) or str(layers.get("L5_functional", "")).upper() != "PASS":
+        return False
+    metrics = report.get("metrics")
+    modes = metrics.get("modes") if isinstance(metrics, Mapping) else None
+    if not isinstance(modes, Mapping):
+        return True
+    return any(modes.get(name) != "success" for name in ("single", "multiple"))
+
+
 def _normalize_report_verdict(report: Mapping[str, Any]) -> tuple[str, str | None, str | None]:
     """Phase 1 verdict: PASS when every SW API layer (L1-L4) actually passed.
 
@@ -1295,6 +1313,9 @@ def _normalize_report_verdict(report: Mapping[str, Any]) -> tuple[str, str | Non
         recovery = str(layers.get("L6_recovery", "")).upper()
         if any(state.startswith("FAIL") for state in sw_states) or recovery.startswith("FAIL"):
             verdict = "FAIL"
+        elif _gpio_modes_incomplete(report):
+            # GPIO L5 PASS needs both single and multiple mode to be success.
+            verdict = "CONDITIONAL"
         elif upper.startswith("FAIL") and (
             not upper.startswith(_PHASE2_ONLY_FAILURES)
             or str(report.get("category")) in _WRITE_PATH_SECTIONS

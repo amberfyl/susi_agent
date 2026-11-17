@@ -103,6 +103,9 @@ try {
         settle_time_ms = $settleMs
     }
     $report.validation_layers.L1_configuration = 'PASS'
+    $requestedModes = @(Get-ConfigValue -Config $functional -Name 'modes' -Default @('single', 'multiple') | ForEach-Object { ([string]$_).ToLowerInvariant() })
+    # Per-mode outcome: success / fail / not_run. A mode that did not run is never success.
+    $report.metrics.modes = [ordered]@{ single = 'not_run'; multiple = 'not_run' }
 
     $init = Initialize-Susi -DllDirs $DllDirs
     $initialized = $true
@@ -213,6 +216,74 @@ try {
                 }
             }
 
+            if ($requestedModes -contains 'multiple') {
+                $report.metrics.modes.multiple = if ($functionalFailures.Count -eq 0) { 'success' } else { 'fail' }
+            }
+
+            # Single pin mode: Id = pin number, Bitmask ignored by the API (always 1).
+            # Each pin is also cross-checked against its bank bit (same GPIO in the driver):
+            # single write -> bank read, then bank write -> single read.
+            if ($requestedModes -contains 'single') {
+                $singleFailedPins = @()
+                $report.metrics.single = [ordered]@{}
+                $channelsAll = Get-ConfigValue -Config $config -Name 'channels' -Default ([ordered]@{})
+                foreach ($chName in @($channelsAll.Keys)) {
+                    $cm = $channelsAll[$chName]
+                    $pinId = Convert-ToUInt32Safe ([string](Get-ConfigValue -Config $cm -Name 'gpio_api_id' ''))
+                    $sMask = Convert-ToUInt32Safe ([string](Get-ConfigValue -Config $cm -Name 'single_bitmask' '1'))
+                    $cmBankId = Convert-ToUInt32Safe ([string](Get-ConfigValue -Config $cm -Name 'bank_id' '0'))
+                    $cmBit = Convert-ToUInt32Safe ([string](Get-ConfigValue -Config $cm -Name 'bank_bitmask' '0'))
+                    $pinResult = [ordered]@{ pin_id = ('0x{0:X8}' -f $pinId); patterns = @(); ok = $true }
+                    $dirStatus = [NativeSusi]::SusiGPIOSetDirection($pinId, $sMask, [UInt32]0)
+                    Add-ApiCall -report $report -name ("GPIO single set output:{0}" -f $chName) -status $dirStatus -value '0x00000000'
+                    if ($dirStatus -ne 0) { $pinResult.ok = $false }
+                    else {
+                        foreach ($pattern in @([UInt32]0, [UInt32]1)) {
+                            $setStatus = [NativeSusi]::SusiGPIOSetLevel($pinId, $sMask, $pattern)
+                            Add-ApiCall -report $report -name ("GPIO single set level:{0}" -f $chName) -status $setStatus -value ('0x{0:X8}' -f $pattern)
+                            if ($settleMs -gt 0) { Start-Sleep -Milliseconds $settleMs }
+                            $sLevel = [UInt32]0
+                            $sReadStatus = [NativeSusi]::SusiGPIOGetLevel($pinId, $sMask, [ref]$sLevel)
+                            Add-ApiCall -report $report -name ("GPIO single read level:{0}" -f $chName) -status $sReadStatus -value ('0x{0:X8}' -f $sLevel)
+                            $singleMatch = ($setStatus -eq 0 -and $sReadStatus -eq 0 -and (($sLevel -band [UInt32]1) -eq $pattern))
+
+                            # cross 1: single write -> bank read
+                            $bLevel = [UInt32]0
+                            $bReadStatus = [NativeSusi]::SusiGPIOGetLevel($cmBankId, $cmBit, [ref]$bLevel)
+                            Add-ApiCall -report $report -name ("GPIO cross bank read:{0}" -f $chName) -status $bReadStatus -value ('0x{0:X8}' -f $bLevel)
+                            $cross1 = ($bReadStatus -eq 0 -and ((($bLevel -band $cmBit) -ne 0) -eq ($pattern -eq 1)))
+
+                            # cross 2: bank write -> single read (opposite level, then verify via single)
+                            $opposite = if ($pattern -eq 1) { [UInt32]0 } else { $cmBit }
+                            $bSetStatus = [NativeSusi]::SusiGPIOSetLevel($cmBankId, $cmBit, $opposite)
+                            Add-ApiCall -report $report -name ("GPIO cross bank set:{0}" -f $chName) -status $bSetStatus -value ('0x{0:X8}' -f $opposite)
+                            if ($settleMs -gt 0) { Start-Sleep -Milliseconds $settleMs }
+                            $s2Level = [UInt32]0
+                            $s2ReadStatus = [NativeSusi]::SusiGPIOGetLevel($pinId, $sMask, [ref]$s2Level)
+                            Add-ApiCall -report $report -name ("GPIO cross single read:{0}" -f $chName) -status $s2ReadStatus -value ('0x{0:X8}' -f $s2Level)
+                            $expectSingle = if ($pattern -eq 1) { [UInt32]0 } else { [UInt32]1 }
+                            $cross2 = ($bSetStatus -eq 0 -and $s2ReadStatus -eq 0 -and (($s2Level -band [UInt32]1) -eq $expectSingle))
+
+                            $pinResult.patterns += [ordered]@{
+                                set = ('0x{0:X8}' -f $pattern)
+                                read = ('0x{0:X8}' -f $sLevel)
+                                single_match = $singleMatch
+                                cross_single_to_bank = $cross1
+                                cross_bank_to_single = $cross2
+                            }
+                            if (-not ($singleMatch -and $cross1 -and $cross2)) { $pinResult.ok = $false }
+                        }
+                    }
+                    $report.metrics.single[$chName] = $pinResult
+                    if (-not $pinResult.ok) {
+                        $singleFailedPins += ("{0} (group {1}, bit {2})" -f $chName, (Get-ConfigValue -Config $cm -Name 'tuple_group' '?'), (Get-ConfigValue -Config $cm -Name 'tuple_pin' '?'))
+                    }
+                }
+                $report.metrics.modes.single = if ($singleFailedPins.Count -eq 0) { 'success' } else { 'fail' }
+                $report.metrics.single_failed_pins = @($singleFailedPins)
+                if ($singleFailedPins.Count -gt 0) { $functionalFailures += 'single' }
+            }
+
             $restoreFailures = @(Restore-GpioBanks -States $states -Report $report)
             foreach ($bankName in @($states.Keys)) {
                 $report.metrics.banks[$bankName].restore = $states[$bankName].restore
@@ -233,6 +304,11 @@ try {
                         }
                     }
                 }
+                if ($null -ne $report.metrics.single_failed_pins) {
+                    foreach ($sp in @($report.metrics.single_failed_pins)) {
+                        if ($failedPins -notcontains $sp) { $failedPins += $sp }
+                    }
+                }
                 $report.metrics.functional_failed_pins = @($failedPins)
                 if ($failedPins.Count -gt 0) {
                     $report.reason = ('GPIO set/readback failed on {0} of {1} pins: {2}. The other pins read back correctly.' -f $failedPins.Count, @($config.required_channels).Count, ($failedPins -join ', '))
@@ -242,7 +318,7 @@ try {
                     if ($restoreFailures.Count -gt 0) { $report.reason += ' Restore failed on bank(s): ' + ($restoreFailures -join ', ') + '.' }
                 }
             } else {
-                $report.reason = 'GPIO low/high readback and restore passed.'
+                $report.reason = ('GPIO low/high readback and restore passed (single={0}, multiple={1}).' -f $report.metrics.modes.single, $report.metrics.modes.multiple)
             }
         }
     }
