@@ -41,6 +41,9 @@ class MachineBSectionConfigIntegrationTests(unittest.TestCase):
         (runner_dir / "run_smbus_validation.ps1").write_text(
             ". ./common_susi.ps1\n", encoding="utf-8"
         )
+        (runner_dir / "run_boardinfo_validation.ps1").write_text(
+            ". ./common_susi.ps1\n", encoding="utf-8"
+        )
         (runner_dir / "common_susi.ps1").write_text(
             "# shared helper\n", encoding="utf-8"
         )

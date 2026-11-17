@@ -83,6 +83,9 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         (runner_dir / "run_smbus_validation.ps1").write_text(
             ". ./common_susi.ps1\n", encoding="utf-8"
         )
+        (runner_dir / "run_boardinfo_validation.ps1").write_text(
+            ". ./common_susi.ps1\n", encoding="utf-8"
+        )
         (runner_dir / "common_susi.ps1").write_text(
             "# shared helper\n", encoding="utf-8"
         )
@@ -119,11 +122,11 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         )
         self.assertEqual(
             [artifact["kind"] for artifact in plan["artifacts"]],
-            ["full_ini", "split_ini", "config", "runner", "dependency"],
+            ["full_ini", "split_ini", "config", "runner", "runner", "dependency"],
         )
-        self.assertEqual(plan["artifact_count"], 5)
+        self.assertEqual(plan["artifact_count"], 6)
         self.assertEqual(
-            len({artifact["remote_path"] for artifact in plan["artifacts"]}), 5
+            len({artifact["remote_path"] for artifact in plan["artifacts"]}), 6
         )
 
     def test_stage_remote_bundle_backs_up_before_upload_without_upload_hash_checks(self):
@@ -138,7 +141,7 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         self.assertEqual(result["probe"]["computer_name"], "MACHINE-B")
         self.assertTrue(result["backup"]["original_exists"])
         self.assertTrue(result["backup"]["hash_verified"])
-        self.assertEqual(result["uploaded_count"], 5)
+        self.assertEqual(result["uploaded_count"], 6)
         self.assertTrue(
             all("sha256" not in item for item in result["artifacts"])
         )
@@ -163,7 +166,7 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         self.assertFalse(result["backup"]["original_exists"])
         self.assertIsNone(result["backup"]["sha256"])
         self.assertFalse(result["backup"]["hash_verified"])
-        self.assertEqual(result["uploaded_count"], 5)
+        self.assertEqual(result["uploaded_count"], 6)
         self.assertFalse(
             any(call[0] == "remote_sha256" for call in transport.calls)
         )
@@ -185,7 +188,7 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         result = stage_remote_bundle(contract, manifest, transport)
 
         self.assertEqual(result["status"], "PASS")
-        self.assertEqual(result["uploaded_count"], 5)
+        self.assertEqual(result["uploaded_count"], 6)
         self.assertFalse(
             any(call == ("remote_sha256", first_remote_path) for call in transport.calls)
         )
@@ -202,7 +205,7 @@ class MachineBRemoteStagingTests(unittest.TestCase):
 
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertIn("staging_plan", payload)
-        self.assertEqual(payload["staging_plan"]["artifact_count"], 5)
+        self.assertEqual(payload["staging_plan"]["artifact_count"], 6)
         self.assertIn("staging_plan", EXECUTION_MANIFEST_SCHEMA["required"])
         self.assertEqual(
             EXECUTION_MANIFEST_SCHEMA["properties"]["staging_plan"]["type"],

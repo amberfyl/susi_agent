@@ -152,12 +152,24 @@ class SectionRegistryEntry:
     opt_in_switches: tuple[str, ...] = ()
     default_switches: tuple[str, ...] = ()
     extra_path_arguments: tuple[str, ...] = ()
+    # Not driven by an INI section: always planned, no split INI, no section config.
+    standalone: bool = False
 
 
 # Normal execution order starts with low-risk reads, keeps dependency-coupled
 # sections adjacent (HWM.Fan -> HWM.Fan.Control), then continues with the
 # independently gated reversible-write sections.
 SECTION_REGISTRY: tuple[SectionRegistryEntry, ...] = (
+    SectionRegistryEntry(
+        "BoardInfo",
+        "",
+        "run_boardinfo_validation.ps1",
+        "boardinfo",
+        ExecutionTier.SIMPLE_READ,
+        0,
+        "read-only Boot Counter and Running Time Meter, both must be >= 1",
+        standalone=True,
+    ),
     SectionRegistryEntry(
         "HWM.CaseOpen",
         "{model}_caseopen.json",
@@ -757,6 +769,8 @@ def build_remote_staging_plan(
     )
     for section_plan in manifest.get("sections", []):
         section = str(section_plan["section"])
+        if section_plan.get("split_ini") is None:
+            continue
         split_path = Path(str(section_plan["split_ini"]))
         _append_staging_artifact(
             artifacts,
@@ -768,6 +782,8 @@ def build_remote_staging_plan(
         )
     for section_plan in manifest.get("sections", []):
         section = str(section_plan["section"])
+        if section_plan.get("config_path") is None:
+            continue
         config_path = Path(str(section_plan["config_path"]))
         _append_staging_artifact(
             artifacts,
@@ -929,7 +945,9 @@ def build_execution_manifest(
             )
 
     planned_entries = [
-        entry for entry in SECTION_REGISTRY if entry.section in generated
+        entry
+        for entry in SECTION_REGISTRY
+        if entry.standalone or entry.section in generated
     ]
     for entry in planned_entries:
         missing_dependencies = [
@@ -955,12 +973,16 @@ def build_execution_manifest(
                 "sequence": sequence,
                 "section": entry.section,
                 "matrix_status": "GENERATED",
-                "config_path": str(
+                "config_path": None
+                if entry.standalone
+                else str(
                     contract.inputs.config_dir
                     / entry.config_template.format(model=contract.project)
                 ),
                 "runner_path": str(contract.inputs.runner_dir / entry.runner),
-                "split_ini": str(contract.inputs.split_inis[entry.section]),
+                "split_ini": None
+                if entry.standalone
+                else str(contract.inputs.split_inis[entry.section]),
                 "report_prefix": entry.report_prefix,
                 "execution_tier": entry.execution_tier.value,
                 "difficulty_rank": entry.difficulty_rank,
@@ -1064,32 +1086,35 @@ def run_local_preflight(
     runner_paths: set[Path] = set()
     dependency_paths: set[Path] = set()
     sections = manifest.get("sections", [])
+    config_count = 0
     for section_plan in sections:
         section = str(section_plan["section"])
-        config_path = Path(str(section_plan["config_path"]))
-        if not config_path.is_file():
-            raise ContractError(
-                ContractErrorCode.CONFIG_FILE_MISSING,
-                f"missing section config: {config_path}",
-                path=config_path,
-                section=section,
-            )
-        try:
-            config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
-        except (json.JSONDecodeError, OSError) as exc:
-            raise ContractError(
-                ContractErrorCode.CONFIG_INVALID_JSON,
-                f"invalid section config JSON: {config_path}: {exc}",
-                path=config_path,
-                section=section,
-            ) from exc
-        if not isinstance(config_data, dict):
-            raise ContractError(
-                ContractErrorCode.CONFIG_INVALID_JSON,
-                f"section config JSON root must be an object: {config_path}",
-                path=config_path,
-                section=section,
-            )
+        if section_plan.get("config_path") is not None:
+            config_count += 1
+            config_path = Path(str(section_plan["config_path"]))
+            if not config_path.is_file():
+                raise ContractError(
+                    ContractErrorCode.CONFIG_FILE_MISSING,
+                    f"missing section config: {config_path}",
+                    path=config_path,
+                    section=section,
+                )
+            try:
+                config_data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            except (json.JSONDecodeError, OSError) as exc:
+                raise ContractError(
+                    ContractErrorCode.CONFIG_INVALID_JSON,
+                    f"invalid section config JSON: {config_path}: {exc}",
+                    path=config_path,
+                    section=section,
+                ) from exc
+            if not isinstance(config_data, dict):
+                raise ContractError(
+                    ContractErrorCode.CONFIG_INVALID_JSON,
+                    f"section config JSON root must be an object: {config_path}",
+                    path=config_path,
+                    section=section,
+                )
 
         runner_path = Path(str(section_plan["runner_path"]))
         if not runner_path.is_file():
@@ -1115,7 +1140,7 @@ def run_local_preflight(
     return {
         "status": "PASS",
         "section_count": len(sections),
-        "config_count": len(sections),
+        "config_count": config_count,
         "runner_count": len(runner_paths),
         "dependency_count": len(dependency_paths),
     }
@@ -1526,17 +1551,20 @@ def execute_validation_sections(
             continue
 
         runner_path = _remote_runner_path(contract, section_plan)
-        config_path = _remote_config_path(contract, section_plan)
+        standalone = section_plan.get("config_path") is None
+        config_path = None if standalone else _remote_config_path(contract, section_plan)
         if section == "HWM.Fan":
             fan_config_path = config_path
         prefix = str(section_plan["report_prefix"])
         pattern = f"{prefix}_*.json"
         before = set(transport.list_remote_files(report_dir, pattern))
-        arguments: dict[str, Any] = {
-            "ConfigPath": config_path,
-            "IniPath": contract.target.runtime_ini,
-            "OutDir": report_dir,
-        }
+        arguments: dict[str, Any] = {"OutDir": report_dir}
+        if not standalone:
+            arguments = {
+                "ConfigPath": config_path,
+                "IniPath": contract.target.runtime_ini,
+                "OutDir": report_dir,
+            }
         enabled_switches = {
             str(value)
             for value in section_plan.get("enabled_switches", [])
@@ -1651,6 +1679,7 @@ def execute_validation_sections(
             "reason": reason,
             "phase2_observation": observation,
             "gpio_suspect_pins": gpio_pins,
+            "detail_note": _section_detail_note(section, report),
             "channel_summary": report.get("channel_summary"),
             "validation_layers": report.get("validation_layers"),
             "sw_verdict": sw_verdict,
@@ -2296,7 +2325,11 @@ def write_validation_summary(
         lines.append(
             f"  {tag:<{tag_width}}  {str(item.get('section')):<{name_width}}  {detail}".rstrip()
         )
-        for note in (_fallback_note(item.get("fallback")), _trigger_note(item)):
+        for note in (
+            str(item.get("detail_note") or ""),
+            _fallback_note(item.get("fallback")),
+            _trigger_note(item),
+        ):
             if note:
                 lines.append(f"{indent}{note}")
     if not_generated:
@@ -2377,6 +2410,63 @@ def _attempt_label(attempt: Mapping[str, Any]) -> str:
     return (
         f"{route} {attempt.get('gpio_supported_pins')}/{attempt.get('gpio_expected_pins')} pins"
     )
+
+
+_THERMAL_EVENT_ORDER = ("none", "shutdown", "throttle", "poweroff")
+
+
+def _section_detail_note(section: str, report: Mapping[str, Any]) -> str:
+    """One-line summary of the newer per-mode / per-event checks, or "" if absent.
+
+    Shown as an indented line under the unchanged section line of the text
+    summary. Older reports without these metrics simply produce no note.
+    """
+
+    metrics = report.get("metrics") if isinstance(report, Mapping) else None
+    if not isinstance(metrics, Mapping):
+        return ""
+    if section == "GPIO":
+        modes = metrics.get("modes")
+        if not isinstance(modes, Mapping):
+            return ""
+        single = metrics.get("single")
+        single_total = len(single) if isinstance(single, Mapping) else 0
+        single_ok = (
+            sum(1 for pin in single.values() if isinstance(pin, Mapping) and pin.get("ok"))
+            if isinstance(single, Mapping)
+            else 0
+        )
+        failed = [str(pin) for pin in metrics.get("single_failed_pins") or []]
+        detail = f"{single_ok}/{single_total} pins ok"
+        if failed:
+            detail += "; failed: " + ", ".join(failed)
+        banks = metrics.get("banks")
+        bank_count = len(banks) if isinstance(banks, Mapping) else 0
+        bank_text = f" ({bank_count} bank{'' if bank_count == 1 else 's'})" if bank_count else ""
+        single_text = f"single {modes.get('single', 'not_run')}"
+        if single_total:
+            single_text += f" ({detail})"
+        return f"modes: {single_text}, multiple {modes.get('multiple', 'not_run')}{bank_text}"
+    if section == "ThermalProtect":
+        events = metrics.get("events")
+        if not isinstance(events, Mapping) or not events:
+            return ""
+        parts = []
+        for name in _THERMAL_EVENT_ORDER:
+            states = {
+                str(zone): str(result.get(name, "not_run"))
+                for zone, result in events.items()
+                if isinstance(result, Mapping)
+            }
+            not_ok = {zone: state for zone, state in states.items() if state != "success"}
+            if not not_ok:
+                parts.append(f"{name} ok")
+            elif len(not_ok) == len(states) and len(set(not_ok.values())) == 1:
+                parts.append(f"{name} {next(iter(not_ok.values()))}")
+            else:
+                parts.append(f"{name} " + ", ".join(f"{zone} {state}" for zone, state in not_ok.items()))
+        return f"events ({len(events)} zones): " + ", ".join(parts)
+    return ""
 
 
 def _fallback_note(fallback: Any) -> str:
@@ -2494,6 +2584,7 @@ def finalize_summary_after_fallback(
                         "result": report.get("result"),
                         "gpio_suspect_pins": gpio_pins,
                         "reason": reason,
+                        "detail_note": _section_detail_note(str(item.get("section")), report),
                         "phase2_observation": observation,
                         "channel_summary": report.get("channel_summary"),
                         "validation_layers": report.get("validation_layers"),

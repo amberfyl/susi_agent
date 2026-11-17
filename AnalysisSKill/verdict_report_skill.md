@@ -62,6 +62,8 @@
    - `BLOCKED_DEPENDENCY`：依賴的 section 失敗而未執行（例：`HWM.Fan` 失敗 → `HWM.Fan.Control` 不跑）。
    - `ORCHESTRATOR_ERROR`：報告缺失/過期/格式錯誤或 runner crash，屬基礎設施問題，不算該 section 完成。
 8. **整體結論**：個別 section 失敗只記入 summary；流程與 rollback 安全完成即回報 `completed` + summary 路徑（同 orchestrator 11.3）。
+9. **BoardInfo（不依賴 ini 的獨立區段，每次必跑、排在第一）**：唯讀，用 `SusiBoardGetValue` 讀 Boot Counter（`0x00000001`）與 Running Time Meter（`0x00000002`，單位 hour），兩者都必須 ≥ 1。API 回傳碼不是 `SUCCESS` 判 `FAIL`（`FAIL_API`，reason 附原碼）；API 成功但值為 0 判 `FAIL`（`FAIL_READBACK`，reason 為 `value is 0 (expected >= 1)`）。兩種原因分開寫，不可合併成「讀取失敗」。此區段沒有 ini 與 section config，不會出現在 `No INI generated` 清單。
+10. **summary 的附註行**：GPIO 與 ThermalProtect 的區段行維持不變，其下以縮排附註行列出新增檢查：GPIO 為 `modes: single … multiple …`（含失敗腳位），ThermalProtect 為 `events (N zones): none …, shutdown …, throttle …, poweroff …`（`unsupported` 不算失敗；失敗的 zone 與 event 具名列出）。附註由程式依報告的 `metrics` 自動產生，代理照抄；舊報告沒有這些欄位時不會有附註。
 
 ## 5. Outputs
 1. per-section verdict（`sw_verdict` 為主，附 `dqa_verdict`、失敗通道與 status code）

@@ -60,10 +60,10 @@ class ExecutionManifestTests(unittest.TestCase):
         self.assertEqual(manifest["mode"], "dry-run")
         self.assertEqual(
             [section["section"] for section in manifest["sections"]],
-            ["HWM.Fan", "HWM.Fan.Control", "StorageArea"],
+            ["BoardInfo", "HWM.Fan", "HWM.Fan.Control", "StorageArea"],
         )
         self.assertEqual(
-            [section["sequence"] for section in manifest["sections"]], [1, 2, 3]
+            [section["sequence"] for section in manifest["sections"]], [1, 2, 3, 4]
         )
         json.dumps(manifest)
 
@@ -72,7 +72,8 @@ class ExecutionManifestTests(unittest.TestCase):
 
         contract = self._build_contract([("SMBus", "GENERATED")])
 
-        section = build_execution_manifest(contract)["sections"][0]
+        sections = build_execution_manifest(contract)["sections"]
+        section = next(item for item in sections if item["section"] == "SMBus")
 
         self.assertEqual(section["section"], "SMBus")
         self.assertEqual(section["matrix_status"], "GENERATED")

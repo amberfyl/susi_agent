@@ -50,6 +50,9 @@ class LocalPreflightAndDryRunTests(unittest.TestCase):
         (runner_dir / "run_smbus_validation.ps1").write_text(
             ". ./common_susi.ps1\n", encoding="utf-8"
         )
+        (runner_dir / "run_boardinfo_validation.ps1").write_text(
+            ". ./common_susi.ps1\n", encoding="utf-8"
+        )
         (runner_dir / "common_susi.ps1").write_text(
             "# shared helper\n", encoding="utf-8"
         )
@@ -71,9 +74,10 @@ class LocalPreflightAndDryRunTests(unittest.TestCase):
         result = run_local_preflight(contract, manifest)
 
         self.assertEqual(result["status"], "PASS")
-        self.assertEqual(result["section_count"], 1)
+        # SMBus plus the standalone BoardInfo (no section config).
+        self.assertEqual(result["section_count"], 2)
         self.assertEqual(result["config_count"], 1)
-        self.assertEqual(result["runner_count"], 1)
+        self.assertEqual(result["runner_count"], 2)
         self.assertEqual(result["dependency_count"], 1)
         self.assertFalse(contract.outputs.run_root.exists())
 

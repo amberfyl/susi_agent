@@ -852,7 +852,7 @@ class RunnerAndReportTests(unittest.TestCase):
             self.assertEqual(invoked_runners, ["fan.ps1", "gpio.ps1"])
 
 
-    def test_all_14_registry_entries_execute_in_fixed_order_with_safe_defaults(self):
+    def test_all_15_registry_entries_execute_in_fixed_order_with_safe_defaults(self):
         from run_machineB_full_validation import SECTION_REGISTRY, execute_validation_sections
 
         with tempfile.TemporaryDirectory() as td:
@@ -874,11 +874,11 @@ class RunnerAndReportTests(unittest.TestCase):
 
             results = execute_validation_sections(contract, {"sections": plans}, transport)
 
-            self.assertEqual(len(results), 14)
+            self.assertEqual(len(results), 15)
             self.assertEqual([item["section"] for item in results], [entry.section for entry in SECTION_REGISTRY])
             self.assertTrue(all(item["execution_status"] == "COMPLETED" for item in results))
             invocations = [call for call in transport.calls if call[0] == "runner"]
-            self.assertEqual(len(invocations), 14)
+            self.assertEqual(len(invocations), 15)
             dangerous = {
                 "AllowControl",
                 "EnableFixtureTest",

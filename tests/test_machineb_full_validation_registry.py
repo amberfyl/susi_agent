@@ -25,9 +25,10 @@ class MachineBFullValidationRegistryTests(unittest.TestCase):
 
         sections = [entry.section for entry in SECTION_REGISTRY]
 
-        self.assertEqual(len(sections), 14)
-        self.assertEqual(len(set(sections)), 14)
-        self.assertEqual(set(sections), set(builder.SECTION_OUTPUTS))
+        # 14 INI-driven sections plus the standalone BoardInfo check.
+        self.assertEqual(len(sections), 15)
+        self.assertEqual(len(set(sections)), 15)
+        self.assertEqual(set(sections) - {"BoardInfo"}, set(builder.SECTION_OUTPUTS))
 
     def test_registry_order_is_fixed_from_easiest_to_most_complex(self):
         from run_machineB_full_validation import SECTION_REGISTRY
@@ -35,6 +36,7 @@ class MachineBFullValidationRegistryTests(unittest.TestCase):
         self.assertEqual(
             [entry.section for entry in SECTION_REGISTRY],
             [
+                "BoardInfo",
                 "HWM.CaseOpen",
                 "HWM.Current",
                 "HWM.Voltage",
@@ -52,13 +54,15 @@ class MachineBFullValidationRegistryTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            [entry.difficulty_rank for entry in SECTION_REGISTRY], list(range(1, 15))
+            [entry.difficulty_rank for entry in SECTION_REGISTRY], list(range(0, 15))
         )
 
     def test_registry_config_templates_match_the_builder(self):
         from run_machineB_full_validation import SECTION_REGISTRY
 
         for entry in SECTION_REGISTRY:
+            if entry.standalone:
+                continue
             with self.subTest(section=entry.section):
                 self.assertEqual(
                     entry.config_template, builder.SECTION_OUTPUTS[entry.section]
@@ -121,10 +125,11 @@ class MachineBFullValidationRegistryTests(unittest.TestCase):
 
         tiers = [entry.execution_tier for entry in SECTION_REGISTRY]
 
-        self.assertEqual(tiers[:4], [ExecutionTier.SIMPLE_READ] * 4)
-        self.assertEqual(tiers[4:9], [ExecutionTier.GATED_READ] * 5)
-        self.assertEqual(tiers[9], ExecutionTier.DEPENDENT_CONTROL)
-        self.assertEqual(tiers[10:14], [ExecutionTier.REVERSIBLE_WRITE] * 4)
+        # tiers[0] is the standalone BoardInfo check (a simple read).
+        self.assertEqual(tiers[:5], [ExecutionTier.SIMPLE_READ] * 5)
+        self.assertEqual(tiers[5:10], [ExecutionTier.GATED_READ] * 5)
+        self.assertEqual(tiers[10], ExecutionTier.DEPENDENT_CONTROL)
+        self.assertEqual(tiers[11:15], [ExecutionTier.REVERSIBLE_WRITE] * 4)
 
 
 if __name__ == "__main__":
