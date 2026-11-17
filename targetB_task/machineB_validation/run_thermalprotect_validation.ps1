@@ -86,6 +86,11 @@ try {
     $setVerified = @()
     $notApplied = @()
     $setErrors = @()
+    # Standalone per-event results (NONE/SHUTDOWN/THROTTLE/POWEROFF): success / fail / unsupported / not_run.
+    $allEvents = [ordered]@{}
+    $eventFailures = @()
+    $eventNotRun = @()
+    $eventTested = @()
     foreach ($ch in $required) {
         $iniKey = @($thermalSection.Keys | Where-Object { $_ -ieq [string]$ch })
         if ($iniKey.Count -ne 1) { throw "Required channel $ch is missing from [ThermalProtect]." }
@@ -243,6 +248,115 @@ try {
             }
         }
 
+        # Standalone EventType tests: one SetConfig -> GetConfig -> restore per event.
+        # An event whose support flag is not set is reported 'unsupported' and never set.
+        # NONE needs no support flag; its temperatures are not kept by the EC, so only
+        # source and event are compared. Trigger events are never raised.
+        $eventCheck = Get-ConfigValue -Config $config -Name 'event_check' -Default ([ordered]@{})
+        $eventDefs = Get-ConfigValue -Config $eventCheck -Name 'events' -Default ([ordered]@{})
+        $chEvents = [ordered]@{}
+        $chEventStatus = [ordered]@{}
+        $evTrigMax = [UInt32]$caps.trigger_maximum.value
+        $evTrigMin = [UInt32]$caps.trigger_minimum.value
+        $evClearMax = [UInt32]$caps.clear_maximum.value
+        $evClearMin = [UInt32]$caps.clear_minimum.value
+        $evSupportFlags = [UInt32]$caps.support_flags.value
+        $evCapsOk = (@($caps.Values | Where-Object { $_.status -ne '0x00000000' }).Count -eq 0)
+        $evRangeOk = ($evCapsOk -and $evTrigMax -ge ($evTrigMin + 10) -and $evTrigMin -ge 10)
+        $evSource = if ($sourceId -ge 0x00020000 -and $sourceId -lt 0x0002000C) { $sourceId } else { [UInt32]0x00020000 }
+        foreach ($evName in @($eventDefs.Keys)) {
+            $evDef = $eventDefs[$evName]
+            $evValue = Convert-ToUInt32Safe ([string](Get-ConfigValue -Config $evDef -Name 'value' '0')) 0
+            $flagText = [string](Get-ConfigValue -Config $evDef -Name 'support_flag' -Default '')
+            $evResult = [ordered]@{ status = 'not_run'; event_value = ('0x{0:X8}' -f $evValue); reason = $null }
+            $evLabel = ('{0}:{1}' -f $ch, $evName)
+
+            if (-not $allowThermalSetConfig -or $configStatus -ne 0) {
+                $evResult.reason = 'SetConfig test not enabled or GetConfig failed'
+            } elseif ($flagText -ne '' -and (($evSupportFlags -band (Convert-ToUInt32Safe $flagText 0)) -eq 0)) {
+                $evResult.status = 'unsupported'
+                $evResult.reason = ('support flag {0} not set (flags 0x{1:X8})' -f $flagText, $evSupportFlags)
+            } elseif ($evValue -ne 0xFF -and -not $evRangeOk) {
+                $evResult.reason = 'GetCaps did not return a usable trigger range; config not modified'
+            } else {
+                $evSend = $sendTemp
+                $evClear = $clearTemp
+                $evUsable = $true
+                if ($evRangeOk) {
+                    $evSend = [UInt32]($evTrigMax - 10)
+                    if ($eventType -ne 0xFF -and $sendTemp -gt $evSend) { $evSend = $sendTemp }
+                    if ($evSend -gt $evTrigMax) { $evUsable = $false; $evResult.reason = 'Original trigger is above caps maximum; config not modified' }
+                    $evClear = [Math]::Min([UInt32]$evClearMax, [UInt32]($evSend - 10))
+                    if ($evUsable -and $evClear -lt $evClearMin) { $evUsable = $false; $evResult.reason = 'No clear temperature within caps below the test trigger' }
+                }
+                if ($evUsable) {
+                    $evTarget = [ordered]@{ source = $evSource; event = $evValue; send = $evSend; clear = $evClear }
+                    $evCfg = New-Object SusiThermalProtect
+                    $evCfg.SourceId = $evTarget.source
+                    $evCfg.EventType = $evTarget.event
+                    $evCfg.SendEventTemperature = $evTarget.send
+                    $evCfg.ClearEventTemperature = $evTarget.clear
+                    $evSetStatus = [NativeSusi]::SusiThermalProtectionSetConfig($thermalId, [ref]$evCfg)
+                    Add-ApiCall -report $report -name ("ThermalEventSet:{0}" -f $evLabel) -status $evSetStatus -value ([ordered]@{ event = ('0x{0:X8}' -f $evValue); send = $evSend; clear = $evClear })
+                    $evMismatch = @()
+                    $evResult.set_status = ('0x{0:X8}' -f [UInt32]$evSetStatus)
+                    if ($evSetStatus -ne 0) {
+                        $evMismatch += ('SetConfig {0}' -f $evResult.set_status)
+                    } else {
+                        $evRead = New-Object SusiThermalProtect
+                        $evReadStatus = [NativeSusi]::SusiThermalProtectionGetConfig($thermalId, [ref]$evRead)
+                        Add-ApiCall -report $report -name ("ThermalEventVerify:{0}" -f $evLabel) -status $evReadStatus -value ([ordered]@{
+                            source_id = ('0x{0:X8}' -f [UInt32]$evRead.SourceId)
+                            event_type = ('0x{0:X8}' -f [UInt32]$evRead.EventType)
+                            send_event_temperature_0_1K = [UInt32]$evRead.SendEventTemperature
+                            clear_event_temperature_0_1K = [UInt32]$evRead.ClearEventTemperature
+                        })
+                        if ($evReadStatus -ne 0) { $evMismatch += ('GetConfig 0x{0:X8}' -f [UInt32]$evReadStatus) }
+                        if ([UInt32]$evRead.SourceId -ne $evTarget.source) { $evMismatch += ('source wrote 0x{0:X8} read 0x{1:X8}' -f [UInt32]$evTarget.source, [UInt32]$evRead.SourceId) }
+                        if ([UInt32]$evRead.EventType -ne $evTarget.event) { $evMismatch += ('event wrote 0x{0:X} read 0x{1:X}' -f [UInt32]$evTarget.event, [UInt32]$evRead.EventType) }
+                        if ($evValue -ne 0xFF) {
+                            if ([UInt32]$evRead.SendEventTemperature -ne $evTarget.send) { $evMismatch += ('trigger wrote {0} read {1}' -f $evTarget.send, [UInt32]$evRead.SendEventTemperature) }
+                            if ([UInt32]$evRead.ClearEventTemperature -ne $evTarget.clear) { $evMismatch += ('clear wrote {0} read {1}' -f $evTarget.clear, [UInt32]$evRead.ClearEventTemperature) }
+                        }
+                    }
+
+                    # Always restore after the attempt, before the next event.
+                    $evOrig = New-Object SusiThermalProtect
+                    $evOrig.SourceId = $sourceId
+                    $evOrig.EventType = $eventType
+                    $evOrig.SendEventTemperature = $sendTemp
+                    $evOrig.ClearEventTemperature = $clearTemp
+                    $evRestoreStatus = [NativeSusi]::SusiThermalProtectionSetConfig($thermalId, [ref]$evOrig)
+                    Add-ApiCall -report $report -name ("ThermalEventRestore:{0}" -f $evLabel) -status $evRestoreStatus
+                    $evRestoreRead = New-Object SusiThermalProtect
+                    $evRestoreReadStatus = [NativeSusi]::SusiThermalProtectionGetConfig($thermalId, [ref]$evRestoreRead)
+                    Add-ApiCall -report $report -name ("ThermalEventRestoreVerify:{0}" -f $evLabel) -status $evRestoreReadStatus
+                    $evRestoreOk = ($evRestoreStatus -eq 0 -and $evRestoreReadStatus -eq 0 -and [UInt32]$evRestoreRead.SourceId -eq $sourceId -and [UInt32]$evRestoreRead.EventType -eq $eventType)
+                    if ($eventType -ne 0xFF) {
+                        $evRestoreOk = ($evRestoreOk -and [UInt32]$evRestoreRead.SendEventTemperature -eq $sendTemp -and [UInt32]$evRestoreRead.ClearEventTemperature -eq $clearTemp)
+                    }
+                    $evResult.restore_verified = $evRestoreOk
+                    $eventTested += $evLabel
+                    if (-not $evRestoreOk) {
+                        $restoreFailures += $ch
+                        $evMismatch += 'original config could not be restored'
+                    }
+                    $evResult.mismatch = @($evMismatch)
+                    if ($evMismatch.Count -eq 0) {
+                        $evResult.status = 'success'
+                    } else {
+                        $evResult.status = 'fail'
+                        $evResult.reason = ($evMismatch -join '; ')
+                    }
+                }
+            }
+            $chEvents[$evName] = $evResult
+            $chEventStatus[$evName] = $evResult.status
+            if ($evResult.status -eq 'fail') { $eventFailures += ('{0}({1})' -f $evLabel, $evResult.reason) }
+            elseif ($evResult.status -eq 'not_run') { $eventNotRun += $evLabel }
+        }
+        $allEvents[$ch] = $chEventStatus
+
         $sourceConfigured = ($sourceId -ge 0x00020000 -and $sourceId -lt 0x0002000C)
         $disabledConfig = ($eventType -eq 0xFF -and $sourceId -eq 0)
         $sourceValid = ($sourceConfigured -or $disabledConfig)
@@ -254,6 +368,7 @@ try {
             thermal_api_id = ('0x{0:X8}' -f [UInt32]$thermalId)
             caps = $caps
             set_config_test = $setTest
+            event_tests = $chEvents
             get_config = [ordered]@{
                 status = ('0x{0:X8}' -f [UInt32]$configStatus)
                 status_name = Get-StatusName $configStatus
@@ -271,6 +386,7 @@ try {
         }
     }
     $report.metrics.channels = $channelMetrics
+    $report.metrics.events = $allEvents
     $capFailures = @($capFailures | Select-Object -Unique | Sort-Object)
     $configFailures = @($configFailures | Select-Object -Unique | Sort-Object)
     if ($capFailures.Count -gt 0) {
@@ -321,13 +437,31 @@ try {
             $report.validation_layers.L4_readback = 'CONDITIONAL'
         }
     }
+    # An event that failed fails the whole section; the reason names the event.
+    # An event that did not run keeps the section from passing (CONDITIONAL).
+    if ($eventFailures.Count -gt 0) {
+        $evReason = 'ThermalProtect event test failed: ' + ($eventFailures -join '; ')
+        if ([string]$report.result -like 'FAIL*') {
+            $report.reason = $report.reason + '; ' + $evReason
+        } else {
+            $report.result = 'FAIL_READBACK'
+            $report.reason = $evReason + '; original restored'
+            $report.validation_layers.L2_capability = 'PASS'
+            $report.validation_layers.L3_api = 'PASS'
+            $report.validation_layers.L4_readback = 'FAIL'
+        }
+    } elseif ($allowThermalSetConfig -and $eventNotRun.Count -gt 0 -and [string]$report.result -eq 'PASS') {
+        $report.result = 'CONDITIONAL'
+        $report.reason = 'ThermalProtect event test not exercised on: ' + ($eventNotRun -join ', ')
+        $report.validation_layers.L4_readback = 'CONDITIONAL'
+    }
     $report.checks.read_stability = 'NOT_APPLICABLE'
     $report.checks.control_effect = 'NOT_RUN'
     $report.validation_layers.L5_functional = 'CONDITIONAL'
     if ($restoreFailures.Count -gt 0) {
         $report.validation_layers.L6_recovery = 'FAIL'
         $report.checks.recovery = 'FAIL'
-    } elseif ($setVerified.Count -gt 0 -or $setFailures.Count -gt 0) {
+    } elseif ($setVerified.Count -gt 0 -or $setFailures.Count -gt 0 -or $eventTested.Count -gt 0) {
         $report.validation_layers.L6_recovery = 'PASS'
         $report.checks.recovery = 'PASS'
     } else {

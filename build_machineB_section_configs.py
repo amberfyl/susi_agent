@@ -904,6 +904,20 @@ def build_thermalprotect_config(
             },
             "read_only": True,
         },
+        # One standalone SetConfig -> GetConfig -> restore test per public EventType.
+        # NONE needs no hardware support flag; the other three use one flag bit each
+        # (SusiThermalProtectionGetCaps support_flags). Values are the public SUSI
+        # values, never the EC-internal encoding (EC maps NONE to 0x08 itself).
+        "event_check": {
+            "events": {
+                "none": {"value": "0x000000FF", "support_flag": None},
+                "shutdown": {"value": "0x00000000", "support_flag": "0x00000001"},
+                "throttle": {"value": "0x00000001", "support_flag": "0x00000002"},
+                "poweroff": {"value": "0x00000002", "support_flag": "0x00000004"},
+            },
+            "results": ["success", "fail", "unsupported", "not_run"],
+            "restore_after_each_event": True,
+        },
         "config_check": {
             "read_only": True,
             "temperature_unit": "0.1_kelvins",
