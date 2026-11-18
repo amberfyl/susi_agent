@@ -54,11 +54,12 @@ try {
     $minMillivolts = [double](Get-ConfigValue -Config $sampleCfg -Name 'min_millivolts' (Get-ConfigValue -Config $config -Name 'min_millivolts' 0.0))
     $maxMillivolts = [double](Get-ConfigValue -Config $sampleCfg -Name 'max_millivolts' (Get-ConfigValue -Config $config -Name 'max_millivolts' 30000.0))
     $maxSpan = [double](Get-ConfigValue -Config $sampleCfg -Name 'max_span_millivolts' (Get-ConfigValue -Config $config -Name 'max_span_millivolts' 5000.0))
+    $nominalTolPct = [double](Get-ConfigValue -Config $sampleCfg -Name 'nominal_tolerance_percent' 10.0)
     if ($sampleCount -le 0 -or $sampleIntervalMs -le 0) { throw "Invalid sampling setup: sample_count=$sampleCount, sample_interval_ms=$sampleIntervalMs" }
 
     $report.config_path = (Resolve-Path $ConfigPath).Path
     $report.source_ini = [ordered]@{ configured_path = $IniPath; resolved_path = $iniResolved; section = $sourceSection; sha256 = $actualHash }
-    $report.metrics.thresholds = [ordered]@{ sample_count = $sampleCount; sample_interval_ms = $sampleIntervalMs; min_millivolts = $minMillivolts; max_millivolts = $maxMillivolts; max_span_millivolts = $maxSpan; min_success_rate = $minSuccessRate }
+    $report.metrics.thresholds = [ordered]@{ sample_count = $sampleCount; sample_interval_ms = $sampleIntervalMs; min_millivolts = $minMillivolts; max_millivolts = $maxMillivolts; max_span_millivolts = $maxSpan; min_success_rate = $minSuccessRate; nominal_tolerance_percent = $nominalTolPct }
     $report.validation_layers.L1_configuration = 'PASS'
 
     # [RUNNER SKELETON] 2) initialize + capability gate
@@ -71,6 +72,7 @@ try {
     $channelMetrics = [ordered]@{}
     $apiFailures = @()
     $readbackFailures = @()
+    $nominalFailures = @()
     foreach ($ch in $required) {
         $iniKey = @($voltageSection.Keys | Where-Object { $_ -ieq [string]$ch })
         if ($iniKey.Count -ne 1) { throw "Required channel $ch is missing from [HWM.Voltage]." }
@@ -93,8 +95,27 @@ try {
         $stats = Get-SeriesStats -series $series
         $inRange = ($stats.count -gt 0 -and $stats.min -ge $minMillivolts -and $stats.max -le $maxMillivolts)
         $spanOk = ($stats.count -gt 0 -and $stats.span -le $maxSpan)
+        # Rated-voltage check: only rails whose nominal is known from the name (3V3, 5V, 12V ...).
+        $nominal = $null; $useAbs = $false
+        if ($null -ne $chMeta) {
+            $nomText = Get-ConfigValue -Config $chMeta -Name 'nominal_millivolts' -Default $null
+            if ($null -ne $nomText) { $nominal = [double]$nomText }
+            $useAbs = [bool](Get-ConfigValue -Config $chMeta -Name 'use_absolute_value' -Default $false)
+        }
+        $nominalOk = $null; $expLow = $null; $expHigh = $null
+        if ($null -ne $nominal -and $stats.count -gt 0) {
+            $expLow = $nominal * (1.0 - $nominalTolPct / 100.0)
+            $expHigh = $nominal * (1.0 + $nominalTolPct / 100.0)
+            $vals = @($series | Where-Object { $_.value -ne $null } | ForEach-Object { if ($useAbs) { [Math]::Abs([double]$_.value) } else { [double]$_.value } })
+            $obsMin = ($vals | Measure-Object -Minimum).Minimum
+            $obsMax = ($vals | Measure-Object -Maximum).Maximum
+            $nominalOk = ($obsMin -ge $expLow -and $obsMax -le $expHigh)
+            if (-not $nominalOk) {
+                $nominalFailures += ('{0}: read {1:0}~{2:0} mV{3}, expected {4:0}~{5:0} mV' -f $ch, $obsMin, $obsMax, $(if ($useAbs) { ' (absolute)' } else { '' }), $expLow, $expHigh)
+            }
+        }
         if ($successRate -lt $minSuccessRate) { $apiFailures += $ch }
-        if (-not $inRange -or -not $spanOk) { $readbackFailures += $ch }
+        if (-not $inRange -or -not $spanOk -or $nominalOk -eq $false) { $readbackFailures += $ch }
         $channelMetrics[$ch] = [ordered]@{
             tuple = $tuple
             api_id = ('0x{0:X8}' -f [UInt32]$apiId)
@@ -103,6 +124,9 @@ try {
             stats_millivolts = $stats
             in_range = $inRange
             span_ok = $spanOk
+            nominal_millivolts = $nominal
+            expected_range_millivolts = if ($null -ne $nominal) { @([Math]::Round($expLow, 0), [Math]::Round($expHigh, 0)) } else { $null }
+            nominal_ok = $nominalOk
             samples = $series
         }
     }
@@ -117,6 +141,7 @@ try {
         $report.result = 'FAIL_READBACK'
         $failed = @($readbackFailures | Select-Object -Unique | Sort-Object)
         $report.reason = ('Voltage out-of-range/unstable span for channel(s): ' + ($failed -join ', '))
+        if ($nominalFailures.Count -gt 0) { $report.reason += ' | rated-voltage mismatch: ' + ($nominalFailures -join '; ') }
         $report.validation_layers.L3_api = 'PASS'; $report.validation_layers.L4_readback = 'FAIL'; $report.validation_layers.L5_functional = 'FAIL'; $report.checks.read_stability = 'FAIL'; $report.checks.control_effect = 'NOT_APPLICABLE'
     } else {
         # [RUNNER SKELETON] 4) verdict mapping + result breakdown
@@ -145,7 +170,7 @@ if ($report.metrics.Contains('channels')) {
     foreach ($ch in @($report.metrics.channels.Keys)) {
         $meta = $report.metrics.channels[$ch]
         if ($null -eq $meta.success_rate -or [double]$meta.success_rate -le 0) { $failItems += "channel:$ch"; continue }
-        if ($meta.in_range -and $meta.span_ok) { $passItems += "channel:$ch" } else { $failItems += "channel:$ch" }
+        if ($meta.in_range -and $meta.span_ok -and $meta.nominal_ok -ne $false) { $passItems += "channel:$ch" } else { $failItems += "channel:$ch" }
     }
 }
 $report.result_breakdown = [ordered]@{ pass = $passItems; pending = $pendingItems; fail = $failItems; na = $naItems }

@@ -68,6 +68,16 @@ VOLTAGE_API_INDEX = {
     "+5V": 4, "+12V": 5, "+5VSB": 6, "+3VSB": 7, "+3.3V": 3,
 }
 
+# Nominal millivolts by SUSI voltage index, only for rails whose name IS the nominal
+# value. Variable rails (VCORE, VTT, DC, DCSTBY, VBATLI, OEM*) are deliberately absent:
+# no nominal is guessed for them. Negative rails are compared by absolute value.
+VOLTAGE_NOMINAL_MV = {
+    2: 2500, 3: 3300, 4: 5000, 5: 12000, 6: 5000, 7: 3300, 8: 3000,
+    9: 5000, 10: 12000, 12: 24000, 20: 1050, 21: 1500, 22: 1800,
+    23: 12000, 24: 5000, 25: 3300,
+}
+VOLTAGE_NEGATIVE_INDEX = {9, 10}
+
 # HWM.Current INI tuples use 0x80000000 + index as configuration channels,
 # while SusiBoardGetValue uses the public current namespace 0x00023000 + index.
 CURRENT_API_INDEX = {"OEM0": 0, "OEM1": 1, "OEM2": 2}
@@ -735,6 +745,8 @@ def build_voltage_config(
             "api_id_source": "SUSI_HWM_VOLTAGE_NAMESPACE",
             "decode": "millivolts",
             "display_name": report_name,
+            "nominal_millivolts": VOLTAGE_NOMINAL_MV.get(api_index),
+            "use_absolute_value": api_index in VOLTAGE_NEGATIVE_INDEX,
         }
 
     sample_count = int(policy_value(read_policy, "sample_count", defaults["sample_count"]))
@@ -743,6 +755,7 @@ def build_voltage_config(
     min_millivolts = float(policy_value(read_policy, "min_millivolts", defaults["min_millivolts"]))
     max_millivolts = float(policy_value(read_policy, "max_millivolts", defaults["max_millivolts"]))
     max_span_millivolts = float(policy_value(read_policy, "max_span_millivolts", defaults["max_span_millivolts"]))
+    nominal_tolerance_percent = float(policy_value(read_policy, "nominal_tolerance_percent", 10.0))
 
     return {
         "schema_version": "1.0",
@@ -758,6 +771,7 @@ def build_voltage_config(
             "min_millivolts": min_millivolts,
             "max_millivolts": max_millivolts,
             "max_span_millivolts": max_span_millivolts,
+            "nominal_tolerance_percent": nominal_tolerance_percent,
         },
         "result_semantics": {
             "api_or_mapping_failure": "FAIL_API",

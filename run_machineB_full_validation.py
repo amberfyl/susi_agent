@@ -2466,6 +2466,20 @@ def _section_detail_note(section: str, report: Mapping[str, Any]) -> str:
             else:
                 parts.append(f"{name} " + ", ".join(f"{zone} {state}" for zone, state in not_ok.items()))
         return f"events ({len(events)} zones): " + ", ".join(parts)
+    if section == "HWM.Voltage":
+        channels = metrics.get("channels")
+        if not isinstance(channels, Mapping) or not channels:
+            return ""
+        if not any(isinstance(c, Mapping) and "nominal_ok" in c for c in channels.values()):
+            return ""
+        rated = [c for c in channels.values() if isinstance(c, Mapping) and c.get("nominal_ok") is not None]
+        bad = [str(n) for n, c in channels.items() if isinstance(c, Mapping) and c.get("nominal_ok") is False]
+        if not rated:
+            return f"rated check: no fixed rails rated (config has no nominal values); {len(channels)} variable rails range-only"
+        text = f"rated check: {len(rated) - len(bad)}/{len(rated)} fixed rails in tolerance"
+        if bad:
+            text += "; out of range: " + ", ".join(bad)
+        return text + f"; {len(channels) - len(rated)} variable rails range-only"
     return ""
 
 
