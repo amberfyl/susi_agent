@@ -195,6 +195,7 @@ try {
             $failures = @()
             $notExercised = @()
             $stopFailures = @()
+            $sciNotRun = @()
             foreach ($ch in $required) {
                 $match = [regex]::Match([string]$ch, '^WDT(\d+)$', 'IgnoreCase')
                 if (-not $match.Success) { throw "Cannot map $ch to a SUSI watchdog id." }
@@ -293,6 +294,80 @@ try {
                         }
                     }
                 }
+
+                # ---- SCI start/stop test (SUSI_WDT_EVENT_TYPE_SCI = 2) ----------------------
+                # What this verifies (phase 1, software API only):
+                #   - the EC reports SCI support (support flag bit2, SUSI_WDT_FLAG_SUPPORT_SCI);
+                #   - SusiWDogStart accepts event type SCI;
+                #   - the event type reads back as SCI;
+                #   - SusiWDogStop succeeds.
+                # Safety: this test never waits for the timer, never reboots or powers off
+                # the target and never raises an SCI. Start uses the maximum delay and the
+                # maximum event time, so neither can elapse in the few milliseconds before
+                # Stop, and reset time 0, so no reset can follow even if Stop failed. Stop
+                # runs in finally and is retried. The NONE test above has already stopped
+                # this watchdog, and SCI only runs when that test passed.
+                # NOT verified here (DQA): that an SCI is really delivered to the OS when the
+                # event time expires. A DQA run must Start with SCI, a short delay/event time
+                # and reset time 0 (no reset), let it expire, and confirm on the target that
+                # the OS received the SCI (the QA tool's wdog.c does this by hand: it waits
+                # 7 s and asks the operator). This runner never waits for that expiry.
+                $test.sci = [ordered]@{ result = 'not_run'; start = $null; sci_readback = $null; stop_status = $null; reason = $null }
+                if ($test.result -eq 'PASS') {
+                    $sciSupported = ((([UInt32]$test.caps.support_flags) -band [UInt32]4) -ne 0)
+                    if (-not $sciSupported) {
+                        $test.sci.result = 'unsupported'
+                        $test.sci.reason = 'support flag bit2 (SCI) is not set; Start not called'
+                    } elseif (-not $test.caps.event_max) {
+                        $test.sci.reason = 'event_max is 0 or unreadable; SCI not started'
+                        $sciNotRun += $ch
+                    } else {
+                        $sciEventType = [UInt32]2  # SUSI_WDT_EVENT_TYPE_SCI
+                        $sciDelay = [UInt32]$test.caps.delay_max
+                        $sciEvent = [UInt32]$test.caps.event_max
+                        $sciReset = [UInt32]0
+                        $test.sci.start = [ordered]@{ delay_time = $sciDelay; event_time = $sciEvent; reset_time = $sciReset; event_type = $sciEventType }
+                        $sciStarted = $false
+                        $sciStopped = $false
+                        try {
+                            $sciStartStatus = [NativeSusi]::SusiWDogStart($wdogId, $sciDelay, $sciEvent, $sciReset, $sciEventType)
+                            Add-ApiCall -report $report -name "SusiWDogStart:${ch}:SCI" -status $sciStartStatus -value $test.sci.start
+                            if (-not (Is-Success $sciStartStatus)) {
+                                $test.sci.result = 'fail'
+                                $test.sci.reason = ('SusiWDogStart with SCI returned {0} (0x{1:X8})' -f (Get-StatusName $sciStartStatus), [UInt32]$sciStartStatus)
+                                $failures += "${ch}:SCIStart"
+                            } else {
+                                $sciStarted = $true
+                                [UInt32]$value = 0
+                                $status = [NativeSusi]::SusiWDogGetCaps($wdogId, [UInt32]$capItems['event_type'], [ref]$value)
+                                Add-ApiCall -report $report -name ("SusiWDogGetCaps:{0}:event_type:SCIreadback" -f $ch) -status $status -value $value
+                                $test.sci.sci_readback = if (Is-Success $status) { $value } else { $null }
+                                if ($null -ne $test.sci.sci_readback -and [UInt32]$test.sci.sci_readback -eq $sciEventType) {
+                                    $test.sci.result = 'success'
+                                } else {
+                                    $test.sci.result = 'fail'
+                                    $test.sci.reason = ('event type read back as {0}, expected 2 (SCI)' -f $(if ($null -eq $test.sci.sci_readback) { 'unreadable' } else { $test.sci.sci_readback }))
+                                    $failures += "${ch}:SCIReadback"
+                                }
+                            }
+                        } finally {
+                            if ($sciStarted) {
+                                for ($attempt = 1; $attempt -le 3 -and -not $sciStopped; $attempt++) {
+                                    $sciStopStatus = [NativeSusi]::SusiWDogStop($wdogId)
+                                    Add-ApiCall -report $report -name ("SusiWDogStop:{0}:SCI:attempt{1}" -f $ch, $attempt) -status $sciStopStatus
+                                    $test.sci.stop_status = Get-StatusName $sciStopStatus
+                                    $sciStopped = Is-Success $sciStopStatus
+                                }
+                                if (-not $sciStopped) {
+                                    $test.sci.result = 'fail'
+                                    $test.sci.reason = 'SusiWDogStop failed after SCI start'
+                                    $test.result = 'FAIL_STOP'
+                                    $stopFailures += ('{0} SCI (event may fire after {1} ms)' -f $ch, $sciDelay)
+                                }
+                            }
+                        }
+                    }
+                }
             }
             $report.metrics.start_stop_test = $startStop
 
@@ -310,6 +385,12 @@ try {
                 $report.validation_layers.L2_capability = if (@($failures | Where-Object { $_ -like '*:GetCaps' }).Count -gt 0) { 'FAIL' } else { 'PASS' }
                 $report.validation_layers.L3_api = 'FAIL'
                 $report.validation_layers.L4_readback = 'FAIL'
+            } elseif ($sciNotRun.Count -gt 0) {
+                $report.result = 'CONDITIONAL'
+                $report.reason = 'WDT SCI test not run (no usable event time range): ' + ($sciNotRun -join ', ')
+                $report.validation_layers.L2_capability = 'PASS'
+                $report.validation_layers.L3_api = 'CONDITIONAL'
+                $report.validation_layers.L4_readback = 'CONDITIONAL'
             } elseif ($notExercised.Count -gt 0) {
                 $report.result = 'CONDITIONAL'
                 $report.reason = 'WDT already running (owned by another program); left untouched: ' + ($notExercised -join ', ')
@@ -318,7 +399,7 @@ try {
                 $report.validation_layers.L4_readback = 'CONDITIONAL'
             } else {
                 $report.result = 'PASS'
-                $report.reason = ('WDT start/readback/trigger/stop passed (reset time ' + (@($startStop.Values | ForEach-Object { $_.start.reset_time }) -join ',') + '); watchdog stopped, no reset triggered.')
+                $report.reason = ('WDT start/readback/trigger/stop passed (reset time ' + (@($startStop.Values | ForEach-Object { $_.start.reset_time }) -join ',') + '; sci ' + (@($startStop.Values | ForEach-Object { $_.sci.result }) -join ',') + '); watchdog stopped, no reset triggered.')
                 $report.validation_layers.L2_capability = 'PASS'
                 $report.validation_layers.L3_api = 'PASS'
                 $report.validation_layers.L4_readback = 'PASS'

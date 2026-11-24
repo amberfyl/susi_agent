@@ -300,7 +300,7 @@ class Phase1VerdictTests(unittest.TestCase):
             self.assertIn("Scope: Phase 1", text)
             self.assertIn("Phase 2 recommendations (hardware / fixture / DQA):", text)
             self.assertIn("- HWM.Voltage: Apply load stimulus", text)
-            self.assertIn("- WDT: Let the watchdog expire", text)
+            self.assertIn("- WDT: Software check only proved", text)
 
 
 class SectionReasonTests(unittest.TestCase):

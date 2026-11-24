@@ -1296,8 +1296,15 @@ PHASE2_RECOMMENDATIONS: Mapping[str, str] = MappingProxyType({
     "HWM.Current": "Apply load and confirm current readings track the change.",
     "I2C": "Connect the approved fixture (0xAC/0xAE) and validate write/read transactions.",
     "SMBus": "Connect the legacy QA fixture and rerun with -EnableFixtureTest for write/read compare.",
-    "WDT": "Let the watchdog expire under a recovery harness and confirm the target resets (reboots the target).",
-    "ThermalProtect": "Validate SHUTDOWN/THROTTLE event triggering under thermal stimulus.",
+    "WDT": (
+        "Software check only proved Start/event-type readback/Stop. DQA: start with SCI, a short delay/event time "
+        "and reset time 0, let it expire and confirm the OS receives the SCI; then, under a recovery harness, "
+        "let a reset time expire and confirm the target resets (reboots the target)."
+    ),
+    "ThermalProtect": (
+        "Software check only proved each event type can be set and read back. DQA: under thermal stimulus "
+        "confirm each event really acts (THROTTLE slows the CPU; SHUTDOWN and POWEROFF stop the target)."
+    ),
 })
 
 
@@ -2466,6 +2473,23 @@ def _section_detail_note(section: str, report: Mapping[str, Any]) -> str:
             else:
                 parts.append(f"{name} " + ", ".join(f"{zone} {state}" for zone, state in not_ok.items()))
         return f"events ({len(events)} zones): " + ", ".join(parts)
+    if section == "WDT":
+        tests = metrics.get("start_stop_test")
+        if not isinstance(tests, Mapping):
+            return ""
+        states = {
+            str(ch): str(test["sci"].get("result", "not_run"))
+            for ch, test in tests.items()
+            if isinstance(test, Mapping) and isinstance(test.get("sci"), Mapping)
+        }
+        if not states:
+            return ""
+        not_ok = {ch: state for ch, state in states.items() if state != "success"}
+        if not not_ok:
+            return "sci: success"
+        if len(not_ok) == len(states) and len(set(not_ok.values())) == 1:
+            return f"sci: {next(iter(not_ok.values()))}"
+        return "sci: " + ", ".join(f"{ch} {state}" for ch, state in not_ok.items())
     if section == "HWM.Voltage":
         channels = metrics.get("channels")
         if not isinstance(channels, Mapping) or not channels:
