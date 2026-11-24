@@ -248,6 +248,9 @@ try {
             }
         }
 
+        # Safety: this block only calls SetConfig/GetConfig. It never triggers protection and
+        # never reboots or powers off the target. Triggers stay at (caps max - 10), armed
+        # channels are only raised, and the original config is restored after every event.
         # Standalone EventType tests: one SetConfig -> GetConfig -> restore per event.
         # An event whose support flag is not set is reported 'unsupported' and never set.
         # NONE needs no support flag; its temperatures are not kept by the EC, so only
