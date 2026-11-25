@@ -20,7 +20,71 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import base64
+
+from machineb_sync import preflight_files, sync_files
+from machineb_transport import SshPowerShellTransport
+
+
+PROBE_FILES = {
+    'run_susi_full_probe.bat': (
+        'run_susi_full_probe.bat', 'susi_board_probe.ps1', 'susi_gpio_probe.ps1',
+        'susi_i2c_smbus_probe.ps1', 'susi_vga_backlight_probe.ps1',
+    ),
+    'run_susi_spd_idx_probe.bat': ('run_susi_spd_idx_probe.bat', 'susi_spd_idx_probe.ps1'),
+}
+
+
+def build_probe_sync_plan(remote_bat: str) -> list[dict[str, str]]:
+    remote = PureWindowsPath(remote_bat)
+    names = PROBE_FILES.get(remote.name.casefold())
+    if names is None:
+        raise ValueError(f'unsupported remote BAT basename: {remote.name}; automatic sync accepts only: ' + ', '.join(PROBE_FILES))
+    root = Path(__file__).resolve().parent / 'suto' / 'V7'
+    plan = [{'kind': 'probe_tool', 'local_path': str(root / name),
+             'remote_path': str(remote if index == 0 else remote.parent / name)}
+            for index, name in enumerate(names)]
+    preflight_files(plan)
+    return plan
+
+
+class WinrmPowerShellTransport(SshPowerShellTransport):
+    """Reuse literal-path/hash primitives via the existing PowerShell WinRM path.
+
+    Each operation owns and closes its PSSession; credentials and binary payloads
+    are sent on stdin, never embedded in command-line arguments or diagnostics.
+    """
+    def __init__(self, host: str, win_user: str | None, win_pass: str | None):
+        if not _is_winrm_allowed_host(host):
+            raise ValueError('WinRM is allowed only for 192.168.100.10-50')
+        self.host = host
+        self.win_user = win_user
+        self._win_pass = win_pass
+
+    def _powershell(self, script: str) -> subprocess.CompletedProcess[str]:
+        pre, cred_arg = _build_ps_credential(self.win_user, self._win_pass)
+        wrapper = (
+            "$ErrorActionPreference='Stop'; " + pre
+            + f'$session=New-PSSession -ComputerName {_ps_single_quote(self.host)} {cred_arg}; '
+            + 'try { Invoke-Command -Session $session -ScriptBlock { ' + script
+            + ' } } finally { Remove-PSSession -Session $session }'
+        )
+        try:
+            return _run_powershell(wrapper)
+        except RuntimeError as exc:
+            detail = str(exc)
+            if self._win_pass:
+                detail = detail.replace(self._win_pass, '[REDACTED]').replace(_ps_single_quote(self._win_pass), '[REDACTED]')
+            raise RuntimeError(detail) from None
+
+    def upload(self, local_path: Path, remote_path: str) -> None:
+        payload = base64.b64encode(Path(local_path).read_bytes()).decode('ascii')
+        self._powershell(
+            "$ErrorActionPreference='Stop'; "
+            + f'[IO.File]::WriteAllBytes({_ps_single_quote(remote_path)}, '
+            + f'[Convert]::FromBase64String({_ps_single_quote(payload)}))'
+        )
 
 
 B_PORT = 8765
@@ -151,11 +215,12 @@ def _run_powershell(script: str) -> subprocess.CompletedProcess[str]:
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        script,
+        "-",
     ]
+    # stdin avoids command-line credential exposure and Windows argv size limits.
     # Windows PowerShell on a zh-TW host writes Big5 (cp950); decoding it as
     # UTF-8 raised UnicodeDecodeError and aborted the whole host failover.
-    p = subprocess.run(cmd, capture_output=True, encoding="cp950", errors="replace")
+    p = subprocess.run(cmd, input=script + '\n', capture_output=True, encoding="cp950", errors="replace")
     if p.returncode != 0:
         err = (p.stderr or p.stdout or "").strip()
         raise RuntimeError(f"[ERROR] PowerShell failed ({p.returncode}):\n{err}")
@@ -184,6 +249,10 @@ def fetch_probe_ssh(
     remote_report: str,
     out_path: Path,
 ) -> None:
+    plan = build_probe_sync_plan(remote_bat)
+    synced = sync_files(plan, SshPowerShellTransport(host=host, user=ssh_user))
+    print(f"[OK] Probe tools synced: uploaded={synced['uploaded_count']} "
+          f"skipped={synced['skipped_count']} verified={synced['verified_count']}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     remote = f"{ssh_user}@{host}"
@@ -204,6 +273,10 @@ def fetch_probe_winrm(
     win_user: str | None,
     win_pass: str | None,
 ) -> None:
+    plan = build_probe_sync_plan(remote_bat)
+    synced = sync_files(plan, WinrmPowerShellTransport(host, win_user, win_pass))
+    print(f"[OK] Probe tools synced: uploaded={synced['uploaded_count']} "
+          f"skipped={synced['skipped_count']} verified={synced['verified_count']}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     bat_win = _to_windows_path(remote_bat)

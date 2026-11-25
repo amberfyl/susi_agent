@@ -85,6 +85,8 @@ class BoardInfoManifestTests(unittest.TestCase):
         runner_dir = contract.inputs.runner_dir
         runner_dir.mkdir(parents=True, exist_ok=True)
         (runner_dir / "run_boardinfo_validation.ps1").write_text("", encoding="utf-8")
+        (runner_dir / "reload_susi4_driver.bat").write_text("@echo off\n", encoding="utf-8")
+        (runner_dir / "reload_susi4_driver.ps1").write_text("# reload\n", encoding="utf-8")
         (runner_dir / "common_susi.ps1").write_text("", encoding="utf-8")
         manifest = {
             "sections": [

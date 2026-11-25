@@ -378,6 +378,7 @@ class RemoteStageErrorCode(str, Enum):
     """Stable machine-readable failures for P6 remote staging."""
 
     PLAN_CONFLICT = "PLAN_CONFLICT"
+    LOCAL_PREFLIGHT_FAILED = "LOCAL_PREFLIGHT_FAILED"
     CONNECTION_FAILED = "CONNECTION_FAILED"
     DIRECTORY_SETUP_FAILED = "DIRECTORY_SETUP_FAILED"
     BACKUP_FAILED = "BACKUP_FAILED"
@@ -713,6 +714,21 @@ def build_post_ini_contract(
     )
 
 
+# The reload BAT calls the PS1 that sits next to it, so both are staged together.
+RELOAD_SCRIPT_NAMES = ("reload_susi4_driver.bat", "reload_susi4_driver.ps1")
+
+
+def _reload_script_plan(contract: PostIniContract) -> list[tuple[Path, PureWindowsPath]]:
+    """(local source, remote path) for the driver reload scripts."""
+
+    reload_bat = PureWindowsPath(contract.target.reload_bat)
+    plan: list[tuple[Path, PureWindowsPath]] = []
+    for name in RELOAD_SCRIPT_NAMES:
+        remote = reload_bat if name.endswith(".bat") else reload_bat.parent / name
+        plan.append((contract.inputs.runner_dir / name, remote))
+    return plan
+
+
 def _append_staging_artifact(
     artifacts: list[dict[str, Any]],
     remote_sources: dict[str, str],
@@ -817,6 +833,16 @@ def build_remote_staging_plan(
                 section=section,
             )
 
+    reload_dir = PureWindowsPath(contract.target.reload_bat).parent
+    for local_path, remote_path in _reload_script_plan(contract):
+        _append_staging_artifact(
+            artifacts,
+            remote_sources,
+            kind="reload_script",
+            local_path=local_path,
+            remote_path=remote_path,
+        )
+
     return {
         "transport": "ssh-powershell",
         "workspace": str(workspace),
@@ -827,6 +853,7 @@ def build_remote_staging_plan(
             str(ini_dir),
             str(run_output),
             str(backup_dir),
+            str(reload_dir),
         ],
         "runtime_ini": contract.target.runtime_ini,
         "backup_ini": str(backup_ini),
@@ -842,7 +869,26 @@ def stage_remote_bundle(
 ) -> dict[str, Any]:
     """Create target workspace, back up runtime INI, and upload artifacts."""
 
+    from machineb_sync import SyncError, preflight_files, sync_files
+
+    def map_sync_error(exc: SyncError) -> RemoteStageError:
+        codes = {
+            'plan_conflict': RemoteStageErrorCode.PLAN_CONFLICT,
+            'local_preflight': RemoteStageErrorCode.LOCAL_PREFLIGHT_FAILED,
+            'directory_setup': RemoteStageErrorCode.DIRECTORY_SETUP_FAILED,
+            'upload': RemoteStageErrorCode.UPLOAD_FAILED,
+            'hash_read': RemoteStageErrorCode.HASH_READ_FAILED,
+            'hash_mismatch': RemoteStageErrorCode.HASH_MISMATCH,
+        }
+        return RemoteStageError(codes[exc.phase], str(exc),
+                                remote_path=exc.remote_path,
+                                artifact_kind=exc.artifact_kind)
+
     plan = build_remote_staging_plan(contract, manifest)
+    try:
+        preflight_files(plan['artifacts'])
+    except SyncError as exc:
+        raise map_sync_error(exc) from exc
     try:
         probe = dict(transport.probe())
     except Exception as exc:
@@ -898,21 +944,10 @@ def stage_remote_bundle(
         backup_result["sha256"] = backup_hash
         backup_result["hash_verified"] = True
 
-    uploaded: list[dict[str, Any]] = []
-    for artifact in plan["artifacts"]:
-        local_path = Path(str(artifact["local_path"]))
-        remote_path = str(artifact["remote_path"])
-        kind = str(artifact["kind"])
-        try:
-            transport.upload(local_path, remote_path)
-        except Exception as exc:
-            raise RemoteStageError(
-                RemoteStageErrorCode.UPLOAD_FAILED,
-                f"artifact upload failed: {exc}",
-                remote_path=remote_path,
-                artifact_kind=kind,
-            ) from exc
-        uploaded.append(dict(artifact))
+    try:
+        sync_result = sync_files(plan['artifacts'], transport)
+    except SyncError as exc:
+        raise map_sync_error(exc) from exc
 
     return {
         "status": "PASS",
@@ -920,8 +955,7 @@ def stage_remote_bundle(
         "workspace": plan["workspace"],
         "directories": plan["directories"],
         "backup": backup_result,
-        "uploaded_count": len(uploaded),
-        "artifacts": uploaded,
+        **sync_result,
     }
 
 
@@ -1136,6 +1170,14 @@ def run_local_preflight(
                     section=section,
                 )
             dependency_paths.add(dependency_path)
+
+    for local_path, _remote in _reload_script_plan(contract):
+        if not local_path.is_file():
+            raise ContractError(
+                ContractErrorCode.SCRIPT_DEPENDENCY_MISSING,
+                f"missing driver reload script: {local_path}",
+                path=local_path,
+            )
 
     return {
         "status": "PASS",

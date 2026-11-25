@@ -79,7 +79,11 @@ def _ps_value(value: Any) -> str:
 def _scp_remote_path(path: str) -> str:
     normalized = path.replace("\\", "/")
     if re.match(r"^[A-Za-z]:/", normalized):
-        return "/" + normalized
+        normalized = "/" + normalized
+    # Legacy scp (-O) inserts this operand into the remote shell command.
+    # subprocess argv separation alone does not preserve Windows path spaces.
+    if any(char.isspace() for char in normalized):
+        normalized = '"' + normalized + '"'
     return normalized
 
 

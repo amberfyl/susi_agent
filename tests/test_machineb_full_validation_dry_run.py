@@ -53,6 +53,8 @@ class LocalPreflightAndDryRunTests(unittest.TestCase):
         (runner_dir / "run_boardinfo_validation.ps1").write_text(
             ". ./common_susi.ps1\n", encoding="utf-8"
         )
+        (runner_dir / "reload_susi4_driver.bat").write_text("@echo off\n", encoding="utf-8")
+        (runner_dir / "reload_susi4_driver.ps1").write_text("# reload\n", encoding="utf-8")
         (runner_dir / "common_susi.ps1").write_text(
             "# shared helper\n", encoding="utf-8"
         )

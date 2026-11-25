@@ -41,6 +41,10 @@ class FakeRemoteTransport:
         self.calls.append(("remote_sha256", remote_path))
         return self.hashes[remote_path]
 
+    def remote_file_exists(self, remote_path):
+        self.calls.append(("remote_file_exists", remote_path))
+        return remote_path in self.hashes
+
 
 class MachineBRemoteStagingTests(unittest.TestCase):
     def _build_contract_and_manifest(self):
@@ -86,6 +90,8 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         (runner_dir / "run_boardinfo_validation.ps1").write_text(
             ". ./common_susi.ps1\n", encoding="utf-8"
         )
+        (runner_dir / "reload_susi4_driver.bat").write_text("@echo off\n", encoding="utf-8")
+        (runner_dir / "reload_susi4_driver.ps1").write_text("# reload\n", encoding="utf-8")
         (runner_dir / "common_susi.ps1").write_text(
             "# shared helper\n", encoding="utf-8"
         )
@@ -113,6 +119,7 @@ class MachineBRemoteStagingTests(unittest.TestCase):
                 contract.target.ini_dir,
                 contract.target.run_output,
                 str(run_output / "backup"),
+                str(PureWindowsPath(contract.target.reload_bat).parent),
             ],
         )
         self.assertEqual(plan["runtime_ini"], contract.target.runtime_ini)
@@ -122,14 +129,15 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         )
         self.assertEqual(
             [artifact["kind"] for artifact in plan["artifacts"]],
-            ["full_ini", "split_ini", "config", "runner", "runner", "dependency"],
+            ["full_ini", "split_ini", "config", "runner", "runner", "dependency",
+             "reload_script", "reload_script"],
         )
-        self.assertEqual(plan["artifact_count"], 6)
+        self.assertEqual(plan["artifact_count"], 8)
         self.assertEqual(
-            len({artifact["remote_path"] for artifact in plan["artifacts"]}), 6
+            len({artifact["remote_path"] for artifact in plan["artifacts"]}), 8
         )
 
-    def test_stage_remote_bundle_backs_up_before_upload_without_upload_hash_checks(self):
+    def test_stage_remote_bundle_backs_up_before_upload_with_upload_hash_checks(self):
         from run_machineB_full_validation import stage_remote_bundle
 
         contract, manifest = self._build_contract_and_manifest()
@@ -141,18 +149,18 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         self.assertEqual(result["probe"]["computer_name"], "MACHINE-B")
         self.assertTrue(result["backup"]["original_exists"])
         self.assertTrue(result["backup"]["hash_verified"])
-        self.assertEqual(result["uploaded_count"], 6)
+        self.assertEqual(result["uploaded_count"], 8)
         self.assertTrue(
-            all("sha256" not in item for item in result["artifacts"])
+            all(len(item["sha256"]) == 64 for item in result["artifacts"])
         )
         self.assertTrue(
-            all("hash_verified" not in item for item in result["artifacts"])
+            all(item["hash_verified"] for item in result["artifacts"])
         )
         call_names = [call[0] for call in transport.calls]
         self.assertLess(
             call_names.index("backup_if_exists"), call_names.index("upload")
         )
-        self.assertEqual(call_names.count("remote_sha256"), 2)
+        self.assertEqual(call_names.count("remote_sha256"), 10)
 
     def test_stage_remote_bundle_allows_missing_original_runtime_ini(self):
         from run_machineB_full_validation import stage_remote_bundle
@@ -166,12 +174,10 @@ class MachineBRemoteStagingTests(unittest.TestCase):
         self.assertFalse(result["backup"]["original_exists"])
         self.assertIsNone(result["backup"]["sha256"])
         self.assertFalse(result["backup"]["hash_verified"])
-        self.assertEqual(result["uploaded_count"], 6)
-        self.assertFalse(
-            any(call[0] == "remote_sha256" for call in transport.calls)
-        )
+        self.assertEqual(result["uploaded_count"], 8)
+        self.assertEqual(sum(call[0] == "remote_sha256" for call in transport.calls), 8)
 
-    def test_stage_remote_bundle_does_not_compare_uploaded_artifact_hashes(self):
+    def test_stage_remote_bundle_rejects_uploaded_artifact_hash_mismatch(self):
         from run_machineB_full_validation import (
             build_remote_staging_plan,
             stage_remote_bundle,
@@ -185,13 +191,34 @@ class MachineBRemoteStagingTests(unittest.TestCase):
             upload_hash_override={first_remote_path: "0" * 64},
         )
 
-        result = stage_remote_bundle(contract, manifest, transport)
+        from run_machineB_full_validation import RemoteStageError, RemoteStageErrorCode
+        with self.assertRaises(RemoteStageError) as caught:
+            stage_remote_bundle(contract, manifest, transport)
+        self.assertEqual(caught.exception.code, RemoteStageErrorCode.HASH_MISMATCH)
+        self.assertEqual(caught.exception.remote_path, first_remote_path)
 
-        self.assertEqual(result["status"], "PASS")
-        self.assertEqual(result["uploaded_count"], 6)
-        self.assertFalse(
-            any(call == ("remote_sha256", first_remote_path) for call in transport.calls)
-        )
+    def test_second_stage_skips_identical_and_updates_changed(self):
+        from run_machineB_full_validation import stage_remote_bundle
+        contract, manifest = self._build_contract_and_manifest()
+        transport = FakeRemoteTransport(original_exists=False)
+        first = stage_remote_bundle(contract, manifest, transport)
+        second = stage_remote_bundle(contract, manifest, transport)
+        self.assertEqual(second['uploaded_count'], 0)
+        self.assertEqual(second['skipped_count'], first['uploaded_count'])
+        self.assertEqual(second['verified_count'], 8)
+        Path(first['artifacts'][0]['local_path']).write_text('changed')
+        third = stage_remote_bundle(contract, manifest, transport)
+        self.assertEqual(third['uploaded_count'], 1)
+        self.assertEqual(third['skipped_count'], 7)
+
+    def test_missing_local_artifact_prevents_all_remote_operations(self):
+        from run_machineB_full_validation import stage_remote_bundle, RemoteStageError
+        contract, manifest = self._build_contract_and_manifest()
+        (contract.inputs.runner_dir / 'reload_susi4_driver.ps1').unlink()
+        transport = FakeRemoteTransport()
+        with self.assertRaises(RemoteStageError):
+            stage_remote_bundle(contract, manifest, transport)
+        self.assertEqual(transport.calls, [])
 
     def test_dry_run_manifest_records_staging_plan_without_transport(self):
         from run_machineB_full_validation import (
@@ -205,7 +232,7 @@ class MachineBRemoteStagingTests(unittest.TestCase):
 
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertIn("staging_plan", payload)
-        self.assertEqual(payload["staging_plan"]["artifact_count"], 6)
+        self.assertEqual(payload["staging_plan"]["artifact_count"], 8)
         self.assertIn("staging_plan", EXECUTION_MANIFEST_SCHEMA["required"])
         self.assertEqual(
             EXECUTION_MANIFEST_SCHEMA["properties"]["staging_plan"]["type"],
@@ -214,6 +241,26 @@ class MachineBRemoteStagingTests(unittest.TestCase):
 
 
 class SshPowerShellTransportTests(unittest.TestCase):
+    def test_legacy_scp_preserves_remote_path_with_spaces(self):
+        import shlex
+        from machineb_transport import SshPowerShellTransport
+        calls = []
+
+        def runner(command):
+            calls.append(command)
+            # Legacy scp passes the remote path through a remote shell.
+            remote_operand = command[-1].split(':', 1)[1]
+            self.assertEqual(shlex.split(remote_operand),
+                             ['/C:/Users/susiaa/Desktop/reload driver/reload_susi4_driver.bat'])
+            return subprocess.CompletedProcess(command, 0, '', '')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'reload.bat'
+            source.write_bytes(b'@echo off\r\n')
+            SshPowerShellTransport(host='example.invalid', user='susiaa', command_runner=runner).upload(
+                source, r'C:\Users\susiaa\Desktop\reload driver\reload_susi4_driver.bat')
+        self.assertEqual(len(calls), 1)
+
     def test_transport_builds_noninteractive_ssh_scp_and_parses_results(self):
         from machineb_transport import SshPowerShellTransport
 
